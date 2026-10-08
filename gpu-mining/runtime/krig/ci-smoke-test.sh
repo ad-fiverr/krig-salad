@@ -33,6 +33,12 @@ if [[ "$mode" == --source ]]; then
   fi
   grep -Eq '^exec[[:space:]]+/opt/krig/krig-miner([[:space:]]|$)' "$entrypoint" ||
     fail "entrypoint must exec KRig directly as PID 1"
+  if grep -Eq '/dev/nvidiactl|/dev/nvidia[0-9]' "$entrypoint"; then
+    fail "entrypoint must not gate Salad startup on guessed NVIDIA device-node paths"
+  fi
+  for fixed_flag in '--no-rocm' '--devices 0' '--no-tui'; do
+    grep -Fq -- "$fixed_flag" "$entrypoint" || fail "entrypoint is missing fixed KRig flag ${fixed_flag}"
+  done
   if grep -Eq 'KRIG_EXTRA_ARGS|(^|[[:space:]])eval([[:space:]]|$)|sh[[:space:]]+-c' "$entrypoint"; then
     fail "entrypoint must not accept arbitrary CLI or shell passthrough"
   fi
@@ -71,6 +77,41 @@ fi
 
 tmp="$(mktemp -d)"
 trap 'rm -rf -- "$tmp"' EXIT
+
+no_nvidia_smi_path="${tmp}/no-nvidia-smi"
+fake_nvidia_smi_ok="${tmp}/fake-nvidia-smi-ok"
+fake_nvidia_smi_fail="${tmp}/fake-nvidia-smi-fail"
+mkdir -p "$no_nvidia_smi_path" "$fake_nvidia_smi_ok" "$fake_nvidia_smi_fail"
+cat >"${fake_nvidia_smi_ok}/nvidia-smi" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+cat >"${fake_nvidia_smi_fail}/nvidia-smi" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+chmod 0555 "${fake_nvidia_smi_ok}/nvidia-smi" "${fake_nvidia_smi_fail}/nvidia-smi"
+
+check_runtime_diagnostic() {
+  local label="$1" path="$2" expected="$3"
+  local output="${tmp}/runtime-${label}.txt"
+  if ! KRIG_COIN=PRL KRIG_POOL_URL=stratum+ssl://pool.example.net:7048 \
+    KRIG_USER=wallet-placeholder/ci-worker PATH="$path" "$BASH" "$entrypoint" --check-runtime >"$output" 2>&1; then
+    fail "--check-runtime rejected valid configuration for ${label}"
+  fi
+  grep -Fq "$expected" "$output" || fail "--check-runtime diagnostic mismatch for ${label}"
+  grep -Fq 'runtime diagnostics complete; miner was not started; CUDA compatibility was not tested' "$output" ||
+    fail "--check-runtime must state that it did not start the miner or validate CUDA"
+  ! grep -Fq 'starting KRig' "$output" || fail "--check-runtime must not enter normal mining startup"
+  ! grep -Fq 'wallet-placeholder' "$output" || fail "--check-runtime output leaked the mining identifier"
+}
+
+check_runtime_diagnostic missing-nvidia-smi "$no_nvidia_smi_path" \
+  'optional nvidia-smi diagnostic unavailable'
+check_runtime_diagnostic nvidia-smi-success "$fake_nvidia_smi_ok" \
+  'optional nvidia-smi diagnostic succeeded'
+check_runtime_diagnostic nvidia-smi-failure "$fake_nvidia_smi_fail" \
+  'WARNING: optional nvidia-smi diagnostic failed'
 
 env KRIG_COIN=PRL KRIG_POOL_URL=stratum+ssl://pool.example.net:7048 \
   KRIG_USER=wallet-placeholder/ci-worker \
@@ -121,18 +162,57 @@ if env KRIG_COIN=PRL KRIG_POOL_URL=stratum+ssl://pool.example.net:7048 \
   fail "arbitrary command override was accepted"
 fi
 
-if env KRIG_COIN=PRL KRIG_POOL_URL=stratum+ssl://pool.example.net:7048 \
-  KRIG_USER=wallet-placeholder/ci-worker \
-  "$entrypoint" --check-runtime >"${tmp}/runtime-check.txt" 2>&1; then
-  grep -Fq 'runtime check complete; miner was not started' "${tmp}/runtime-check.txt" || fail "runtime-only check did not exit safely"
-else
-  grep -Fq 'NVIDIA runtime is not exposed' "${tmp}/runtime-check.txt" ||
-    grep -Fq 'nvidia-smi could not query' "${tmp}/runtime-check.txt" ||
-    fail "runtime-only check failed for an unexpected reason"
+if [[ "$mode" == --image ]]; then
+  [[ ! -e /dev/nvidiactl ]] || fail "normal-start regression requires /dev/nvidiactl to be absent; do not create fake device nodes"
+  [[ ! -e /dev/nvidia0 ]] || fail "normal-start regression requires /dev/nvidia0 to be absent; do not create fake device nodes"
+
+  stub="${tmp}/krig-miner-stub"
+  stub_argv="${tmp}/krig-stub-argv.bin"
+  expected_argv="${tmp}/krig-stub-expected-argv.bin"
+  test_entrypoint="${tmp}/krig-entrypoint-launch-test.sh"
+  normal_start_output="${tmp}/normal-start.txt"
+  cat >"$stub" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${KRIG_TEST_ARGV_FILE:?}"
+printf '%s\0' "$@" >"$KRIG_TEST_ARGV_FILE"
+EOF
+  chmod 0555 "$stub"
+  sed "s#/opt/krig/krig-miner#${stub}#g" "$entrypoint" >"$test_entrypoint" ||
+    fail "could not prepare temporary entrypoint copy for the no-GPU regression"
+  chmod 0555 "$test_entrypoint"
+  grep -Fq "$stub" "$test_entrypoint" || fail "temporary entrypoint does not target the KRig stub"
+  if grep -Fq '/opt/krig/krig-miner' "$test_entrypoint"; then
+    fail "temporary entrypoint still references the real KRig binary"
+  fi
+
+  if ! KRIG_COIN=PRL KRIG_POOL_URL=stratum+ssl://pool.example.net:7048 \
+    KRIG_USER=wallet-placeholder/ci-worker KRIG_TEST_ARGV_FILE="$stub_argv" \
+    PATH="${fake_nvidia_smi_fail}:${PATH}" "$BASH" "$test_entrypoint" >"$normal_start_output" 2>&1; then
+    fail "valid normal-start configuration did not reach the temporary KRig stub without NVIDIA device nodes"
+  fi
+  grep -Fq 'starting KRig v1.5.6: coin=PRL pool=pool.example.net:7048 device=0 mining-identifier=redacted' "$normal_start_output" ||
+    fail "normal-start summary did not report the redacted PRL configuration"
+  grep -Fq 'WARNING: optional nvidia-smi diagnostic failed; continuing to KRig for CUDA initialization' "$normal_start_output" ||
+    fail "normal startup did not continue after nvidia-smi failure"
+  ! grep -Fq 'wallet-placeholder' "$normal_start_output" || fail "normal-start output leaked the mining identifier"
+
+  printf '%s\0' \
+    '--coin' 'pearl' \
+    '--url' 'stratum+ssl://pool.example.net:7048' \
+    '--user' 'wallet-placeholder/ci-worker' \
+    '--no-rocm' \
+    '--devices' '0' \
+    '--no-tui' >"$expected_argv"
+  cmp -s "$expected_argv" "$stub_argv" || fail "temporary KRig stub did not receive the exact coin, URL, user, and fixed flags"
 fi
 
 sample_digest="sha256:$(printf 'a%.0s' {1..64})"
 parsed_digest="$(printf '1.5.6: digest: %s size: 2048\n' "$sample_digest" | sed -nE 's/.*digest: (sha256:[0-9a-f]{64}).*/\1/p')"
 [[ "$parsed_digest" == "$sample_digest" ]] || fail "Docker push digest parser did not extract the manifest digest"
 
-printf 'non-GPU %s smoke tests passed: PRL/QTC config mapping, documented TLS endpoints, identifier redaction, runtime detection, fail-closed validation, and registry digest parsing\n' "${mode#--}"
+if [[ "$mode" == --image ]]; then
+  printf 'non-GPU image smoke tests passed: PRL/QTC config mapping, optional diagnostics, no-device normal-start stub argv, fail-closed validation, and artifact/digest checks\n'
+else
+  printf 'non-GPU source smoke tests passed: PRL/QTC config mapping, optional runtime diagnostics, fail-closed validation, and registry digest parsing\n'
+fi

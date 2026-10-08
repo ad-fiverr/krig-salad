@@ -43,28 +43,26 @@ if [[ "${1:-}" == --validate-config ]]; then
   exit 0
 fi
 
-detect_nvidia_runtime() {
-  [[ -e /dev/nvidiactl ]] || fail "NVIDIA runtime is not exposed: /dev/nvidiactl is missing"
-  local device gpu_count=0
-  for device in /dev/nvidia[0-9]*; do
-    if [[ -c "$device" ]]; then
-      gpu_count=$((gpu_count + 1))
-    fi
-  done
-  (( gpu_count > 0 )) || fail "NVIDIA runtime is not exposed: no /dev/nvidiaN GPU device nodes found"
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    nvidia-smi -L >/dev/null 2>&1 || fail "nvidia-smi could not query the exposed GPU runtime"
+diagnose_nvidia_smi() {
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    printf 'krig-entrypoint: optional nvidia-smi diagnostic unavailable; continuing to KRig for CUDA initialization\n' >&2
+    return 0
   fi
-  printf 'NVIDIA runtime detected: gpu_device_nodes=%s; KRig will use visible device 0\n' "$gpu_count"
+
+  if nvidia-smi -L >/dev/null 2>&1; then
+    printf 'krig-entrypoint: optional nvidia-smi diagnostic succeeded; KRig will initialize CUDA\n'
+  else
+    printf 'krig-entrypoint: WARNING: optional nvidia-smi diagnostic failed; continuing to KRig for CUDA initialization\n' >&2
+  fi
 }
 
 if [[ "${1:-}" == --check-runtime ]]; then
-  detect_nvidia_runtime
-  printf 'runtime check complete; miner was not started\n'
+  diagnose_nvidia_smi
+  printf 'runtime diagnostics complete; miner was not started; CUDA compatibility was not tested\n'
   exit 0
 fi
 
-detect_nvidia_runtime
+diagnose_nvidia_smi
 printf 'starting KRig v1.5.6: coin=%s pool=%s:%s device=0 mining-identifier=redacted\n' "$coin_label" "$pool_host" "$pool_port"
 exec /opt/krig/krig-miner \
   --coin "$coin_arg" \
