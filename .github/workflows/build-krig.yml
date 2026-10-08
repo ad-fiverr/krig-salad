@@ -32,7 +32,7 @@ jobs:
       - name: Validate workflow YAML
         shell: bash
         run: |
-          ruby -e 'require "yaml"; YAML.load_file(".github/workflows/build-krig.yml", aliases: true); puts "workflow YAML parses"'
+          ruby -e 'require "yaml"; YAML.load_file(".github/workflows/build-krig.yml"); puts "workflow YAML parses"'
 
       - name: Validate shell scripts and pinned release lock
         shell: bash
