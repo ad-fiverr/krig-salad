@@ -1,0 +1,144 @@
+name: Build KRig Salad container
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-krig.yml"
+      - "gpu-mining/runtime/krig/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-publish:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Runner disk preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h /
+          available_kb="$(df -Pk / | awk 'NR == 2 { print $4 }')"
+          if (( available_kb < 6000000 )); then
+            echo "Insufficient free disk for the pinned CUDA base image." >&2
+            exit 1
+          fi
+
+      - name: Validate workflow YAML
+        shell: bash
+        run: |
+          ruby -e 'require "yaml"; YAML.load_file(".github/workflows/build-krig.yml", aliases: true); puts "workflow YAML parses"'
+
+      - name: Validate shell scripts and pinned release lock
+        shell: bash
+        working-directory: gpu-mining/runtime/krig
+        run: |
+          set -euo pipefail
+          for script in krig-entrypoint.sh krig-healthcheck.sh verify-artifact.sh ci-smoke-test.sh; do
+            bash -n "$script"
+          done
+          bash ./verify-artifact.sh --lock-only
+          bash ./ci-smoke-test.sh --source
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Build linux/amd64 image for local smoke test
+        working-directory: gpu-mining/runtime/krig
+        env:
+          KRIG_VERSION: 1.5.6
+        run: docker buildx build --platform linux/amd64 --load --tag "local/krig-salad:${KRIG_VERSION}" .
+
+      - name: Inspect built image metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          image=local/krig-salad:1.5.6
+          docker image inspect "$image" | python3 -c '
+          import json, sys
+          images = json.load(sys.stdin)
+          if len(images) != 1:
+              raise SystemExit("expected one locally built image")
+          image = images[0]
+          config = image.get("Config") or {}
+          labels = config.get("Labels") or {}
+          checks = {
+              "linux/amd64": image.get("Os") == "linux" and image.get("Architecture") == "amd64",
+              "entrypoint": config.get("Entrypoint") == ["/opt/krig/krig-entrypoint.sh"],
+              "healthcheck": (config.get("Healthcheck") or {}).get("Test") == ["CMD", "/opt/krig/krig-healthcheck.sh"],
+              "version label": labels.get("org.opencontainers.image.version") == "1.5.6",
+              "source label": labels.get("org.opencontainers.image.source") == "https://github.com/kryptex/krig-miner",
+              "release revision label": labels.get("org.opencontainers.image.revision") == "259a2a064b28dcf7d0f1921dcdb2c3f608242567",
+          }
+          failed = [name for name, passed in checks.items() if not passed]
+          if failed:
+              raise SystemExit("built image metadata check failed: " + ", ".join(failed))
+          print("built image metadata verified: linux/amd64, entrypoint, healthcheck, version/source/revision labels")
+          '
+
+      - name: Run non-GPU, network-disabled container smoke test
+        run: docker run --rm --network none --entrypoint /opt/krig/ci-smoke-test.sh local/krig-salad:1.5.6 --image
+
+      - name: Log in to Docker Hub
+        if: github.ref_name == github.event.repository.default_branch
+        uses: docker/login-action@v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Publish tested image and report immutable digest
+        if: github.ref_name == github.event.repository.default_branch
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          KRIG_VERSION: 1.5.6
+        run: |
+          set -euo pipefail
+          [[ -n "$DOCKERHUB_USERNAME" ]] || { echo "Missing DOCKERHUB_USERNAME secret" >&2; exit 1; }
+          repo="docker.io/${DOCKERHUB_USERNAME,,}/krig-salad"
+          short_sha="${GITHUB_SHA:0:12}"
+          source_image="local/krig-salad:${KRIG_VERSION}"
+          version_image="${repo}:${KRIG_VERSION}"
+          sha_image="${repo}:sha-${short_sha}"
+          latest_image="${repo}:latest"
+          docker tag "$source_image" "$version_image"
+          docker tag "$source_image" "$sha_image"
+          docker tag "$source_image" "$latest_image"
+
+          push_and_read_digest() {
+            local image="$1" output_file digest
+            output_file="$(mktemp)"
+            if ! docker push "$image" >"$output_file" 2>&1; then
+              cat "$output_file" >&2
+              rm -f -- "$output_file"
+              return 1
+            fi
+            cat "$output_file" >&2
+            digest="$(sed -nE 's/.*digest: (sha256:[0-9a-f]{64}).*/\1/p' "$output_file" | tail -n 1)"
+            rm -f -- "$output_file"
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "Could not read pushed manifest digest for ${image}" >&2; return 1; }
+            printf '%s\n' "$digest"
+          }
+
+          version_digest="$(push_and_read_digest "$version_image")"
+          sha_digest="$(push_and_read_digest "$sha_image")"
+          latest_digest="$(push_and_read_digest "$latest_image")"
+          [[ "$version_digest" == "$sha_digest" && "$version_digest" == "$latest_digest" ]] || {
+            echo "Published tags do not resolve to the same manifest digest." >&2
+            exit 1
+          }
+          {
+            echo "### KRig Salad image published"
+            echo
+            echo "- Version tag: `${version_image}`"
+            echo "- Commit tag: `${sha_image}`"
+            echo "- Convenience tag: `${latest_image}`"
+            echo "- Verified immutable reference: `${repo}@${version_digest}`"
+            echo "- Platform: `linux/amd64`"
+            echo "- KRig: `v${KRIG_VERSION}`"
+          } >> "$GITHUB_STEP_SUMMARY"

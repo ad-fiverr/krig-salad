@@ -1,0 +1,8 @@
+**
+!Dockerfile
+!README.md
+!krig-release.lock
+!krig-entrypoint.sh
+!krig-healthcheck.sh
+!verify-artifact.sh
+!ci-smoke-test.sh
