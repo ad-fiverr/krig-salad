@@ -20,7 +20,7 @@ if [[ "$mode" == --source ]]; then
   for script in "$ENTRYPOINT" "$HEALTHCHECK" "$VERIFIER" "$SCRIPT_DIR/ci-smoke-test.sh"; do
     bash -n "$script" || fail "Bash syntax check failed: $(basename "$script")"
   done
-  "$VERIFIER" --lock-only
+  bash "$VERIFIER" --lock-only
 
   cuda_base='nvidia/cuda:12.8.2-runtime-ubuntu22.04@sha256:f442e45b864e8e3fcb53764f69a011d494d402812ef4abec104621b508264a91'
   [[ "$(grep -Fc "$cuda_base" "$SCRIPT_DIR/Dockerfile")" -eq 2 ]] ||
@@ -126,7 +126,7 @@ PY
   exit 0
 fi
 
-"$VERIFIER" --lock-only
+bash "$VERIFIER" --lock-only
 binary="$SCRIPT_DIR/fl4shminer"
 [[ -f "$binary" && ! -L "$binary" && -x "$binary" ]] || fail "installed miner is missing or not executable"
 expected_sha="$(awk -F= '$1 == "executable_sha256" {print $2}' "$LOCK")"
