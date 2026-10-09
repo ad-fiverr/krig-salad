@@ -59,12 +59,25 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          docker buildx build \
-            --platform linux/amd64 \
-            --load \
-            --metadata-file "$RUNNER_TEMP/fl4sh-local-build.json" \
-            --tag fl4shminer-salad:ci \
+          local_build_args=(
+            --platform linux/amd64
+            --load
+            --metadata-file "$RUNNER_TEMP/fl4sh-local-build.json"
+            --tag fl4shminer-salad:ci
             gpu-mining/runtime/fl4shminer
+          )
+          for attempt in 1 2 3; do
+            if docker buildx build "${local_build_args[@]}"; then
+              break
+            fi
+            if (( attempt == 3 )); then
+              printf 'Local build failed after %s attempts.\n' "$attempt" >&2
+              exit 1
+            fi
+            delay_seconds=$((attempt * 30))
+            printf 'Local build failed; retrying in %s seconds (attempt %s of 3).\n' "$delay_seconds" "$((attempt + 1))" >&2
+            sleep "$delay_seconds"
+          done
           image_platform="$(docker image inspect fl4shminer-salad:ci --format '{{.Os}}/{{.Architecture}}')"
           [[ "$image_platform" == linux/amd64 ]]
           printf 'Local image platform: %s\n' "$image_platform"
