@@ -1,0 +1,134 @@
+name: Build Fl4shMiner Salad image
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - gpu-mining/runtime/fl4shminer/.dockerignore
+      - gpu-mining/runtime/fl4shminer/Dockerfile
+      - gpu-mining/runtime/fl4shminer/fl4sh-release.lock
+      - gpu-mining/runtime/fl4shminer/verify-artifact.sh
+      - gpu-mining/runtime/fl4shminer/fl4sh-entrypoint.sh
+      - gpu-mining/runtime/fl4shminer/fl4sh-healthcheck.sh
+      - gpu-mining/runtime/fl4shminer/ci-smoke-test.sh
+      - gpu-mining/runtime/fl4shminer/README.md
+      - .github/workflows/build-fl4shminer.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-fl4shminer-salad-main
+  cancel-in-progress: false
+
+env:
+  IMAGE: docker.io/myblockchaincompany/fl4shminer-salad
+  VERSION: 1.5.2
+
+jobs:
+  build-test-publish:
+    name: Build, smoke-test, and publish pinned image
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+
+      - name: Check runner disk space
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          available_kib="$(df -Pk / | awk 'END {print $4}')"
+          printf 'Available root filesystem: %s KiB\n' "$available_kib"
+          (( available_kib >= 4194304 )) || {
+            printf 'At least 4 GiB of free space is required for the CUDA build.\n' >&2
+            exit 1
+          }
+
+      - name: Parse workflow YAML
+        run: ruby -e 'require "yaml"; doc = YAML.load_file(ARGV.fetch(0)); abort "jobs missing" unless doc.is_a?(Hash) && doc["jobs"].is_a?(Hash)' .github/workflows/build-fl4shminer.yml
+
+      - name: Run source smoke tests
+        run: bash gpu-mining/runtime/fl4shminer/ci-smoke-test.sh --source
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Build local linux/amd64 image
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          docker buildx build \
+            --platform linux/amd64 \
+            --load \
+            --metadata-file "$RUNNER_TEMP/fl4sh-local-build.json" \
+            --tag fl4shminer-salad:ci \
+            gpu-mining/runtime/fl4shminer
+          image_platform="$(docker image inspect fl4shminer-salad:ci --format '{{.Os}}/{{.Architecture}}')"
+          [[ "$image_platform" == linux/amd64 ]]
+          printf 'Local image platform: %s\n' "$image_platform"
+
+      - name: Smoke-test image without network or GPU
+        run: docker run --rm --network none --entrypoint /opt/fl4shminer/ci-smoke-test.sh fl4shminer-salad:ci --image
+
+      - name: Log in to Docker Hub
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Publish version, commit, and latest tags
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          short_sha="${GITHUB_SHA:0:12}"
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --push \
+            --metadata-file "$RUNNER_TEMP/fl4sh-publish-metadata.json" \
+            --tag "$IMAGE:$VERSION" \
+            --tag "$IMAGE:sha-$short_sha" \
+            --tag "$IMAGE:latest" \
+            gpu-mining/runtime/fl4shminer
+          expected_digest="$(jq -r '."containerimage.digest" // empty' "$RUNNER_TEMP/fl4sh-publish-metadata.json")"
+          [[ "$expected_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            printf 'Buildx did not report a valid published digest.\n' >&2
+            exit 1
+          }
+
+      - name: Verify all published tags resolve to the same digest
+        if: github.ref == 'refs/heads/main'
+        id: verify-published
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          expected_digest="$(jq -r '."containerimage.digest" // empty' "$RUNNER_TEMP/fl4sh-publish-metadata.json")"
+          short_sha="${GITHUB_SHA:0:12}"
+          for tag in "$VERSION" "sha-$short_sha" latest; do
+            reference="$IMAGE:$tag"
+            description="$(docker buildx imagetools inspect "$reference")"
+            actual_digest="$(awk '$1 == "Digest:" {print $2; exit}' <<< "$description")"
+            [[ "$actual_digest" == "$expected_digest" ]] || {
+              printf '%s resolved to %s; expected %s\n' "$reference" "$actual_digest" "$expected_digest" >&2
+              exit 1
+            }
+            printf '%s -> %s\n' "$reference" "$actual_digest"
+          done
+
+      - name: Write immutable image reference to run summary
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          digest="$(jq -r '."containerimage.digest" // empty' "$RUNNER_TEMP/fl4sh-publish-metadata.json")"
+          {
+            printf '## Fl4shMiner Salad image published\n\n'
+            printf -- '- Version tag: %s:%s\n' "$IMAGE" "$VERSION"
+            printf -- '- Commit tag: %s:sha-%s\n' "$IMAGE" "${GITHUB_SHA:0:12}"
+            printf -- '- Latest tag: %s:latest\n' "$IMAGE"
+            printf -- '- Immutable reference: %s@%s\n' "$IMAGE" "$digest"
+            printf '\nAll three remote tags resolved to the same verified digest after the no-network image smoke test.\n'
+          } >> "$GITHUB_STEP_SUMMARY"

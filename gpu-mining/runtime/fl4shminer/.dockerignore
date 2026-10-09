@@ -1,0 +1,8 @@
+*
+!Dockerfile
+!README.md
+!fl4sh-release.lock
+!verify-artifact.sh
+!fl4sh-entrypoint.sh
+!fl4sh-healthcheck.sh
+!ci-smoke-test.sh

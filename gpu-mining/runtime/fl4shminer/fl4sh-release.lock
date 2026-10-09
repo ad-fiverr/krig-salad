@@ -1,0 +1,10 @@
+schema_version=1
+release_version=1.5.2
+target_platform=linux/amd64
+asset_url=https://github.com/Fl4sh9174/Fl4shMiner/releases/download/v1.5.2/fl4shminer-v1.5.2.tar.gz
+asset_bytes=53173385
+asset_sha256=105bf6e799adcc6a2a814b8a3ce1549696fe20a931cb9676bc363367280c4052
+asset_sha256_provenance=UPSTREAM_PUBLISHED
+executable_path=fl4shminer/fl4shminer
+executable_sha256=18eb1c096770c9f7614be2690172ff6418fdf1755b6c5b07e481ac15f3d85f58
+executable_sha256_provenance=LOCALLY_FROZEN_AUDIT
