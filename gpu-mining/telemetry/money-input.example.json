@@ -1,0 +1,7 @@
+{
+  "schema_version": "2.0",
+  "money_evidence": [],
+  "billing_evidence": [],
+  "balance_snapshots": [],
+  "active_worker_count_by_interval": {}
+}

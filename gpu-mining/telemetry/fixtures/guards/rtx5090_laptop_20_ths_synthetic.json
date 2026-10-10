@@ -1,0 +1,47 @@
+{
+  "fixture_status": "SYNTHETIC_TEST_ONLY",
+  "scenario": "user-observed RTX 5090 Laptop low-performance scenario reproduced synthetically; not a historical CSV measurement",
+  "gpu_identity": {
+    "raw_model": "NVIDIA GeForce RTX 5090 Laptop GPU",
+    "model": "RTX 5090",
+    "form_factor": "laptop",
+    "identity_source": "synthetic_test_fixture",
+    "identity_verified": true,
+    "identity_status": "synthetic_fixture_identity"
+  },
+  "policy": {
+    "gpu_floors_ths": {
+      "RTX 5090|laptop|synthetic_test_fixture": 25
+    },
+    "warmup_seconds": 180,
+    "hash_window_seconds": 300,
+    "minimum_samples_per_window": 5,
+    "expected_sample_interval_seconds": 60,
+    "maximum_sample_gap_seconds": 60,
+    "minimum_window_coverage_ratio": 1.0,
+    "consecutive_bad_windows": 2,
+    "reallocation_cooldown_seconds": 0,
+    "max_reallocations_per_run": 2
+  },
+  "samples": [
+    {"elapsed_seconds": 0, "hashrate_ths": 20, "hashrate_semantics": "fl4shminer_device_reported", "hashrate_source": "synthetic_fixture"},
+    {"elapsed_seconds": 60, "hashrate_ths": 20, "hashrate_semantics": "fl4shminer_device_reported", "hashrate_source": "synthetic_fixture"},
+    {"elapsed_seconds": 120, "hashrate_ths": 20, "hashrate_semantics": "fl4shminer_device_reported", "hashrate_source": "synthetic_fixture"},
+    {"elapsed_seconds": 180, "hashrate_ths": 20, "hashrate_semantics": "fl4shminer_device_reported", "hashrate_source": "synthetic_fixture"},
+    {"elapsed_seconds": 240, "hashrate_ths": 20, "hashrate_semantics": "fl4shminer_device_reported", "hashrate_source": "synthetic_fixture"},
+    {"elapsed_seconds": 300, "hashrate_ths": 20, "hashrate_semantics": "fl4shminer_device_reported", "hashrate_source": "synthetic_fixture"},
+    {"elapsed_seconds": 360, "hashrate_ths": 20, "hashrate_semantics": "fl4shminer_device_reported", "hashrate_source": "synthetic_fixture"},
+    {"elapsed_seconds": 420, "hashrate_ths": 20, "hashrate_semantics": "fl4shminer_device_reported", "hashrate_source": "synthetic_fixture"},
+    {"elapsed_seconds": 480, "hashrate_ths": 20, "hashrate_semantics": "fl4shminer_device_reported", "hashrate_source": "synthetic_fixture"},
+    {"elapsed_seconds": 540, "hashrate_ths": 20, "hashrate_semantics": "fl4shminer_device_reported", "hashrate_source": "synthetic_fixture"},
+    {"elapsed_seconds": 600, "hashrate_ths": 20, "hashrate_semantics": "fl4shminer_device_reported", "hashrate_source": "synthetic_fixture"},
+    {"elapsed_seconds": 660, "hashrate_ths": 20, "hashrate_semantics": "fl4shminer_device_reported", "hashrate_source": "synthetic_fixture"},
+    {"elapsed_seconds": 720, "hashrate_ths": 20, "hashrate_semantics": "fl4shminer_device_reported", "hashrate_source": "synthetic_fixture"},
+    {"elapsed_seconds": 780, "hashrate_ths": 20, "hashrate_semantics": "fl4shminer_device_reported", "hashrate_source": "synthetic_fixture"},
+    {"elapsed_seconds": 840, "hashrate_ths": 20, "hashrate_semantics": "fl4shminer_device_reported", "hashrate_source": "synthetic_fixture"},
+    {"elapsed_seconds": 900, "hashrate_ths": 20, "hashrate_semantics": "fl4shminer_device_reported", "hashrate_source": "synthetic_fixture"},
+    {"elapsed_seconds": 960, "hashrate_ths": 20, "hashrate_semantics": "fl4shminer_device_reported", "hashrate_source": "synthetic_fixture"},
+    {"elapsed_seconds": 1020, "hashrate_ths": 20, "hashrate_semantics": "fl4shminer_device_reported", "hashrate_source": "synthetic_fixture"},
+    {"elapsed_seconds": 1080, "hashrate_ths": 20, "hashrate_semantics": "fl4shminer_device_reported", "hashrate_source": "synthetic_fixture"}
+  ]
+}
