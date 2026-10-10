@@ -3,7 +3,7 @@ FROM --platform=linux/amd64 nvidia/cuda:12.8.2-runtime-ubuntu22.04@sha256:f442e4
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl file binutils coreutils tar python3-minimal \
+    && apt-get install -y --no-install-recommends ca-certificates curl file binutils coreutils tar python3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build/fl4shminer
