@@ -55,6 +55,16 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4.4.1
 
+      - name: Authenticate Docker Hub for pinned CUDA base pull
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          printf '%s' "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+
       - name: Build local linux/amd64 image
         shell: bash
         run: |
@@ -81,6 +91,10 @@ jobs:
           image_platform="$(docker image inspect fl4shminer-salad:ci --format '{{.Os}}/{{.Architecture}}')"
           [[ "$image_platform" == linux/amd64 ]]
           printf 'Local image platform: %s\n' "$image_platform"
+
+      - name: End Docker Hub pull session before smoke test
+        if: github.ref == 'refs/heads/main'
+        run: docker logout docker.io
 
       - name: Smoke-test image without network or GPU
         run: docker run --rm --network none --entrypoint /opt/fl4shminer/ci-smoke-test.sh fl4shminer-salad:ci --image
