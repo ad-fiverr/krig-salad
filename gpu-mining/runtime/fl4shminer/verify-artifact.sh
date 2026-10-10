@@ -111,8 +111,12 @@ try:
             if any(part in ("", ".", "..") for part in parts):
                 raise SystemExit("archive member escapes its extraction root")
             normalized = "/".join(parts)
-            if parts[0] != "fl4shminer" or normalized in normalized_members:
-                raise SystemExit("archive contains an unexpected or duplicate member path")
+            if parts[0] != "fl4shminer":
+                raise SystemExit(f"archive contains an unexpected member path: {name!r}")
+            if normalized in normalized_members:
+                if member.isdir() and normalized_members[normalized].isdir():
+                    continue
+                raise SystemExit(f"archive contains a duplicate member path: {name!r}")
             if not (member.isdir() or member.isfile()):
                 raise SystemExit("archive contains a link or special file")
             normalized_members[normalized] = member
