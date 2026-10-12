@@ -29,8 +29,10 @@ if [[ "$mode" == --source ]]; then
     fail "both Docker stages must use the pinned CUDA base"
   ! grep -Eq '^[[:space:]]*EXPOSE[[:space:]]' "$SCRIPT_DIR/Dockerfile" ||
     fail "Dockerfile must not expose a port"
-  grep -Fq 'python3-minimal' "$SCRIPT_DIR/Dockerfile" ||
-    fail "final image must install only the minimal Python runtime needed by the opt-in monitor"
+  grep -Fq 'apt-get install -y --no-install-recommends python3' "$SCRIPT_DIR/Dockerfile" ||
+    fail "final image must install the Python standard library needed by the opt-in monitor"
+  ! grep -Fq 'python3-minimal' "$SCRIPT_DIR/Dockerfile" ||
+    fail "final image must not substitute the incomplete minimal Python runtime"
   grep -Fq 'COPY --chmod=0555 fl4sh-runtime-monitor.py /opt/fl4shminer/fl4sh-runtime-monitor.py' "$SCRIPT_DIR/Dockerfile" ||
     fail "final image does not contain the runtime monitor"
   grep -Fxq '!fl4sh-runtime-monitor.py' "$SCRIPT_DIR/.dockerignore" ||
@@ -219,6 +221,11 @@ if command -v dpkg-query >/dev/null 2>&1; then
   [[ -z "$driver_packages" ]] || fail "runtime image contains host driver packages: $driver_packages"
 fi
 command -v python3 >/dev/null 2>&1 || fail "runtime image is missing the opt-in monitor Python interpreter"
+if ! python3 -c 'import collections, dataclasses, datetime, hashlib, json, math, os, queue, re, signal, subprocess, sys, threading, time, typing' >/tmp/fl4sh-python-stdlib.out 2>&1; then
+  printf 'Python standard-library import diagnostic (first 12 lines):\n' >&2
+  head -n 12 /tmp/fl4sh-python-stdlib.out | sed -E 's/(api[_-]?key|token|secret|password)([=: ]+)[^[:space:]]+/\1\2[REDACTED]/Ig' >&2
+  fail "runtime image is missing required Python standard-library modules"
+fi
 
 pool='stratum+tcp://pool.example:7048'
 mining_id='PRL_WALLET_FOR_IMAGE_SMOKE.worker-1'
@@ -237,9 +244,12 @@ FL4SH_POOL_URL="$pool" FL4SH_MINING_ID="$mining_id" \
   fail "installed non-mining runtime check failed"
 grep -Fq 'miner was not started; CUDA compatibility was not tested' /tmp/fl4sh-runtime.out ||
   fail "installed runtime check exceeded or misreported its scope"
-FL4SH_MONITOR_ENABLED=1 FL4SH_MONITOR_PROFILE=RTX_5090_LAPTOP \
-  python3 -B "$MONITOR" --check-config >/tmp/fl4sh-monitor-config.out 2>&1 ||
+if ! FL4SH_MONITOR_ENABLED=1 FL4SH_MONITOR_PROFILE=RTX_5090_LAPTOP \
+  python3 -B "$MONITOR" --check-config >/tmp/fl4sh-monitor-config.out 2>&1; then
+  printf 'Monitor config diagnostic (first 12 lines):\n' >&2
+  head -n 12 /tmp/fl4sh-monitor-config.out | sed -E 's/(api[_-]?key|token|secret|password)([=: ]+)[^[:space:]]+/\1\2[REDACTED]/Ig' >&2
   fail "installed monitor rejected its valid offline configuration"
+fi
 FL4SH_POOL_URL="$pool" FL4SH_MINING_ID="$mining_id" \
   FL4SH_MONITOR_ENABLED=1 FL4SH_MONITOR_PROFILE=RTX_5090_LAPTOP \
   "$ENTRYPOINT" --check-runtime >/tmp/fl4sh-monitor-runtime.out 2>&1 ||

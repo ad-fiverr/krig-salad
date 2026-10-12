@@ -13,10 +13,10 @@ RUN chmod 0555 verify-artifact.sh \
 
 FROM --platform=linux/amd64 nvidia/cuda:12.8.2-runtime-ubuntu22.04@sha256:f442e45b864e8e3fcb53764f69a011d494d402812ef4abec104621b508264a91
 
-# The opt-in log supervisor needs only the distro Python interpreter. Keep the
-# final stage free of pip, compilers, downloaders, and build tooling.
+# The opt-in log supervisor needs Python's standard library. Keep the final
+# stage free of pip, compilers, downloaders, and build tooling.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3-minimal \
+    && apt-get install -y --no-install-recommends python3 \
     && rm -rf /var/lib/apt/lists/*
 
 LABEL org.opencontainers.image.title="Fl4shMiner Salad runtime" \

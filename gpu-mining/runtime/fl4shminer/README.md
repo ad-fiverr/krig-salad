@@ -13,6 +13,8 @@ This directory builds an isolated Linux/amd64 image for Fl4shMiner v1.5.2 and Pe
 
 The builder verifies the exact archive byte count and digest before inspecting its tar members. Extraction accepts only regular files and directories under the expected fl4shminer root, rejects links and traversal paths, extracts only the locked executable, then checks its digest and ELF64 x86-64 identity. The final image does not contain the download/build toolchain.
 
+The opt-in supervisor requires the Python standard library. The final stage installs Ubuntu's `python3` package with `--no-install-recommends`; `python3-minimal` alone is insufficient because modules such as `dataclasses` are supplied by the full standard-library package. The image smoke checks the imports used by the monitor before validating its offline configuration. CI diagnostics for these checks are bounded and redacted.
+
 The upstream publisher describes a 1.5% developer fee. That is a publisher claim, not a separately measured fee for this runtime or a Salad session.
 
 ## Runtime contract
@@ -52,7 +54,7 @@ The image smoke test runs with Docker networking disabled and no GPU:
 
     docker run --rm --network none --entrypoint /opt/fl4shminer/ci-smoke-test.sh fl4shminer-salad:ci --image
 
-It verifies the installed binary hash and ELF header, runtime package boundary, config handling, and healthcheck behavior outside a mining container. It does not connect to a pool or invoke the real miner.
+It verifies the required Python standard-library imports, installed binary hash and ELF header, runtime package boundary, config handling, and healthcheck behavior outside a mining container. It does not connect to a pool or invoke the real miner. A passing image smoke is required before the workflow publishes the version, commit, and latest tags.
 
 The independent GitHub Actions workflow builds and smoke-tests a local linux/amd64 image before Docker Hub login. On main only, it publishes the same image as 1.5.2, sha-<12-character-commit>, and latest, then checks that all tags resolve to the published digest. Required repository secrets are DOCKERHUB_USERNAME and DOCKERHUB_TOKEN. The destination is fixed to docker.io/myblockchaincompany/fl4shminer-salad.
 
