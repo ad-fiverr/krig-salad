@@ -32,7 +32,29 @@ DEVICE_RATE_RE = re.compile(
     r"(?:\s*,\s*warm:\s*(?P<warm>[0-9]+))?\b",
     re.IGNORECASE,
 )
+GPU_KEY_RE = re.compile(
+    r"RTX_[0-9]{4}(?:_[A-Z0-9]{1,16})*(?:_(?:LAPTOP|DESKTOP))?"
+)
+GPU_INITIALIZED_RE = re.compile(
+    r"Device\s*\[(?P<device>[0-9]{1,3})\]\s+"
+    r"(?P<gpu>[^\r\n:]{1,256})\s*:\s*Initialized\b",
+    re.IGNORECASE,
+)
+PEARL_GPU_RE = re.compile(
+    r"(?:Device\s*\[(?P<device>[0-9]{1,3})\]\s*)?"
+    r"GPU\s*=\s*(?P<gpu>[^\r\n]{1,256}?)\s+"
+    r"Pearl\s+autotune\s+hashrate\s*=",
+    re.IGNORECASE,
+)
+SOLUTIONS_GPU_RE = re.compile(
+    r"Solutions\s+accepted:.*?(?P<device>[0-9]{1,3})-"
+    r"(?P<gpu>NVIDIA\s+GeForce\s+RTX\s+[^,;\r\n]{1,192})",
+    re.IGNORECASE,
+)
 MAX_PARSE_LINE_BYTES = 64 * 1024
+MAX_GPU_REGISTRY_BYTES = 16 * 1024
+MAX_GPU_REGISTRY_ENTRIES = 64
+MAX_GPU_FLOOR_THS = 10_000.0
 
 PROFILE_FLOORS: dict[str, tuple[str, float]] = {
     "RTX_5080_LAPTOP": ("SALAD_G5_GPU_FLOOR_RTX_5080_LAPTOP_THS", 120.0),
@@ -40,6 +62,10 @@ PROFILE_FLOORS: dict[str, tuple[str, float]] = {
     "RTX_5080_DESKTOP": ("SALAD_G5_GPU_FLOOR_RTX_5080_DESKTOP_THS", 209.0),
     "RTX_5090_DESKTOP": ("SALAD_G5_GPU_FLOOR_RTX_5090_DESKTOP_THS", 350.0),
 }
+DEFAULT_GPU_FLOORS: dict[str, float] = {
+    profile: default for profile, (_env_name, default) in PROFILE_FLOORS.items()
+}
+GPU_REGISTRY_ENV = "FL4SH_MONITOR_GPU_FLOORS_JSON"
 
 TIMING_ENV: dict[str, tuple[str, str, float | int]] = {
     "warmup_seconds": ("SALAD_G5_WARMUP_SECONDS", "int", 90),
@@ -63,6 +89,8 @@ class MonitorConfig:
     profile: str | None
     floor_ths: float | None
     floor_source: str
+    floor_registry: tuple[tuple[str, float], ...]
+    floor_registry_sources: tuple[tuple[str, str], ...]
     warmup_seconds: int
     expected_sample_interval_seconds: int
     hash_window_seconds: int
@@ -90,19 +118,28 @@ class MonitorConfig:
 
         profile_text = env.get("FL4SH_MONITOR_PROFILE")
         profile: str | None = profile_text if profile_text else None
-        if profile is not None and profile not in PROFILE_FLOORS:
-            raise MonitorConfigError("FL4SH_MONITOR_PROFILE is not an exact supported profile")
+        if profile is not None and not _is_canonical_gpu_key(profile):
+            raise MonitorConfigError("FL4SH_MONITOR_PROFILE must be a canonical GPU key")
 
-        floor: float | None = None
-        floor_source = "UNCONFIGURED"
-        if profile is not None:
-            floor_env, default_floor = PROFILE_FLOORS[profile]
+        floor_registry = dict(DEFAULT_GPU_FLOORS)
+        floor_sources = {key: "G5_DEFAULT" for key in floor_registry}
+        for key, (floor_env, _default_floor) in PROFILE_FLOORS.items():
             if floor_env in env:
-                floor = _parse_finite_number(env[floor_env], floor_env, allow_zero=False)
-                floor_source = "ENV"
-            else:
-                floor = default_floor
-                floor_source = "G5_DEFAULT"
+                floor_registry[key] = _parse_env_floor(env[floor_env], floor_env)
+                floor_sources[key] = "ENV"
+
+        if GPU_REGISTRY_ENV in env:
+            dynamic_floors = _parse_gpu_floor_registry(env[GPU_REGISTRY_ENV])
+            for key, value in dynamic_floors.items():
+                floor_registry[key] = value
+                floor_sources[key] = "ENV_REGISTRY"
+
+        floor: float | None = floor_registry.get(profile) if profile is not None else None
+        floor_source = (
+            floor_sources.get(profile, "UNCONFIGURED")
+            if profile is not None
+            else "UNCONFIGURED"
+        )
 
         timing: dict[str, int | float] = {}
         for key, (env_name, kind, default) in TIMING_ENV.items():
@@ -123,6 +160,8 @@ class MonitorConfig:
             "profile": profile,
             "floor_ths": floor,
             "floor_source": floor_source,
+            "floor_registry": sorted(floor_registry.items()),
+            "floor_registry_sources": sorted(floor_sources.items()),
             **timing,
         }
         policy_hash = hashlib.sha256(
@@ -133,9 +172,151 @@ class MonitorConfig:
             profile=profile,
             floor_ths=floor,
             floor_source=floor_source,
+            floor_registry=tuple(sorted(floor_registry.items())),
+            floor_registry_sources=tuple(sorted(floor_sources.items())),
             **timing,
             policy_hash=policy_hash,
         )
+
+
+def _is_canonical_gpu_key(key: str) -> bool:
+    return bool(GPU_KEY_RE.fullmatch(key))
+
+
+def _parse_floor(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise MonitorConfigError(f"{name} values must be numeric")
+    try:
+        parsed = float(value)
+    except (OverflowError, ValueError):
+        raise MonitorConfigError(f"{name} values must be finite, positive, and within the supported limit") from None
+    if not math.isfinite(parsed) or parsed <= 0 or parsed > MAX_GPU_FLOOR_THS:
+        raise MonitorConfigError(f"{name} values must be finite, positive, and within the supported limit")
+    return parsed
+
+
+def _parse_env_floor(value: str, name: str) -> float:
+    parsed = _parse_finite_number(value, name, allow_zero=False)
+    if parsed > MAX_GPU_FLOOR_THS:
+        raise MonitorConfigError(f"{name} exceeds the supported floor limit")
+    return parsed
+
+
+def _parse_gpu_floor_registry(raw: str) -> dict[str, float]:
+    if len(raw.encode("utf-8", "replace")) > MAX_GPU_REGISTRY_BYTES:
+        raise MonitorConfigError(f"{GPU_REGISTRY_ENV} exceeds the supported size")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        seen_aliases: set[str] = set()
+        for key, value in pairs:
+            if key in result or key.upper() in seen_aliases:
+                raise MonitorConfigError(f"{GPU_REGISTRY_ENV} contains duplicate or aliased keys")
+            if not _is_canonical_gpu_key(key):
+                raise MonitorConfigError(f"{GPU_REGISTRY_ENV} keys must be canonical GPU keys")
+            result[key] = value
+            seen_aliases.add(key.upper())
+        return result
+
+    try:
+        decoded = json.loads(
+            raw,
+            object_pairs_hook=unique_object,
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+        )
+    except MonitorConfigError:
+        raise
+    except (json.JSONDecodeError, TypeError, ValueError, UnicodeError):
+        raise MonitorConfigError(f"{GPU_REGISTRY_ENV} must contain a valid JSON object") from None
+    if not isinstance(decoded, dict):
+        raise MonitorConfigError(f"{GPU_REGISTRY_ENV} must contain a valid JSON object")
+    if len(decoded) > MAX_GPU_REGISTRY_ENTRIES:
+        raise MonitorConfigError(f"{GPU_REGISTRY_ENV} exceeds the supported entry count")
+    return {key: _parse_floor(value, GPU_REGISTRY_ENV) for key, value in decoded.items()}
+
+
+@dataclass(frozen=True)
+class GpuIdentityObservation:
+    device_index: int | None
+    raw_name: str
+    gpu_key: str | None
+    source: str
+
+
+def normalize_gpu_identity(raw_name: str) -> str | None:
+    """Normalize Fl4shMiner names, retaining neutral keys when form is absent."""
+    match = re.fullmatch(
+        r"NVIDIA\s+GeForce\s+RTX\s+(?P<model>[0-9]{4})(?P<tail>.*)",
+        raw_name.strip(),
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    model = match.group("model")
+    tokens = re.findall(r"[A-Za-z0-9]+", match.group("tail"))
+    tokens = [token.upper() for token in tokens if token.upper() != "GPU"]
+    laptop_tags = {"LAPTOP", "NOTEBOOK", "MOBILE"}
+    forms = {token for token in tokens if token in laptop_tags | {"DESKTOP"}}
+    if len(forms) > 1:
+        return None
+    if forms:
+        form = "LAPTOP" if next(iter(forms)) in laptop_tags else "DESKTOP"
+        variants = [token for token in tokens if token not in laptop_tags | {"DESKTOP"}]
+    elif not tokens and model in {"5080", "5090"}:
+        # Preserve the existing exact 5080/5090 mappings used by the operator.
+        # Other models without a form factor remain neutral below.
+        form = "DESKTOP"
+        variants = []
+    else:
+        # Preserve the missing form factor as a neutral identity. This can only
+        # match an equally neutral registry key; it never inherits a Laptop or
+        # Desktop floor.
+        form = None
+        variants = tokens
+    if len(variants) > 3:
+        return None
+    variant_suffix = "".join(f"_{token}" for token in variants)
+    form_suffix = f"_{form}" if form is not None else ""
+    key = f"RTX_{model}{variant_suffix}{form_suffix}"
+    return key if _is_canonical_gpu_key(key) else None
+
+
+def parse_gpu_identity_observations(line: str) -> list[GpuIdentityObservation]:
+    """Read model identity only; autotune values never become performance samples."""
+    observations: list[GpuIdentityObservation] = []
+    for match in GPU_INITIALIZED_RE.finditer(line):
+        raw_name = match.group("gpu").strip()
+        safe_name = _redact_complete_text(raw_name)
+        observations.append(
+            GpuIdentityObservation(
+                int(match.group("device")), raw_name,
+                normalize_gpu_identity(raw_name) if safe_name == raw_name else None,
+                "device_initialized",
+            )
+        )
+    for match in PEARL_GPU_RE.finditer(line):
+        raw_name = match.group("gpu").strip()
+        safe_name = _redact_complete_text(raw_name)
+        device_text = match.group("device")
+        observations.append(
+            GpuIdentityObservation(
+                int(device_text) if device_text is not None else None,
+                raw_name,
+                normalize_gpu_identity(raw_name) if safe_name == raw_name else None,
+                "pearl_autotune_model",
+            )
+        )
+    for match in SOLUTIONS_GPU_RE.finditer(line):
+        raw_name = match.group("gpu").strip()
+        safe_name = _redact_complete_text(raw_name)
+        observations.append(
+            GpuIdentityObservation(
+                int(match.group("device")), raw_name,
+                normalize_gpu_identity(raw_name) if safe_name == raw_name else None,
+                "solutions_accepted_model",
+            )
+        )
+    return observations
 
 
 def _parse_finite_number(value: str, name: str, *, allow_zero: bool) -> float:
@@ -226,6 +407,15 @@ class SamplePoint:
 class DeviceState:
     device_index: int
     samples: deque[SamplePoint] = field(default_factory=deque)
+    identity_candidates: set[str] = field(default_factory=set)
+    identity_sources: set[str] = field(default_factory=set)
+    identity_primary_seen: bool = False
+    gpu_key: str | None = None
+    gpu_raw_name: str | None = None
+    gpu_identity_source: str | None = None
+    gpu_identity_status: str = "UNOBSERVED"
+    identity_conflict: bool = False
+    profile_mismatch: bool = False
     last_evaluation_at: float | None = None
     last_state: str | None = None
     consecutive_bad_windows: int = 0
@@ -247,20 +437,133 @@ class Fl4shMonitor:
         self._global_eval_at: float | None = None
 
     def observe_line(self, line: str, *, now: float | None = None) -> list[dict[str, Any]]:
+        timestamp = time.monotonic() if now is None else now
+        events: list[dict[str, Any]] = []
+        for observation in parse_gpu_identity_observations(line):
+            device_index = observation.device_index
+            if device_index is None:
+                # An unindexed autotune observation is corroboration only after
+                # the primary Device [N] Initialized identity exists.
+                if len(self.devices) != 1:
+                    continue
+                device_index = next(iter(self.devices))
+                if not self.devices[device_index].identity_primary_seen:
+                    continue
+            state = self.devices.setdefault(device_index, DeviceState(device_index))
+            events.extend(self._apply_identity(state, observation))
+
         sample = parse_device_hashrate(line)
         if sample is None:
-            return []
-        timestamp = time.monotonic() if now is None else now
+            return events
         state = self.devices.setdefault(sample.device_index, DeviceState(sample.device_index))
         if state.samples and timestamp <= state.samples[-1].monotonic_seconds:
             state.duplicate_timestamps += 1
-            return []
+            return events
         state.samples.append(SamplePoint(timestamp, sample))
         self._trim_samples(state, timestamp)
         if state.last_state is None:
-            initial_state = "WARMUP" if self.config.floor_ths is not None else "NO_FLOOR_CONFIGURED"
+            floor, _source, _issue = self._effective_floor(state)
+            initial_state = "WARMUP" if floor is not None else "NO_FLOOR_CONFIGURED"
             state.last_state = initial_state
-            return [self._event(state, initial_state, observed=sample.hashrate_ths)]
+            events.append(self._event(state, initial_state, observed=sample.hashrate_ths))
+        return events
+
+    def _effective_floor(
+        self, state: DeviceState | None
+    ) -> tuple[float | None, str, str | None]:
+        if state is not None and state.identity_conflict:
+            return None, "IDENTITY_CONFLICT", "GPU_IDENTITY_CONFLICT"
+        if state is not None and state.profile_mismatch:
+            return None, "PROFILE_MISMATCH", "GPU_PROFILE_MISMATCH"
+        if state is not None and state.gpu_identity_status == "UNKNOWN":
+            return None, "UNCONFIGURED", "NO_FLOOR_CONFIGURED"
+        if self.config.profile is not None:
+            if state is not None and state.gpu_key and state.gpu_key != self.config.profile:
+                return None, "PROFILE_MISMATCH", "GPU_PROFILE_MISMATCH"
+            if self.config.floor_ths is None:
+                return None, "UNCONFIGURED", "NO_FLOOR_CONFIGURED"
+            return self.config.floor_ths, "PROFILE_OVERRIDE", None
+        if state is None or state.gpu_identity_status != "DETECTED" or state.gpu_key is None:
+            return None, "UNCONFIGURED", "NO_FLOOR_CONFIGURED"
+        registry = dict(self.config.floor_registry)
+        sources = dict(self.config.floor_registry_sources)
+        floor = registry.get(state.gpu_key)
+        if floor is None:
+            return None, "UNCONFIGURED", "NO_FLOOR_CONFIGURED"
+        return floor, sources.get(state.gpu_key, "ENV_REGISTRY"), None
+
+    def _apply_identity(
+        self, state: DeviceState, observation: GpuIdentityObservation
+    ) -> list[dict[str, Any]]:
+        prior_status = state.gpu_identity_status
+        is_primary = observation.source == "device_initialized"
+        state.identity_sources.add(observation.source)
+        if observation.gpu_key is not None:
+            if state.identity_candidates and observation.gpu_key not in state.identity_candidates:
+                state.identity_conflict = True
+            state.identity_candidates.add(observation.gpu_key)
+        elif state.identity_candidates:
+            # A GPU-specific but ambiguous observation cannot silently leave
+            # an older model's floor and low-performance episode active.
+            state.identity_conflict = True
+        else:
+            state.gpu_identity_status = "UNKNOWN"
+            state.gpu_key = None
+            state.consecutive_bad_windows = 0
+            state.recommendation_emitted = False
+            if is_primary or state.gpu_raw_name is None:
+                state.gpu_raw_name = observation.raw_name
+                state.gpu_identity_source = observation.source
+            state.last_state = "GPU_IDENTITY_UNKNOWN"
+            if prior_status != "UNKNOWN":
+                return [self._event(state, "GPU_IDENTITY_UNKNOWN", observed=self._latest_rate(state))]
+            return []
+
+        if state.identity_conflict:
+            state.gpu_key = None
+            state.gpu_identity_status = "CONFLICT"
+            state.profile_mismatch = False
+            state.consecutive_bad_windows = 0
+            state.recommendation_emitted = False
+            state.last_state = "GPU_IDENTITY_CONFLICT"
+            if prior_status != "CONFLICT":
+                return [self._event(state, "GPU_IDENTITY_CONFLICT", observed=self._latest_rate(state))]
+            return []
+
+        if observation.gpu_key is None:
+            return []
+
+        if not is_primary:
+            # Secondary sources may confirm or conflict with a primary source,
+            # but may never establish an identity or enable a floor by themselves.
+            if not state.identity_primary_seen:
+                state.gpu_key = None
+                state.gpu_identity_status = "UNKNOWN"
+                state.consecutive_bad_windows = 0
+                state.recommendation_emitted = False
+                state.last_state = "GPU_IDENTITY_UNKNOWN"
+                if prior_status != "UNKNOWN":
+                    return [self._event(state, "GPU_IDENTITY_UNKNOWN", observed=self._latest_rate(state))]
+            return []
+
+        state.identity_primary_seen = True
+        state.gpu_key = observation.gpu_key
+        state.gpu_identity_status = "DETECTED"
+        state.gpu_raw_name = observation.raw_name
+        state.gpu_identity_source = observation.source
+        if self.config.profile is not None and observation.gpu_key != self.config.profile:
+            state.profile_mismatch = True
+            state.gpu_identity_status = "PROFILE_MISMATCH"
+            state.consecutive_bad_windows = 0
+            state.recommendation_emitted = False
+            state.last_state = "GPU_PROFILE_MISMATCH"
+            if prior_status != "PROFILE_MISMATCH":
+                return [self._event(state, "GPU_PROFILE_MISMATCH", observed=self._latest_rate(state))]
+            return []
+        if state.last_state == "NO_FLOOR_CONFIGURED":
+            state.last_state = None
+        if prior_status not in {"DETECTED", "PROFILE_MISMATCH"}:
+            return [self._event(state, "GPU_DETECTED", observed=self._latest_rate(state))]
         return []
 
     def tick(self, *, now: float | None = None) -> list[dict[str, Any]]:
@@ -283,18 +586,39 @@ class Fl4shMonitor:
 
         events: list[dict[str, Any]] = []
         for state in self.devices.values():
+            if not state.samples:
+                if state.identity_conflict or state.profile_mismatch:
+                    continue
+                if (
+                    state.last_evaluation_at is not None
+                    and timestamp - state.last_evaluation_at < self.config.reevaluation_interval_seconds
+                ):
+                    continue
+                state.last_evaluation_at = timestamp
+                elapsed = timestamp - self.started_at
+                if elapsed < self.config.warmup_seconds:
+                    no_sample_state = "WARMUP"
+                elif elapsed < self.config.warmup_seconds + self.config.maximum_sample_gap_seconds:
+                    no_sample_state = "INSUFFICIENT_DATA"
+                else:
+                    no_sample_state = "TELEMETRY_STALE"
+                events.extend(self._set_state(state, no_sample_state, observed=None))
+                continue
             if (
                 state.last_evaluation_at is not None
                 and timestamp - state.last_evaluation_at < self.config.reevaluation_interval_seconds
             ):
                 continue
             state.last_evaluation_at = timestamp
+            _floor, _floor_source, identity_issue = self._effective_floor(state)
+            if identity_issue in {"GPU_IDENTITY_CONFLICT", "GPU_PROFILE_MISMATCH"}:
+                state.consecutive_bad_windows = 0
+                events.extend(
+                    self._set_state(state, identity_issue, observed=self._latest_rate(state))
+                )
+                continue
             if timestamp - self.started_at < self.config.warmup_seconds:
                 events.extend(self._set_state(state, "WARMUP", observed=self._latest_rate(state)))
-                continue
-            if not state.samples:
-                state.consecutive_bad_windows = 0
-                events.extend(self._set_state(state, "INSUFFICIENT_DATA", observed=None))
                 continue
             age = timestamp - state.samples[-1].monotonic_seconds
             if age > self.config.maximum_sample_gap_seconds:
@@ -317,13 +641,14 @@ class Fl4shMonitor:
                     )
                 )
                 continue
-            if self.config.floor_ths is None:
+            floor, _floor_source, floor_issue = self._effective_floor(state)
+            if floor is None:
                 state.consecutive_bad_windows = 0
                 stats = self._window_stats(state, timestamp)
                 events.extend(
                     self._set_state(
                         state,
-                        "NO_FLOOR_CONFIGURED",
+                        floor_issue or "NO_FLOOR_CONFIGURED",
                         observed=stats["mean_ths"] if stats["valid"] else self._latest_rate(state),
                         stats=stats,
                     )
@@ -347,7 +672,7 @@ class Fl4shMonitor:
             state.last_window_mean_ths = mean_rate
             state.last_coverage_ratio = float(stats["coverage_ratio"])
             state.last_window_sample_count = int(stats["sample_count"])
-            if mean_rate < self.config.floor_ths:
+            if mean_rate < floor:
                 state.consecutive_bad_windows += 1
                 if (
                     state.consecutive_bad_windows >= self.config.consecutive_bad_windows
@@ -481,6 +806,8 @@ class Fl4shMonitor:
     ) -> dict[str, Any]:
         latest = state.samples[-1].sample if state is not None and state.samples else None
         device = f"fl4shminer_device:{state.device_index}" if state is not None else "unobserved"
+        floor, floor_source, _identity_issue = self._effective_floor(state)
+        identity_sources = sorted(state.identity_sources) if state is not None else []
         return {
             "component": "FL4SH_MONITOR",
             "state": state_name,
@@ -488,8 +815,13 @@ class Fl4shMonitor:
             "profile_is_operator_configuration_only": True,
             "device": device,
             "device_namespace": "fl4shminer_device" if state is not None else "unknown",
-            "floor_ths": self.config.floor_ths,
-            "floor_source": self.config.floor_source,
+            "gpu_key": state.gpu_key if state is not None and state.gpu_key else "unknown",
+            "gpu_raw": _redact_complete_text(state.gpu_raw_name) if state is not None and state.gpu_raw_name else None,
+            "gpu_identity_status": state.gpu_identity_status if state is not None else "UNKNOWN",
+            "gpu_identity_sources": identity_sources,
+            "gpu_identity_candidates": sorted(state.identity_candidates) if state is not None else [],
+            "floor_ths": floor,
+            "floor_source": floor_source,
             "observed_window_mean_ths": observed,
             "latest_device_hashrate_ths": self._latest_rate(state) if state is not None else None,
             "window_coverage_ratio": float(stats["coverage_ratio"]) if stats is not None else None,
@@ -510,7 +842,13 @@ class Fl4shMonitor:
                 else None
             ),
             "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "source": "fl4shminer_stdout:Device hashRate",
+            "source": (
+                f"fl4shminer_stdout:{state.gpu_identity_source or 'identity'}"
+                if state is not None and state_name in {
+                    "GPU_DETECTED", "GPU_IDENTITY_UNKNOWN", "GPU_IDENTITY_CONFLICT", "GPU_PROFILE_MISMATCH"
+                }
+                else "fl4shminer_stdout:Device hashRate"
+            ),
             "policy_hash": self.config.policy_hash,
             "provider_binding_status": "UNKNOWN",
             "gpu_identity_verified": False,
@@ -530,7 +868,11 @@ def format_event(event: Mapping[str, Any]) -> str:
         f'state={event["state"]}',
         f'profile={event["profile"]}',
         f'device={event["device"]}',
+        f'gpu_key={event["gpu_key"]}',
+        f'gpu_candidates={",".join(event["gpu_identity_candidates"]) or "unknown"}',
+        f'gpu_raw={json.dumps(event["gpu_raw"], ensure_ascii=True) if event["gpu_raw"] is not None else "unknown"}',
         f'floor={_format_number(floor)}',
+        f'floor_ths={_format_number(floor)}',
         f'floor_source={event["floor_source"]}',
         f'observed={_format_number(observed)}',
         f'bad_windows={bad}',
@@ -564,6 +906,8 @@ def format_config(config: MonitorConfig) -> str:
             f"profile={config.profile or 'unknown'}",
             f"floor={_format_number(config.floor_ths)}",
             f"floor_source={config.floor_source}",
+            f"floor_registry_entries={len(config.floor_registry)}",
+            "floor_registry_sources=G5_DEFAULT+SALAD_G5_GPU_FLOOR_*+FL4SH_MONITOR_GPU_FLOORS_JSON",
             f"warmup_seconds={config.warmup_seconds}",
             f"expected_sample_interval_seconds={config.expected_sample_interval_seconds}",
             f"hash_window_seconds={config.hash_window_seconds}",
@@ -657,6 +1001,13 @@ class StreamingRedactor:
             output.append(self.buffer[0])
             del self.buffer[0]
         return bytes(output)
+
+
+def _redact_complete_text(value: str) -> str:
+    """Redact a complete record using the same secret policy as raw streams."""
+    secret = os.environ.get("FL4SH_MINING_ID", "")
+    redactor = StreamingRedactor([secret])
+    return redactor.feed(value.encode("utf-8"), final=True).decode("utf-8", errors="replace")
 
 
 def _write_stream(stream_name: str, content: bytes, open_streams: dict[str, bool], write_lock: threading.Lock) -> None:
@@ -768,7 +1119,7 @@ def run_supervisor(
 
     def emit(events: list[dict[str, Any]]) -> None:
         for event in events:
-            line = (format_event(event) + "\n").encode("utf-8")
+            line = _redact_complete_text(format_event(event) + "\n").encode("utf-8")
             _write_stream("stdout", line, open_streams, write_lock)
 
     def safe_tick() -> None:

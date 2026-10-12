@@ -44,6 +44,23 @@ def make_config(**overrides: str) -> MONITOR.MonitorConfig:
     return MONITOR.MonitorConfig.from_env(values, require_enabled=True)
 
 
+def make_auto_config(**overrides: str) -> MONITOR.MonitorConfig:
+    values = {
+        "FL4SH_MONITOR_ENABLED": "1",
+        "FL4SH_MONITOR_PROFILE": "",
+        "SALAD_G5_WARMUP_SECONDS": "0",
+        "SALAD_G5_EXPECTED_SAMPLE_INTERVAL_SECONDS": "10",
+        "SALAD_G5_HASH_WINDOW_SECONDS": "20",
+        "SALAD_G5_REEVALUATION_INTERVAL_SECONDS": "5",
+        "SALAD_G5_MINIMUM_SAMPLES_PER_WINDOW": "2",
+        "SALAD_G5_MAXIMUM_SAMPLE_GAP_SECONDS": "10",
+        "SALAD_G5_MINIMUM_WINDOW_COVERAGE_RATIO": "0.8",
+        "SALAD_G5_CONSECUTIVE_BAD_WINDOWS": "1",
+    }
+    values.update(overrides)
+    return MONITOR.MonitorConfig.from_env(values, require_enabled=True)
+
+
 def line(rate: float, *, device: int = 1, stale: str = "0/0 (0.0%)") -> str:
     return f"Device [{device}] hashRate: {rate:.2f} TH/s, stale: {stale}, warm: 0"
 
@@ -79,7 +96,7 @@ class MonitorConfigTests(unittest.TestCase):
                 )
         with self.assertRaises(MONITOR.MonitorConfigError):
             MONITOR.MonitorConfig.from_env(
-                {"FL4SH_MONITOR_ENABLED": "1", "FL4SH_MONITOR_PROFILE": "RTX_5090"},
+                {"FL4SH_MONITOR_ENABLED": "1", "FL4SH_MONITOR_PROFILE": "GPU_5090"},
                 require_enabled=True,
             )
 
@@ -142,6 +159,74 @@ class MonitorConfigTests(unittest.TestCase):
         self.assertIn("provider_binding=UNKNOWN", rendered)
         self.assertNotIn("FL4SH_MINING_ID", rendered)
 
+    def test_dynamic_floor_registry_overrides_defaults_and_supports_new_gpu_keys(self) -> None:
+        config = make_auto_config(
+            SALAD_G5_GPU_FLOOR_RTX_5080_LAPTOP_THS="125",
+            FL4SH_MONITOR_GPU_FLOORS_JSON=(
+                '{"RTX_5080_LAPTOP":110,"RTX_5090_LAPTOP":115,'
+                '"RTX_5070_TI_LAPTOP":100}'
+            ),
+        )
+        registry = dict(config.floor_registry)
+        sources = dict(config.floor_registry_sources)
+        self.assertEqual(registry["RTX_5080_LAPTOP"], 110)
+        self.assertEqual(sources["RTX_5080_LAPTOP"], "ENV_REGISTRY")
+        self.assertEqual(registry["RTX_5070_TI_LAPTOP"], 100)
+        self.assertEqual(registry["RTX_5080_DESKTOP"], 209)
+        self.assertIsNone(config.floor_ths)
+        self.assertIn("FL4SH_MONITOR_GPU_FLOORS_JSON", MONITOR.format_config(config))
+
+    def test_dynamic_registry_json_fails_closed_without_echoing_content(self) -> None:
+        invalid = (
+            "not-json synthetic-secret-123",
+            "[]",
+            "null",
+            '{"RTX_5080_LAPTOP":true}',
+            '{"RTX_5080_LAPTOP":"110"}',
+            '{"RTX_5080_LAPTOP":0}',
+            '{"RTX_5080_LAPTOP":-1}',
+            '{"RTX_5080_LAPTOP":10001}',
+            '{"RTX_5080_LAPTOP":NaN}',
+            '{"RTX_5080_LAPTOP":Infinity}',
+            '{"GPU_5080":110}',
+            '{"rtx_5080_laptop":110}',
+            '{"RTX_5080_LAPTOP":110,"RTX_5080_LAPTOP":111}',
+            '{"RTX_5080_LAPTOP":110,"rtx_5080_laptop":111}',
+        )
+        for raw in invalid:
+            with self.subTest(raw=raw):
+                with self.assertRaises(MONITOR.MonitorConfigError) as caught:
+                    make_auto_config(FL4SH_MONITOR_GPU_FLOORS_JSON=raw)
+                self.assertNotIn("synthetic-secret-123", str(caught.exception))
+
+    def test_registry_hash_changes_when_any_dynamic_floor_changes(self) -> None:
+        one = make_auto_config(
+            FL4SH_MONITOR_GPU_FLOORS_JSON='{"RTX_5080_LAPTOP":110,"RTX_5070_TI_LAPTOP":100}'
+        )
+        two = make_auto_config(
+            FL4SH_MONITOR_GPU_FLOORS_JSON='{"RTX_5080_LAPTOP":110,"RTX_5070_TI_LAPTOP":101}'
+        )
+        self.assertNotEqual(one.policy_hash, two.policy_hash)
+
+    def test_neutral_gpu_floor_keys_are_valid_and_change_policy_hash(self) -> None:
+        neutral_110 = make_auto_config(
+            FL4SH_MONITOR_GPU_FLOORS_JSON='{"RTX_3090_TI":110}'
+        )
+        neutral_111 = make_auto_config(
+            FL4SH_MONITOR_GPU_FLOORS_JSON='{"RTX_3090_TI":111}'
+        )
+        self.assertEqual(dict(neutral_110.floor_registry)["RTX_3090_TI"], 110)
+        self.assertNotEqual(neutral_110.policy_hash, neutral_111.policy_hash)
+
+    def test_legacy_profile_can_select_dynamic_gpu_key_and_keeps_floor_source(self) -> None:
+        config = make_config(
+            FL4SH_MONITOR_PROFILE="RTX_5080_LAPTOP",
+            FL4SH_MONITOR_GPU_FLOORS_JSON='{"RTX_5080_LAPTOP":110}',
+        )
+        self.assertEqual(config.profile, "RTX_5080_LAPTOP")
+        self.assertEqual(config.floor_ths, 110)
+        self.assertEqual(config.floor_source, "ENV_REGISTRY")
+
 
 class ParsingAndWindowTests(unittest.TestCase):
     def test_only_device_hashrate_lines_are_observed(self) -> None:
@@ -164,6 +249,261 @@ class ParsingAndWindowTests(unittest.TestCase):
                 "CUDA autotune (measured pool-equivalent): 217.81 TH/s"
             )
         )
+
+    def test_gpu_name_normalization_preserves_neutral_and_explicit_forms(self) -> None:
+        cases = {
+            "NVIDIA GeForce RTX 5080 Laptop GPU": "RTX_5080_LAPTOP",
+            "NVIDIA GeForce RTX 5090 Laptop GPU": "RTX_5090_LAPTOP",
+            "NVIDIA GeForce RTX 5080": "RTX_5080_DESKTOP",
+            "NVIDIA GeForce RTX 5070 Ti Laptop GPU": "RTX_5070_TI_LAPTOP",
+            "NVIDIA GeForce RTX 5070 Ti": "RTX_5070_TI",
+            "NVIDIA GeForce RTX 3090 Ti": "RTX_3090_TI",
+            "NVIDIA GeForce RTX 3090 Ti Laptop GPU": "RTX_3090_TI_LAPTOP",
+            "NVIDIA GeForce RTX 3090 Ti Desktop GPU": "RTX_3090_TI_DESKTOP",
+        }
+        for raw_name, expected in cases.items():
+            with self.subTest(raw_name=raw_name):
+                self.assertEqual(MONITOR.normalize_gpu_identity(raw_name), expected)
+        self.assertIsNone(MONITOR.normalize_gpu_identity("RTX 5080"))
+
+    def test_neutral_3090_ti_selects_only_its_exact_floor_key(self) -> None:
+        configured = make_auto_config(
+            FL4SH_MONITOR_GPU_FLOORS_JSON='{"RTX_3090_TI":110}'
+        )
+        monitor = MONITOR.Fl4shMonitor(configured, start_monotonic=0)
+        detected = monitor.observe_line(
+            "Device [3] NVIDIA GeForce RTX 3090 Ti: Initialized", now=0
+        )[0]
+        self.assertEqual(detected["gpu_key"], "RTX_3090_TI")
+        self.assertEqual(detected["floor_ths"], 110)
+        self.assertEqual(detected["floor_source"], "ENV_REGISTRY")
+
+        form_specific_only = make_auto_config(
+            FL4SH_MONITOR_GPU_FLOORS_JSON=(
+                '{"RTX_3090_TI_LAPTOP":120,"RTX_3090_TI_DESKTOP":209}'
+            )
+        )
+        monitor_without_neutral = MONITOR.Fl4shMonitor(
+            form_specific_only, start_monotonic=0
+        )
+        neutral_identity = monitor_without_neutral.observe_line(
+            "Device [4] NVIDIA GeForce RTX 3090 Ti: Initialized", now=0
+        )[0]
+        self.assertEqual(neutral_identity["state"], "GPU_DETECTED")
+        self.assertEqual(neutral_identity["gpu_key"], "RTX_3090_TI")
+        self.assertIsNone(neutral_identity["floor_ths"])
+        self.assertEqual(neutral_identity["floor_source"], "UNCONFIGURED")
+        no_floor = monitor_without_neutral.observe_line(line(1, device=4), now=1)[0]
+        self.assertEqual(no_floor["state"], "NO_FLOOR_CONFIGURED")
+        self.assertIsNone(no_floor["floor_ths"])
+
+    def test_autodetected_laptops_select_their_json_floors_without_profile(self) -> None:
+        config = make_auto_config(
+            FL4SH_MONITOR_GPU_FLOORS_JSON=(
+                '{"RTX_5080_LAPTOP":110,"RTX_5090_LAPTOP":115}'
+            )
+        )
+        cases = (
+            ("NVIDIA GeForce RTX 5080 Laptop GPU", "RTX_5080_LAPTOP", 110),
+            ("NVIDIA GeForce RTX 5090 Laptop GPU", "RTX_5090_LAPTOP", 115),
+        )
+        for raw_name, key, floor in cases:
+            with self.subTest(key=key):
+                monitor = MONITOR.Fl4shMonitor(config, start_monotonic=0)
+                events = monitor.observe_line(
+                    f"Device [7] {raw_name}: Initialized", now=0
+                )
+                self.assertEqual(events[0]["state"], "GPU_DETECTED")
+                self.assertEqual(events[0]["device"], "fl4shminer_device:7")
+                self.assertEqual(events[0]["gpu_key"], key)
+                self.assertEqual(events[0]["gpu_raw"], raw_name)
+                self.assertEqual(events[0]["floor_ths"], floor)
+                self.assertEqual(events[0]["floor_source"], "ENV_REGISTRY")
+                self.assertFalse(events[0]["gpu_identity_verified"])
+                sample_events = monitor.observe_line(line(130, device=7), now=1)
+                self.assertEqual(sample_events[0]["floor_ths"], floor)
+                self.assertFalse(any("machine_id" in event for event in sample_events))
+
+    def test_laptop_and_desktop_floor_resolution_is_device_scoped(self) -> None:
+        config = make_auto_config(
+            FL4SH_MONITOR_GPU_FLOORS_JSON=(
+                '{"RTX_5080_LAPTOP":110,"RTX_5080_DESKTOP":209}'
+            )
+        )
+        monitor = MONITOR.Fl4shMonitor(config, start_monotonic=0)
+        laptop = monitor.observe_line(
+            "Device [2] NVIDIA GeForce RTX 5080 Laptop GPU: Initialized", now=0
+        )[0]
+        desktop = monitor.observe_line(
+            "Device [9] NVIDIA GeForce RTX 5080: Initialized", now=0
+        )[0]
+        self.assertEqual((laptop["gpu_key"], laptop["floor_ths"]), ("RTX_5080_LAPTOP", 110))
+        self.assertEqual((desktop["gpu_key"], desktop["floor_ths"]), ("RTX_5080_DESKTOP", 209))
+        self.assertEqual(laptop["device"], "fl4shminer_device:2")
+        self.assertEqual(desktop["device"], "fl4shminer_device:9")
+
+    def test_new_gpu_profile_is_added_by_registry_without_source_changes(self) -> None:
+        config = make_auto_config(
+            FL4SH_MONITOR_GPU_FLOORS_JSON='{"RTX_5070_TI_LAPTOP":100}'
+        )
+        monitor = MONITOR.Fl4shMonitor(config, start_monotonic=0)
+        event = monitor.observe_line(
+            "Device [4] NVIDIA GeForce RTX 5070 Ti Laptop GPU: Initialized", now=0
+        )[0]
+        self.assertEqual(event["gpu_key"], "RTX_5070_TI_LAPTOP")
+        self.assertEqual(event["floor_ths"], 100)
+        self.assertEqual(event["floor_source"], "ENV_REGISTRY")
+
+    def test_neutral_identity_without_floor_never_recommends(self) -> None:
+        config = make_auto_config()
+        monitor = MONITOR.Fl4shMonitor(config, start_monotonic=0)
+        identity = monitor.observe_line(
+            "Device [3] NVIDIA GeForce RTX 5070 Ti: Initialized", now=0
+        )[0]
+        self.assertEqual(identity["state"], "GPU_DETECTED")
+        self.assertEqual(identity["gpu_key"], "RTX_5070_TI")
+        self.assertIsNone(identity["floor_ths"])
+        first_sample = monitor.observe_line(line(1, device=3), now=0)[0]
+        self.assertEqual(first_sample["state"], "NO_FLOOR_CONFIGURED")
+        for instant in (10, 20, 30):
+            monitor.observe_line(line(1, device=3), now=instant)
+        events = monitor.tick(now=30)
+        self.assertFalse(any(event["state"] == "REALLOCATE_RECOMMENDED" for event in events))
+        self.assertIsNone(monitor._event(monitor.devices[3], "NO_FLOOR_CONFIGURED", observed=1)["floor_ths"])
+
+    def test_identity_conflict_disables_floor_recommendation(self) -> None:
+        config = make_auto_config(
+            FL4SH_MONITOR_GPU_FLOORS_JSON=(
+                '{"RTX_5080_LAPTOP":110,"RTX_5090_LAPTOP":115}'
+            )
+        )
+        monitor = MONITOR.Fl4shMonitor(config, start_monotonic=0)
+        monitor.observe_line(
+            "Device [5] NVIDIA GeForce RTX 5080 Laptop GPU: Initialized", now=0
+        )
+        conflict = monitor.observe_line(
+            "Solutions accepted: 5-NVIDIA GeForce RTX 5090 Laptop GPU, 0 stale", now=1
+        )
+        self.assertEqual(conflict[0]["state"], "GPU_IDENTITY_CONFLICT")
+        self.assertEqual(set(conflict[0]["gpu_identity_candidates"]), {
+            "RTX_5080_LAPTOP", "RTX_5090_LAPTOP"
+        })
+        for instant in (2, 12, 22, 32):
+            monitor.observe_line(line(1, device=5), now=instant)
+        events = monitor.tick(now=32)
+        self.assertFalse(any(event["state"] == "REALLOCATE_RECOMMENDED" for event in events))
+        self.assertIsNone(monitor._effective_floor(monitor.devices[5])[0])
+
+    def test_ambiguous_corroboration_invalidates_prior_floor_and_episode(self) -> None:
+        config = make_auto_config(FL4SH_MONITOR_GPU_FLOORS_JSON='{"RTX_5080_LAPTOP":110}')
+        monitor = MONITOR.Fl4shMonitor(config, start_monotonic=0)
+        monitor.observe_line(
+            "Device [5] NVIDIA GeForce RTX 5080 Laptop GPU: Initialized", now=0
+        )
+        state = monitor.devices[5]
+        state.consecutive_bad_windows = 1
+        state.recommendation_emitted = True
+        state.last_state = "BELOW_FLOOR"
+
+        events = monitor.observe_line(
+            "Solutions accepted: 5-NVIDIA GeForce RTX 5080 Series, stale=0", now=1
+        )
+        self.assertEqual(events[0]["state"], "GPU_IDENTITY_CONFLICT")
+        self.assertIsNone(events[0]["floor_ths"])
+        self.assertIsNone(state.gpu_key)
+        self.assertEqual(state.gpu_identity_status, "CONFLICT")
+        self.assertEqual(state.consecutive_bad_windows, 0)
+        self.assertFalse(state.recommendation_emitted)
+        self.assertIsNone(monitor._effective_floor(state)[0])
+
+        for instant in (2, 12, 22, 32):
+            monitor.observe_line(line(1, device=5), now=instant)
+        self.assertFalse(any(
+            event["state"] == "REALLOCATE_RECOMMENDED" for event in monitor.tick(now=32)
+        ))
+
+    def test_autotune_and_solutions_cannot_establish_identity_without_primary(self) -> None:
+        config = make_auto_config(FL4SH_MONITOR_GPU_FLOORS_JSON='{"RTX_5080_LAPTOP":110}')
+        monitor = MONITOR.Fl4shMonitor(config, start_monotonic=0)
+        monitor.observe_line(line(1, device=1), now=0)
+
+        # The unindexed Pearl line is ignored until Device [N] Initialized exists.
+        self.assertEqual(
+            monitor.observe_line(
+                "GPU=NVIDIA GeForce RTX 5080 Laptop GPU Pearl autotune hashrate = 9999 TH/s",
+                now=1,
+            ),
+            [],
+        )
+        secondary = monitor.observe_line(
+            "Solutions accepted: 1-NVIDIA GeForce RTX 5080 Laptop GPU, stale=0", now=2
+        )
+        state = monitor.devices[1]
+        self.assertTrue(any(event["state"] == "GPU_IDENTITY_UNKNOWN" for event in secondary))
+        self.assertFalse(state.identity_primary_seen)
+        self.assertIsNone(state.gpu_key)
+        self.assertEqual(state.gpu_identity_status, "UNKNOWN")
+        self.assertIsNone(monitor._effective_floor(state)[0])
+        self.assertEqual(len(state.samples), 1)
+
+        primary = monitor.observe_line(
+            "Device [1] NVIDIA GeForce RTX 5080 Laptop GPU: Initialized", now=3
+        )
+        self.assertEqual(primary[0]["state"], "GPU_DETECTED")
+        self.assertTrue(state.identity_primary_seen)
+        self.assertEqual(primary[0]["gpu_key"], "RTX_5080_LAPTOP")
+        self.assertEqual(primary[0]["floor_ths"], 110)
+
+    def test_autotune_and_solutions_lines_only_corroborate_identity(self) -> None:
+        monitor = MONITOR.Fl4shMonitor(
+            make_auto_config(FL4SH_MONITOR_GPU_FLOORS_JSON='{"RTX_5080_LAPTOP":110}'),
+            start_monotonic=0,
+        )
+        monitor.observe_line(
+            "Device [1] NVIDIA GeForce RTX 5080 Laptop GPU: Initialized", now=0
+        )
+        pearl_events = monitor.observe_line(
+            "GPU=NVIDIA GeForce RTX 5080 Laptop GPU Pearl autotune hashrate = 9999 TH/s", now=1
+        )
+        self.assertEqual(pearl_events, [])
+        self.assertEqual(len(monitor.devices[1].samples), 0)
+        monitor.observe_line(
+            "Solutions accepted: 1-NVIDIA GeForce RTX 5080 Laptop GPU, stale=0", now=2
+        )
+        self.assertEqual(monitor.devices[1].gpu_key, "RTX_5080_LAPTOP")
+        self.assertEqual(monitor.devices[1].identity_sources, {
+            "device_initialized", "pearl_autotune_model", "solutions_accepted_model"
+        })
+        self.assertEqual(len(monitor.devices[1].samples), 0)
+
+    def test_profile_override_match_is_compatible_and_mismatch_is_blocked(self) -> None:
+        compatible = MONITOR.Fl4shMonitor(
+            make_config(
+                FL4SH_MONITOR_PROFILE="RTX_5080_LAPTOP",
+                FL4SH_MONITOR_GPU_FLOORS_JSON='{"RTX_5080_LAPTOP":110}',
+            ),
+            start_monotonic=0,
+        )
+        match = compatible.observe_line(
+            "Device [1] NVIDIA GeForce RTX 5080 Laptop GPU: Initialized", now=0
+        )[0]
+        self.assertEqual(match["state"], "GPU_DETECTED")
+        self.assertEqual(match["floor_ths"], 110)
+        self.assertEqual(match["floor_source"], "PROFILE_OVERRIDE")
+
+        mismatch = MONITOR.Fl4shMonitor(
+            make_config(FL4SH_MONITOR_PROFILE="RTX_5090_LAPTOP"), start_monotonic=0
+        )
+        event = mismatch.observe_line(
+            "Device [1] NVIDIA GeForce RTX 5080 Laptop GPU: Initialized", now=0
+        )[0]
+        self.assertEqual(event["state"], "GPU_PROFILE_MISMATCH")
+        self.assertIsNone(event["floor_ths"])
+        for instant in (1, 11, 21, 31):
+            mismatch.observe_line(line(1, device=1), now=instant)
+        self.assertFalse(any(
+            event["state"] == "REALLOCATE_RECOMMENDED" for event in mismatch.tick(now=31)
+        ))
 
     def test_device_numbers_are_namespaced_and_not_machine_identity(self) -> None:
         monitor = MONITOR.Fl4shMonitor(make_config(), start_monotonic=0)
@@ -389,6 +729,53 @@ class RedactionAndSupervisorTests(unittest.TestCase):
         self.assertNotIn(b"wallet-secret.123", first + second)
         self.assertIn(b"[REDACTED]", first + second)
 
+    def test_gpu_identity_events_and_both_streams_redact_mining_identifier(self) -> None:
+        secret = "synthetic-gpu-credential"
+        raw_line = (
+            "Device [7] NVIDIA GeForce RTX 5080 Laptop GPU "
+            f"{secret}: Initialized"
+        )
+        with mock.patch.dict(MONITOR.os.environ, {"FL4SH_MINING_ID": secret}, clear=False):
+            monitor = MONITOR.Fl4shMonitor(make_auto_config(), start_monotonic=0)
+            events = monitor.observe_line(raw_line, now=0)
+            self.assertTrue(events)
+            self.assertNotIn(secret, repr(events))
+            self.assertIn("[REDACTED]", events[0]["gpu_raw"])
+            self.assertNotIn(secret, MONITOR.format_event(events[0]))
+
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "FL4SH_MONITOR_ENABLED": "1",
+                "FL4SH_MONITOR_PROFILE": "",
+                "FL4SH_MONITOR_GPU_FLOORS_JSON": "{}",
+                "FL4SH_MINING_ID": secret,
+                "SALAD_G5_WARMUP_SECONDS": "0",
+                "SALAD_G5_HASH_WINDOW_SECONDS": "10",
+                "SALAD_G5_EXPECTED_SAMPLE_INTERVAL_SECONDS": "5",
+                "SALAD_G5_REEVALUATION_INTERVAL_SECONDS": "5",
+                "SALAD_G5_MINIMUM_SAMPLES_PER_WINDOW": "2",
+                "SALAD_G5_MAXIMUM_SAMPLE_GAP_SECONDS": "5",
+            }
+        )
+        child_code = (
+            f"print({raw_line!r}, flush=True); "
+            f"import sys; print('stderr={secret}', file=sys.stderr, flush=True)"
+        )
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / "fl4sh-runtime-monitor.py"), "--", sys.executable, "-c", child_code],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", "replace"))
+        combined = completed.stdout + completed.stderr
+        self.assertNotIn(secret.encode(), combined)
+        self.assertIn(b"[REDACTED]", completed.stdout)
+        self.assertIn(b"[REDACTED]", completed.stderr)
+
     def test_bounded_parser_drops_overlong_lines_and_recovers_at_newline(self) -> None:
         parser = MONITOR.BoundedLineParser(max_line_bytes=64)
         self.assertEqual(parser.feed(b"x" * 100), [])
@@ -515,6 +902,50 @@ class RedactionAndSupervisorTests(unittest.TestCase):
                 )
                 self.assertEqual(completed.returncode, exit_code)
                 self.assertIn(b"FL4SH_MONITOR state=CONFIG", completed.stdout)
+
+    def test_real_supervisor_preserves_gpu_identity_stdout(self) -> None:
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "FL4SH_MONITOR_ENABLED": "1",
+                "FL4SH_MONITOR_GPU_FLOORS_JSON": '{"RTX_5080_LAPTOP":110}',
+                "FL4SH_MONITOR_PROFILE": "",
+                "SALAD_G5_WARMUP_SECONDS": "0",
+                "SALAD_G5_HASH_WINDOW_SECONDS": "10",
+                "SALAD_G5_EXPECTED_SAMPLE_INTERVAL_SECONDS": "5",
+                "SALAD_G5_REEVALUATION_INTERVAL_SECONDS": "5",
+                "SALAD_G5_MINIMUM_SAMPLES_PER_WINDOW": "2",
+                "SALAD_G5_MAXIMUM_SAMPLE_GAP_SECONDS": "5",
+            }
+        )
+        child_code = (
+            "print('Device [7] NVIDIA GeForce RTX 5080 Laptop GPU: Initialized', flush=True); "
+            "print('Device [7] hashRate: 120.00 TH/s', flush=True)"
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "fl4sh-runtime-monitor.py"),
+                "--",
+                sys.executable,
+                "-c",
+                child_code,
+            ],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", "replace"))
+        output = completed.stdout.decode("utf-8", "replace")
+        raw_line = "Device [7] NVIDIA GeForce RTX 5080 Laptop GPU: Initialized"
+        self.assertEqual(output.count(raw_line), 1)
+        self.assertIn("state=GPU_DETECTED", output)
+        self.assertIn("gpu_key=RTX_5080_LAPTOP", output)
+        self.assertIn("floor_ths=110", output)
+        self.assertIn("floor_source=ENV_REGISTRY", output)
+        self.assertIn("actions_performed=false", output)
 
     def test_real_supervisor_relays_partial_bytes_and_redacts_chunk_boundaries(self) -> None:
         environment = os.environ.copy()

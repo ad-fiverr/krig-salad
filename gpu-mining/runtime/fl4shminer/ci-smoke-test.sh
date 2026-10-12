@@ -47,7 +47,7 @@ if [[ "$mode" == --source ]]; then
   command -v "$python_bin" >/dev/null 2>&1 || fail "Python is required for isolated smoke checks"
   [[ -f "$MONITOR" && -f "$MONITOR_TESTS" ]] || fail "runtime monitor source and tests are required"
   monitor_env_keys=(
-    FL4SH_MONITOR_ENABLED FL4SH_MONITOR_PROFILE
+    FL4SH_MONITOR_ENABLED FL4SH_MONITOR_PROFILE FL4SH_MONITOR_GPU_FLOORS_JSON
     SALAD_G5_GPU_FLOOR_RTX_5080_LAPTOP_THS SALAD_G5_GPU_FLOOR_RTX_5090_LAPTOP_THS
     SALAD_G5_GPU_FLOOR_RTX_5080_DESKTOP_THS SALAD_G5_GPU_FLOOR_RTX_5090_DESKTOP_THS
     SALAD_G5_WARMUP_SECONDS SALAD_G5_EXPECTED_SAMPLE_INTERVAL_SECONDS
@@ -62,6 +62,10 @@ if [[ "$mode" == --source ]]; then
   env "${monitor_env_unset[@]}" FL4SH_MONITOR_ENABLED=1 \
     FL4SH_MONITOR_PROFILE=RTX_5090_LAPTOP "$python_bin" -B "$MONITOR" --check-config >/dev/null ||
     fail "valid opt-in monitor configuration was rejected"
+  env "${monitor_env_unset[@]}" FL4SH_MONITOR_ENABLED=1 \
+    FL4SH_MONITOR_GPU_FLOORS_JSON='{"RTX_5080_LAPTOP":110,"RTX_5090_LAPTOP":115,"RTX_5070_TI_LAPTOP":100}' \
+    "$python_bin" -B "$MONITOR" --check-config >/dev/null 2>&1 ||
+    fail "valid autodetected GPU floor registry was rejected"
   "$python_bin" -B "$MONITOR_TESTS" || fail "runtime monitor unit tests failed"
   if command -v ruby >/dev/null 2>&1; then
     ruby -e 'require "yaml"; doc = YAML.load_file(ARGV.fetch(0)); abort "workflow jobs missing" unless doc.is_a?(Hash) && doc["jobs"].is_a?(Hash)' \
@@ -244,12 +248,15 @@ FL4SH_POOL_URL="$pool" FL4SH_MINING_ID="$mining_id" \
   fail "installed non-mining runtime check failed"
 grep -Fq 'miner was not started; CUDA compatibility was not tested' /tmp/fl4sh-runtime.out ||
   fail "installed runtime check exceeded or misreported its scope"
-if ! FL4SH_MONITOR_ENABLED=1 FL4SH_MONITOR_PROFILE=RTX_5090_LAPTOP \
+if ! FL4SH_MONITOR_ENABLED=1 \
+  FL4SH_MONITOR_GPU_FLOORS_JSON='{"RTX_5080_LAPTOP":110,"RTX_5090_LAPTOP":115,"RTX_5070_TI_LAPTOP":100,"RTX_3090_TI":110}' \
   python3 -B "$MONITOR" --check-config >/tmp/fl4sh-monitor-config.out 2>&1; then
   printf 'Monitor config diagnostic (first 12 lines):\n' >&2
   head -n 12 /tmp/fl4sh-monitor-config.out | sed -E 's/(api[_-]?key|token|secret|password)([=: ]+)[^[:space:]]+/\1\2[REDACTED]/Ig' >&2
   fail "installed monitor rejected its valid offline configuration"
 fi
+grep -Fq 'floor_registry_entries=6' /tmp/fl4sh-monitor-config.out ||
+  fail "installed monitor did not load the autodetected GPU floor registry"
 FL4SH_POOL_URL="$pool" FL4SH_MINING_ID="$mining_id" \
   FL4SH_MONITOR_ENABLED=1 FL4SH_MONITOR_PROFILE=RTX_5090_LAPTOP \
   "$ENTRYPOINT" --check-runtime >/tmp/fl4sh-monitor-runtime.out 2>&1 ||
