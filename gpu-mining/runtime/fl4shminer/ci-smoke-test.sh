@@ -6,6 +6,8 @@ ENTRYPOINT="$SCRIPT_DIR/fl4sh-entrypoint.sh"
 HEALTHCHECK="$SCRIPT_DIR/fl4sh-healthcheck.sh"
 VERIFIER="$SCRIPT_DIR/verify-artifact.sh"
 LOCK="$SCRIPT_DIR/fl4sh-release.lock"
+MONITOR="$SCRIPT_DIR/fl4sh-runtime-monitor.py"
+MONITOR_TESTS="$SCRIPT_DIR/test-runtime-monitor.py"
 
 fail() {
   printf 'ci-smoke-test: %s\n' "$*" >&2
@@ -27,6 +29,12 @@ if [[ "$mode" == --source ]]; then
     fail "both Docker stages must use the pinned CUDA base"
   ! grep -Eq '^[[:space:]]*EXPOSE[[:space:]]' "$SCRIPT_DIR/Dockerfile" ||
     fail "Dockerfile must not expose a port"
+  grep -Fq 'python3-minimal' "$SCRIPT_DIR/Dockerfile" ||
+    fail "final image must install only the minimal Python runtime needed by the opt-in monitor"
+  grep -Fq 'COPY --chmod=0555 fl4sh-runtime-monitor.py /opt/fl4shminer/fl4sh-runtime-monitor.py' "$SCRIPT_DIR/Dockerfile" ||
+    fail "final image does not contain the runtime monitor"
+  grep -Fxq '!fl4sh-runtime-monitor.py' "$SCRIPT_DIR/.dockerignore" ||
+    fail "Docker context does not allow the runtime monitor source"
   if grep -Eq 'FL4SH_MINING_ID=.*(PASSWORD|TOKEN|SECRET)|FL4SH_POOL_URL=.*(@|password=)' "$ENTRYPOINT"; then
     fail "entrypoint contains an unsafe credential pattern"
   fi
@@ -35,6 +43,24 @@ if [[ "$mode" == --source ]]; then
     python_bin=python
   fi
   command -v "$python_bin" >/dev/null 2>&1 || fail "Python is required for isolated smoke checks"
+  [[ -f "$MONITOR" && -f "$MONITOR_TESTS" ]] || fail "runtime monitor source and tests are required"
+  monitor_env_keys=(
+    FL4SH_MONITOR_ENABLED FL4SH_MONITOR_PROFILE
+    SALAD_G5_GPU_FLOOR_RTX_5080_LAPTOP_THS SALAD_G5_GPU_FLOOR_RTX_5090_LAPTOP_THS
+    SALAD_G5_GPU_FLOOR_RTX_5080_DESKTOP_THS SALAD_G5_GPU_FLOOR_RTX_5090_DESKTOP_THS
+    SALAD_G5_WARMUP_SECONDS SALAD_G5_EXPECTED_SAMPLE_INTERVAL_SECONDS
+    SALAD_G5_HASH_WINDOW_SECONDS SALAD_G5_REEVALUATION_INTERVAL_SECONDS
+    SALAD_G5_MINIMUM_SAMPLES_PER_WINDOW SALAD_G5_MAXIMUM_SAMPLE_GAP_SECONDS
+    SALAD_G5_MINIMUM_WINDOW_COVERAGE_RATIO SALAD_G5_CONSECUTIVE_BAD_WINDOWS
+  )
+  monitor_env_unset=()
+  for env_name in "${monitor_env_keys[@]}"; do monitor_env_unset+=(-u "$env_name"); done
+  env "${monitor_env_unset[@]}" "$python_bin" -B "$MONITOR" --check-config >/dev/null 2>&1 &&
+    fail "monitor unexpectedly accepted a disabled configuration"
+  env "${monitor_env_unset[@]}" FL4SH_MONITOR_ENABLED=1 \
+    FL4SH_MONITOR_PROFILE=RTX_5090_LAPTOP "$python_bin" -B "$MONITOR" --check-config >/dev/null ||
+    fail "valid opt-in monitor configuration was rejected"
+  "$python_bin" -B "$MONITOR_TESTS" || fail "runtime monitor unit tests failed"
   if command -v ruby >/dev/null 2>&1; then
     ruby -e 'require "yaml"; doc = YAML.load_file(ARGV.fetch(0)); abort "workflow jobs missing" unless doc.is_a?(Hash) && doc["jobs"].is_a?(Hash)' \
       "$SCRIPT_DIR/../../../.github/workflows/build-fl4shminer.yml"
@@ -51,13 +77,21 @@ if [[ "$mode" == --source ]]; then
 #!/usr/bin/env bash
 exit 0
 STUB
+  cat > "$temporary/bin/python3" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == /opt/fl4shminer/fl4sh-runtime-monitor.py && "${2:-}" == --check-config ]]; then
+  printf 'FL4SH_MONITOR configuration valid provider_binding=UNKNOWN actions_performed=false\n'
+  exit 0
+fi
+exit 91
+STUB
   cat > "$temporary/miner-stub" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$@" > "$FL4SH_TEST_ARGV_FILE"
 STUB
-  chmod 0555 "$temporary/bin/nvidia-smi" "$temporary/miner-stub"
+  chmod 0555 "$temporary/bin/nvidia-smi" "$temporary/bin/python3" "$temporary/miner-stub"
 
-  "$python_bin" - "$ENTRYPOINT" "$temporary/entrypoint-test.sh" <<'PY'
+  "$python_bin" - "$ENTRYPOINT" "$temporary/entrypoint-test.sh" "$temporary/monitor-entrypoint-test.sh" <<'PY'
 import pathlib
 import sys
 
@@ -67,8 +101,13 @@ replacement = 'exec "$FL4SH_TEST_EXECUTABLE" \\\n'
 if source.count(needle) != 1:
     raise SystemExit("could not isolate the normal-start command for argument capture")
 pathlib.Path(sys.argv[2]).write_text(source.replace(needle, replacement), newline="\n")
+monitor_needle = "exec python3 /opt/fl4shminer/fl4sh-runtime-monitor.py -- \\\n"
+monitor_replacement = 'exec "$FL4SH_TEST_EXECUTABLE" \\\n'
+if source.count(monitor_needle) != 1:
+    raise SystemExit("could not isolate the opt-in monitor command for argument capture")
+pathlib.Path(sys.argv[3]).write_text(source.replace(monitor_needle, monitor_replacement), newline="\n")
 PY
-  chmod 0555 "$temporary/entrypoint-test.sh"
+  chmod 0555 "$temporary/entrypoint-test.sh" "$temporary/monitor-entrypoint-test.sh"
 
   pool='stratum+tcp://pool.example:7048'
   mining_id='PRL_WALLET_FOR_SMOKE.worker-1'
@@ -122,7 +161,38 @@ PY
     [[ "${actual_args[$index]}" == "${expected_args[$index]}" ]] ||
       fail "miner argument mismatch at index $index"
   done
-  printf 'source smoke passed: lock, scripts, workflow YAML, config rejection/redaction, and captured argv\n'
+
+  FL4SH_POOL_URL="$pool" FL4SH_MINING_ID="$mining_id" \
+    FL4SH_MONITOR_ENABLED=1 FL4SH_MONITOR_PROFILE=RTX_5090_LAPTOP \
+    PATH="$temporary/bin:$PATH" bash "$ENTRYPOINT" --validate-config \
+    > "$temporary/monitor-config.out" 2>&1 ||
+    fail "valid monitor-enabled configuration was rejected"
+  if grep -Fq "$mining_id" "$temporary/monitor-config.out"; then
+    fail "mining identifier leaked from monitor-enabled config validation"
+  fi
+  expect_rejected "invalid monitor switch" env FL4SH_POOL_URL="$pool" \
+    FL4SH_MINING_ID="$mining_id" FL4SH_MONITOR_ENABLED=true \
+    bash "$ENTRYPOINT" --validate-config
+
+  FL4SH_POOL_URL="$pool" FL4SH_MINING_ID="$mining_id" \
+    FL4SH_MONITOR_ENABLED=1 FL4SH_MONITOR_PROFILE=RTX_5090_LAPTOP \
+    FL4SH_TEST_EXECUTABLE="$temporary/miner-stub" \
+    FL4SH_TEST_ARGV_FILE="$temporary/monitor-argv.txt" \
+    PATH="$temporary/bin:$PATH" \
+    bash "$temporary/monitor-entrypoint-test.sh" > "$temporary/monitor-start.out" 2>&1 ||
+    fail "isolated opt-in monitor command capture failed"
+  if grep -Fq "$mining_id" "$temporary/monitor-start.out"; then
+    fail "mining identifier leaked into opt-in monitor wrapper output"
+  fi
+  mapfile -t monitor_args < "$temporary/monitor-argv.txt"
+  expected_monitor_args=(/opt/fl4shminer/fl4shminer -a pearlhash -pool "$pool" -w "$mining_id" -pass x -d 0)
+  [[ "${#monitor_args[@]}" -eq "${#expected_monitor_args[@]}" ]] ||
+    fail "opt-in monitor miner argument count differs from the locked launch contract"
+  for index in "${!expected_monitor_args[@]}"; do
+    [[ "${monitor_args[$index]}" == "${expected_monitor_args[$index]}" ]] ||
+      fail "opt-in monitor miner argument mismatch at index $index"
+  done
+  printf 'source smoke passed: lock, scripts, workflow YAML, monitor tests, config redaction, and opt-in/off argv capture\n'
   exit 0
 fi
 
@@ -140,7 +210,7 @@ elf_machine="$(od -An -tx1 -j18 -N2 "$binary" | tr -d '[:space:]')"
   fail "installed binary is not an ELF64 little-endian x86-64 executable"
 
 if command -v dpkg-query >/dev/null 2>&1; then
-  for package in curl wget gcc g++ build-essential python3 nvidia-smi; do
+  for package in curl wget gcc g++ build-essential python3-pip python3-venv python3-dev nvidia-smi; do
     status="$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)"
     [[ "$status" != 'install ok installed' ]] || fail "runtime image unexpectedly contains $package"
   done
@@ -148,6 +218,7 @@ if command -v dpkg-query >/dev/null 2>&1; then
     awk '$2 == "install" && $3 == "ok" && $4 == "installed" && $1 ~ /^nvidia-(driver|utils|kernel|dkms)/ {print $1}')"
   [[ -z "$driver_packages" ]] || fail "runtime image contains host driver packages: $driver_packages"
 fi
+command -v python3 >/dev/null 2>&1 || fail "runtime image is missing the opt-in monitor Python interpreter"
 
 pool='stratum+tcp://pool.example:7048'
 mining_id='PRL_WALLET_FOR_IMAGE_SMOKE.worker-1'
@@ -166,7 +237,16 @@ FL4SH_POOL_URL="$pool" FL4SH_MINING_ID="$mining_id" \
   fail "installed non-mining runtime check failed"
 grep -Fq 'miner was not started; CUDA compatibility was not tested' /tmp/fl4sh-runtime.out ||
   fail "installed runtime check exceeded or misreported its scope"
+FL4SH_MONITOR_ENABLED=1 FL4SH_MONITOR_PROFILE=RTX_5090_LAPTOP \
+  python3 -B "$MONITOR" --check-config >/tmp/fl4sh-monitor-config.out 2>&1 ||
+  fail "installed monitor rejected its valid offline configuration"
+FL4SH_POOL_URL="$pool" FL4SH_MINING_ID="$mining_id" \
+  FL4SH_MONITOR_ENABLED=1 FL4SH_MONITOR_PROFILE=RTX_5090_LAPTOP \
+  "$ENTRYPOINT" --check-runtime >/tmp/fl4sh-monitor-runtime.out 2>&1 ||
+  fail "installed monitor runtime check failed"
+grep -Fq 'miner was not started; CUDA compatibility was not tested' /tmp/fl4sh-monitor-runtime.out ||
+  fail "opt-in monitor runtime check exceeded or misreported its scope"
 if "$HEALTHCHECK" >/dev/null 2>&1; then
   fail "liveness healthcheck unexpectedly passed outside a running miner container"
 fi
-printf 'image smoke passed: installed hash/ELF/config/liveness checks; miner and network were not used\n'
+printf 'image smoke passed: installed hash/ELF/config/monitor/liveness checks; miner and network were not used\n'

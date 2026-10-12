@@ -13,6 +13,12 @@ RUN chmod 0555 verify-artifact.sh \
 
 FROM --platform=linux/amd64 nvidia/cuda:12.8.2-runtime-ubuntu22.04@sha256:f442e45b864e8e3fcb53764f69a011d494d402812ef4abec104621b508264a91
 
+# The opt-in log supervisor needs only the distro Python interpreter. Keep the
+# final stage free of pip, compilers, downloaders, and build tooling.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3-minimal \
+    && rm -rf /var/lib/apt/lists/*
+
 LABEL org.opencontainers.image.title="Fl4shMiner Salad runtime" \
       org.opencontainers.image.description="Isolated Fl4shMiner v1.5.2 PRL/PearlHash runtime; Salad GPU and pool behavior require a later lab" \
       org.opencontainers.image.version="1.5.2" \
@@ -21,6 +27,7 @@ LABEL org.opencontainers.image.title="Fl4shMiner Salad runtime" \
 WORKDIR /opt/fl4shminer
 COPY --from=artifact --chmod=0555 /opt/fl4shminer/fl4shminer /opt/fl4shminer/fl4shminer
 COPY --chmod=0555 fl4sh-entrypoint.sh fl4sh-healthcheck.sh verify-artifact.sh ci-smoke-test.sh /opt/fl4shminer/
+COPY --chmod=0555 fl4sh-runtime-monitor.py /opt/fl4shminer/fl4sh-runtime-monitor.py
 COPY fl4sh-release.lock README.md /opt/fl4shminer/
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 CMD ["/opt/fl4shminer/fl4sh-healthcheck.sh"]

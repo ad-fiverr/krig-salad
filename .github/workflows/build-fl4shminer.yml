@@ -11,6 +11,8 @@ on:
       - gpu-mining/runtime/fl4shminer/verify-artifact.sh
       - gpu-mining/runtime/fl4shminer/fl4sh-entrypoint.sh
       - gpu-mining/runtime/fl4shminer/fl4sh-healthcheck.sh
+      - gpu-mining/runtime/fl4shminer/fl4sh-runtime-monitor.py
+      - gpu-mining/runtime/fl4shminer/test-runtime-monitor.py
       - gpu-mining/runtime/fl4shminer/ci-smoke-test.sh
       - gpu-mining/runtime/fl4shminer/README.md
       - .github/workflows/build-fl4shminer.yml

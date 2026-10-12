@@ -6,3 +6,4 @@
 !fl4sh-entrypoint.sh
 !fl4sh-healthcheck.sh
 !ci-smoke-test.sh
+!fl4sh-runtime-monitor.py

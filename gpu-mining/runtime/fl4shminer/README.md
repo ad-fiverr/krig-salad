@@ -22,7 +22,19 @@ The container accepts only these required environment variables:
 - FL4SH_POOL_URL: an explicit stratum+tcp://host:port URL. There is no default endpoint.
 - FL4SH_MINING_ID: the complete pool login/identifier, optionally followed by a worker suffix. The wrapper does not print its value.
 
-The password is fixed to x by the launch contract. Arbitrary command overrides, shell evaluation, extra devices, and pool fallback are disabled. The normal process uses PearlHash, requests device 0, and runs as PID 1 through direct exec. Optional nvidia-smi diagnostics do not decide CUDA compatibility.
+The password is fixed to x by the launch contract. Arbitrary command overrides, shell evaluation, extra devices, and pool fallback are disabled. With the monitor disabled (the default), the miner keeps its existing direct-exec PID 1 behavior. Optional nvidia-smi diagnostics do not decide CUDA compatibility.
+
+### Optional runtime hashrate monitor
+
+Set `FL4SH_MONITOR_ENABLED=1` to opt in. The Python supervisor becomes PID 1, starts Fl4shMiner as its child, forwards termination signals, and relays stdout/stderr in byte chunks so progress output without a newline remains visible. Hashrate parsing uses a separate bounded line buffer; oversized records cannot grow parser memory. A child ended by a signal maps to the conventional `128 + signal` exit status. With `FL4SH_MONITOR_ENABLED=0` or unset, the original direct-exec process behavior remains. The liveness healthcheck supports both process layouts and does not use hashrate as a health signal.
+
+The monitor parses only explicit Fl4shMiner lines of the form `Device [N] hashRate: ... TH/s`. It ignores Pearl autotune and CUDA pool-equivalent estimates. Its rolling average is time-weighted; each reading is held for at most the expected sample interval, never across a larger configured sample gap. Larger gaps reduce coverage, and a gap beyond the maximum invalidates the window. The first performance decision waits for the complete hash window after warm-up; subsequent decisions use the configured reevaluation cadence. Incomplete windows result in `INSUFFICIENT_DATA` or `TELEMETRY_STALE`, never an invented zero rate. Device numbers are reported in the `fl4shminer_device:N` namespace and are not a verified Salad GPU or allocation identity. Stale counters remain miner-reported counters, not proof of paid shares. Provider binding, billing, and GPU identity remain `UNKNOWN`; every advisory includes `actions_performed=false`.
+
+Select an exact operator alert profile with `FL4SH_MONITOR_PROFILE`: `RTX_5080_LAPTOP`, `RTX_5090_LAPTOP`, `RTX_5080_DESKTOP`, or `RTX_5090_DESKTOP`. Default floors are 120, 120, 209, and 350 TH/s respectively. The matching floor can be overridden independently with `SALAD_G5_GPU_FLOOR_RTX_5080_LAPTOP_THS`, `SALAD_G5_GPU_FLOOR_RTX_5090_LAPTOP_THS`, `SALAD_G5_GPU_FLOOR_RTX_5080_DESKTOP_THS`, or `SALAD_G5_GPU_FLOOR_RTX_5090_DESKTOP_THS`. Profile selection is an operator configuration, not evidence that the provider assigned that GPU.
+
+Initial monitoring values can be set independently using `SALAD_G5_WARMUP_SECONDS` (90), `SALAD_G5_EXPECTED_SAMPLE_INTERVAL_SECONDS` (10), `SALAD_G5_HASH_WINDOW_SECONDS` (120), `SALAD_G5_REEVALUATION_INTERVAL_SECONDS` (30), `SALAD_G5_MINIMUM_SAMPLES_PER_WINDOW` (10), `SALAD_G5_MAXIMUM_SAMPLE_GAP_SECONDS` (30), `SALAD_G5_MINIMUM_WINDOW_COVERAGE_RATIO` (0.8), and `SALAD_G5_CONSECUTIVE_BAD_WINDOWS` (2). Invalid or incoherent values fail closed before the monitor can start Fl4shMiner. On startup, the monitor logs its effective settings and `policy_hash` for traceability.
+
+The monitor emits `WARMUP`, `INSUFFICIENT_DATA`, `TELEMETRY_STALE`, `NO_FLOOR_CONFIGURED`, `HEALTHY`, `BELOW_FLOOR`, `REALLOCATE_RECOMMENDED`, and `RECOVERED` transitions when applicable. `REALLOCATE_RECOMMENDED` is an advisory only: this image does not stop, move, or reallocate a Salad instance, and the monitor does not verify profitability or Salad billing.
 
 Kryptex documents regional PRL endpoints as candidates; prl-us.kryptex.network:7048 is a candidate endpoint for an explicitly configured lab, not a hidden image default. The third-party command form and device flag have not been validated by running this pinned binary against Salad. KRig's port 8048 must not be substituted based on its separate runtime.
 
@@ -34,7 +46,7 @@ Run source checks from the repository root:
 
     bash gpu-mining/runtime/fl4shminer/ci-smoke-test.sh --source
 
-The CI source checks validate Bash syntax, the release lock, workflow YAML, configuration rejection and redaction, and the exact launch arguments using a temporary stub executable. They never execute the Fl4shMiner binary.
+The CI source checks validate Bash syntax, the release lock, workflow YAML, the monitor's offline regression tests, configuration rejection and redaction, and the exact launch arguments in monitor-off and monitor-on modes using a temporary stub executable. They never execute the Fl4shMiner binary.
 
 The image smoke test runs with Docker networking disabled and no GPU:
 

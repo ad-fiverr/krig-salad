@@ -33,7 +33,19 @@ pool_port=$((10#$pool_port_text))
 [[ "$FL4SH_MINING_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}(/[A-Za-z0-9._-]{1,32})?$ ]] ||
   fail "FL4SH_MINING_ID contains unsupported characters or an invalid worker suffix"
 
+monitor_enabled="${FL4SH_MONITOR_ENABLED:-0}"
+[[ "$monitor_enabled" == 0 || "$monitor_enabled" == 1 ]] ||
+  fail "FL4SH_MONITOR_ENABLED must be 0 or 1"
+
+validate_monitor_config() {
+  [[ "$monitor_enabled" == 1 ]] || return 0
+  command -v python3 >/dev/null 2>&1 || fail "Python 3 is required when FL4SH_MONITOR_ENABLED=1"
+  python3 /opt/fl4shminer/fl4sh-runtime-monitor.py --check-config ||
+    fail "Fl4sh runtime monitor configuration is invalid"
+}
+
 if [[ "${1:-}" == --validate-config ]]; then
+  validate_monitor_config
   printf 'configuration valid: coin=PRL pool=%s:%s mining-identifier=redacted\n' "$pool_host" "$pool_port"
   exit 0
 fi
@@ -53,12 +65,25 @@ diagnose_nvidia_smi() {
 
 if [[ "${1:-}" == --check-runtime ]]; then
   diagnose_nvidia_smi
+  validate_monitor_config
   printf 'runtime diagnostics complete; miner was not started; CUDA compatibility was not tested\n'
   exit 0
 fi
 
 diagnose_nvidia_smi
 printf 'starting Fl4shMiner v1.5.2: coin=PRL pool=%s:%s device=0 mining-identifier=redacted\n' "$pool_host" "$pool_port"
+if [[ "$monitor_enabled" == 1 ]]; then
+  printf 'starting Fl4shMiner runtime monitor as PID 1; reallocation is advisory only\n'
+  exec python3 /opt/fl4shminer/fl4sh-runtime-monitor.py -- \
+    /opt/fl4shminer/fl4shminer \
+    -a pearlhash \
+    -pool "$FL4SH_POOL_URL" \
+    -w "$FL4SH_MINING_ID" \
+    -pass x \
+    -d 0
+fi
+
+# Preserve the historical direct-exec process tree when the monitor is off.
 exec /opt/fl4shminer/fl4shminer \
   -a pearlhash \
   -pool "$FL4SH_POOL_URL" \
