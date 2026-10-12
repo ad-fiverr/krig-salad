@@ -37,6 +37,13 @@ monitor_enabled="${FL4SH_MONITOR_ENABLED:-0}"
 [[ "$monitor_enabled" == 0 || "$monitor_enabled" == 1 ]] ||
   fail "FL4SH_MONITOR_ENABLED must be 0 or 1"
 
+telegram_enabled="${FL4SH_TELEGRAM_ENABLED:-0}"
+[[ "$telegram_enabled" == 0 || "$telegram_enabled" == 1 ]] ||
+  fail "FL4SH_TELEGRAM_ENABLED must be 0 or 1"
+if [[ "$telegram_enabled" == 1 && "$monitor_enabled" != 1 ]]; then
+  fail "FL4SH_TELEGRAM_ENABLED=1 requires FL4SH_MONITOR_ENABLED=1"
+fi
+
 validate_monitor_config() {
   [[ "$monitor_enabled" == 1 ]] || return 0
   command -v python3 >/dev/null 2>&1 || fail "Python 3 is required when FL4SH_MONITOR_ENABLED=1"

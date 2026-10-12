@@ -11,17 +11,20 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
+import http.client
 import json
 import math
 import os
 import queue
 import re
 import signal
+import ssl
 import subprocess
 import sys
 import threading
 import time
-from typing import Any, Mapping
+import uuid
+from typing import Any, Callable, Mapping
 
 
 DEVICE_RATE_RE = re.compile(
@@ -66,6 +69,22 @@ DEFAULT_GPU_FLOORS: dict[str, float] = {
     profile: default for profile, (_env_name, default) in PROFILE_FLOORS.items()
 }
 GPU_REGISTRY_ENV = "FL4SH_MONITOR_GPU_FLOORS_JSON"
+POOL_CONNECTION_FAILED_LINE = "Pool connection failed: mining.authorize response timeout"
+POOL_CONNECTION_FAILED_RE = re.compile(
+    r"(?:(?P<timestamp>[0-9]{4}/[0-9]{2}/[0-9]{2} "
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2}) )?"
+    r"Pool connection failed: mining\.authorize response timeout"
+    r"; reconnecting; retrying in (?P<retry_seconds>[0-9]{1,5})s"
+)
+MAX_POOL_RETRY_SECONDS = 86_400
+TELEGRAM_QUEUE_CAPACITY = 32
+TELEGRAM_TIMEOUT_SECONDS = 5.0
+TELEGRAM_MAX_RESPONSE_BYTES = 4096
+TELEGRAM_ENABLED_ENV = "FL4SH_TELEGRAM_ENABLED"
+TELEGRAM_TOKEN_ENV = "FL4SH_TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ENV = "FL4SH_TELEGRAM_CHAT_ID"
+TELEGRAM_COOLDOWN_ENV = "FL4SH_TELEGRAM_POOL_ERROR_COOLDOWN_SECONDS"
+TELEGRAM_LABEL_ENV = "FL4SH_MONITOR_LABEL"
 
 TIMING_ENV: dict[str, tuple[str, str, float | int]] = {
     "warmup_seconds": ("SALAD_G5_WARMUP_SECONDS", "int", 90),
@@ -81,6 +100,57 @@ TIMING_ENV: dict[str, tuple[str, str, float | int]] = {
 
 class MonitorConfigError(ValueError):
     """Raised for invalid monitor settings without echoing supplied values."""
+
+
+class TelegramConfigError(ValueError):
+    """Raised for invalid Telegram settings without echoing supplied values."""
+
+
+@dataclass(frozen=True)
+class TelegramConfig:
+    enabled: bool
+    bot_token: str | None = field(default=None, repr=False)
+    chat_id: str | None = field(default=None, repr=False)
+    pool_error_cooldown_seconds: int = 300
+    label: str | None = None
+
+    @classmethod
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> "TelegramConfig":
+        env = os.environ if environ is None else environ
+        enabled_text = env.get(TELEGRAM_ENABLED_ENV, "0")
+        if enabled_text not in {"0", "1"}:
+            raise TelegramConfigError(f"{TELEGRAM_ENABLED_ENV} must be 0 or 1")
+        enabled = enabled_text == "1"
+        if not enabled:
+            return cls(enabled=False)
+
+        token = env.get(TELEGRAM_TOKEN_ENV, "")
+        if not token or len(token) > 256 or not re.fullmatch(r"[A-Za-z0-9:_-]+", token):
+            raise TelegramConfigError(f"{TELEGRAM_TOKEN_ENV} is required and must use supported characters")
+        chat_id = env.get(TELEGRAM_CHAT_ENV, "")
+        if not chat_id or len(chat_id) > 40 or not re.fullmatch(r"-?[0-9]{1,24}|@[A-Za-z0-9_]{5,32}", chat_id):
+            raise TelegramConfigError(f"{TELEGRAM_CHAT_ENV} is required and must be a Telegram chat identifier")
+        cooldown = 300
+        if TELEGRAM_COOLDOWN_ENV in env:
+            raw_cooldown = env[TELEGRAM_COOLDOWN_ENV]
+            if len(raw_cooldown) > 5 or not re.fullmatch(r"[0-9]+", raw_cooldown):
+                raise TelegramConfigError(f"{TELEGRAM_COOLDOWN_ENV} must be a supported integer")
+            cooldown = int(raw_cooldown)
+            if cooldown > 86400:
+                raise TelegramConfigError(f"{TELEGRAM_COOLDOWN_ENV} exceeds the supported limit")
+        label = env.get(TELEGRAM_LABEL_ENV, "")
+        if label:
+            if len(label) > 64 or any(ord(char) < 32 or ord(char) == 127 for char in label):
+                raise TelegramConfigError(f"{TELEGRAM_LABEL_ENV} must be at most 64 printable characters")
+            if token in label or chat_id in label:
+                raise TelegramConfigError(f"{TELEGRAM_LABEL_ENV} cannot contain notifier credentials")
+        return cls(
+            enabled=True,
+            bot_token=token,
+            chat_id=chat_id,
+            pool_error_cooldown_seconds=cooldown,
+            label=label or None,
+        )
 
 
 @dataclass(frozen=True)
@@ -897,32 +967,328 @@ def format_event(event: Mapping[str, Any]) -> str:
     return " ".join(fields)
 
 
-def format_config(config: MonitorConfig) -> str:
-    return " ".join(
-        (
-            "FL4SH_MONITOR",
-            "state=CONFIG",
-            "enabled=true",
-            f"profile={config.profile or 'unknown'}",
-            f"floor={_format_number(config.floor_ths)}",
-            f"floor_source={config.floor_source}",
-            f"floor_registry_entries={len(config.floor_registry)}",
-            "floor_registry_sources=G5_DEFAULT+SALAD_G5_GPU_FLOOR_*+FL4SH_MONITOR_GPU_FLOORS_JSON",
-            f"warmup_seconds={config.warmup_seconds}",
-            f"expected_sample_interval_seconds={config.expected_sample_interval_seconds}",
-            f"hash_window_seconds={config.hash_window_seconds}",
-            f"reevaluation_interval_seconds={config.reevaluation_interval_seconds}",
-            f"minimum_samples_per_window={config.minimum_samples_per_window}",
-            f"maximum_sample_gap_seconds={config.maximum_sample_gap_seconds}",
-            f"minimum_window_coverage_ratio={_format_number(config.minimum_window_coverage_ratio)}",
-            f"consecutive_bad_windows={config.consecutive_bad_windows}",
-            f"policy_hash={config.policy_hash}",
+def format_config(config: MonitorConfig, *, telegram_enabled: bool = False) -> str:
+    fields = [
+        "FL4SH_MONITOR",
+        "state=CONFIG",
+        "enabled=true",
+        f"profile={config.profile or 'unknown'}",
+        f"floor={_format_number(config.floor_ths)}",
+        f"floor_source={config.floor_source}",
+        f"floor_registry_entries={len(config.floor_registry)}",
+        "floor_registry_sources=G5_DEFAULT+SALAD_G5_GPU_FLOOR_*+FL4SH_MONITOR_GPU_FLOORS_JSON",
+        f"warmup_seconds={config.warmup_seconds}",
+        f"expected_sample_interval_seconds={config.expected_sample_interval_seconds}",
+        f"hash_window_seconds={config.hash_window_seconds}",
+        f"reevaluation_interval_seconds={config.reevaluation_interval_seconds}",
+        f"minimum_samples_per_window={config.minimum_samples_per_window}",
+        f"maximum_sample_gap_seconds={config.maximum_sample_gap_seconds}",
+        f"minimum_window_coverage_ratio={_format_number(config.minimum_window_coverage_ratio)}",
+        f"consecutive_bad_windows={config.consecutive_bad_windows}",
+        f"policy_hash={config.policy_hash}",
+    ]
+    if telegram_enabled:
+        fields.append("telegram_enabled=true")
+    fields.extend(
+        [
             "provider_binding=UNKNOWN",
             "gpu_identity_verified=false",
             "billing=UNKNOWN",
             "actions_performed=false",
-        )
+        ]
     )
+    return " ".join(fields)
+
+
+def format_telegram_message(
+    event_name: str,
+    event: Mapping[str, Any],
+    *,
+    alert_id: str,
+    monitor_session_id: str | None,
+    label: str | None,
+) -> str:
+    """Build a bounded plain-text audit message from local monitor evidence."""
+    stale = event.get("stale_counter")
+    stale_text = "unknown"
+    if isinstance(stale, Mapping):
+        numerator = stale.get("numerator", "unknown")
+        denominator = stale.get("denominator", "unknown")
+        reported_percent = stale.get("reported_percent")
+        if (
+            isinstance(reported_percent, (int, float))
+            and math.isfinite(float(reported_percent))
+        ):
+            stale_text = (
+                f"{numerator}/{denominator} "
+                f"({_format_number(reported_percent)}%)"
+            )
+        else:
+            stale_text = f"{numerator}/{denominator} (unknown)"
+    timestamp = event.get("timestamp_utc") or datetime.now(timezone.utc).isoformat(timespec="seconds")
+    fields = [
+        "Fl4shMiner audit alert",
+        f"event: {event_name}",
+        f"alert_id: {alert_id}",
+        f"monitor_session_id: {monitor_session_id or 'unknown'}",
+    ]
+    if event_name == "POOL_CONNECTION_FAILED":
+        fields.append("reason: MINING_AUTHORIZE_RESPONSE_TIMEOUT")
+        retry_seconds = event.get("retry_seconds")
+        if (
+            isinstance(retry_seconds, int)
+            and not isinstance(retry_seconds, bool)
+            and 1 <= retry_seconds <= MAX_POOL_RETRY_SECONDS
+        ):
+            fields.append(f"retry: {retry_seconds}s")
+        else:
+            fields.append("retry: unknown")
+    if label:
+        fields.append(f"label: {label}")
+    fields.extend(
+        [
+            f"GPU: {event.get('gpu_key') or 'unknown'}",
+            f"device: {event.get('device') or 'unknown'}",
+            f"floor_ths: {_format_number(event.get('floor_ths'))}",
+            f"observed_window_mean_ths: {_format_number(event.get('observed_window_mean_ths'))}",
+            "bad_windows: "
+            f"{event.get('consecutive_bad_windows', 0)}/{event.get('consecutive_bad_windows_required', 0)}",
+            f"stale_counter: {stale_text}",
+            f"timestamp_utc: {timestamp}",
+            "actions_performed: false",
+            "Machine ID: correlate Alert ID in Salad Logs",
+        ]
+    )
+    # All inserted data is local and bounded by parser/config validation. This
+    # final cap also protects Telegram's message limit if a future event grows.
+    return "\n".join(fields)[:3500]
+
+
+def _send_telegram_message(
+    config: TelegramConfig,
+    message: str,
+    *,
+    connection_factory: Callable[..., Any] | None = None,
+) -> bool:
+    """POST one message to the fixed Bot API host; never expose transport errors."""
+    if not config.enabled or not config.bot_token or not config.chat_id:
+        return False
+    connection: Any | None = None
+    try:
+        factory = connection_factory or http.client.HTTPSConnection
+        connection = factory(
+            "api.telegram.org",
+            443,
+            timeout=TELEGRAM_TIMEOUT_SECONDS,
+            context=ssl.create_default_context(),
+        )
+        body = json.dumps(
+            {"chat_id": config.chat_id, "text": message},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        # Bot API requires the token in the path. The path is never logged,
+        # included in errors, or persisted; HTTPSConnection targets the fixed
+        # official host directly and does not use environment proxy settings.
+        connection.request(
+            "POST",
+            f"/bot{config.bot_token}/sendMessage",
+            body=body,
+            headers={"Content-Type": "application/json", "Content-Length": str(len(body))},
+        )
+        response = connection.getresponse()
+        response_body = response.read(TELEGRAM_MAX_RESPONSE_BYTES + 1)
+        if response.status != 200 or len(response_body) > TELEGRAM_MAX_RESPONSE_BYTES:
+            return False
+        try:
+            decoded = json.loads(response_body.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            return False
+        return isinstance(decoded, dict) and decoded.get("ok") is True
+    except Exception:
+        # Exceptions can contain the request target (and therefore the bot
+        # token); deliberately discard their text and traceback.
+        return False
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+
+class TelegramNotifier:
+    """One bounded, non-blocking notification worker. Disabled means no thread."""
+
+    def __init__(
+        self,
+        config: TelegramConfig,
+        *,
+        audit: Callable[[str], None],
+        sender: Callable[[TelegramConfig, str], bool] | None = None,
+        queue_capacity: int = TELEGRAM_QUEUE_CAPACITY,
+    ) -> None:
+        self.config = config
+        self.audit = audit
+        self.sender = sender or _send_telegram_message
+        self._queue: queue.Queue[tuple[str, str, str] | None] | None = None
+        self._worker: threading.Thread | None = None
+        if config.enabled:
+            self._queue = queue.Queue(maxsize=queue_capacity)
+            self._worker = threading.Thread(target=self._run, name="fl4sh-telegram-audit", daemon=True)
+            self._worker.start()
+
+    def submit(self, event_name: str, event: Mapping[str, Any], *, monitor_session_id: str) -> str | None:
+        if not self.config.enabled or self._queue is None:
+            return None
+        alert_id = str(uuid.uuid4())
+        message = format_telegram_message(
+            event_name,
+            event,
+            alert_id=alert_id,
+            monitor_session_id=monitor_session_id,
+            label=self.config.label,
+        )
+        self.audit(
+            f"FL4SH_MONITOR state=TELEGRAM_ALERT alert_id={alert_id} "
+            f"event={event_name} actions_performed=false"
+        )
+        try:
+            self._queue.put_nowait((alert_id, event_name, message))
+        except queue.Full:
+            self.audit(
+                f"FL4SH_MONITOR state=TELEGRAM_NOTIFY_FAILED alert_id={alert_id} "
+                "reason=QUEUE_FULL actions_performed=false"
+            )
+            return alert_id
+        return alert_id
+
+    def _run(self) -> None:
+        assert self._queue is not None
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            alert_id, event_name, message = item
+            try:
+                sent = bool(self.sender(self.config, message))
+            except Exception:
+                # Sender exception text may contain the bot token URL.
+                sent = False
+            if sent:
+                self.audit(
+                    f"FL4SH_MONITOR state=TELEGRAM_NOTIFY_SENT alert_id={alert_id} "
+                    f"event={event_name} actions_performed=false"
+                )
+            else:
+                self.audit(
+                    f"FL4SH_MONITOR state=TELEGRAM_NOTIFY_FAILED alert_id={alert_id} "
+                    f"event={event_name} reason=TRANSPORT actions_performed=false"
+                )
+
+    def close(self) -> None:
+        if self._queue is None or self._worker is None:
+            return
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            # The daemon worker drains accepted records; process shutdown must
+            # never wait behind network I/O or an unbounded queue operation.
+            return
+        self._worker.join(timeout=0.1)
+
+
+class TelegramAlertCoordinator:
+    """Apply per-episode recommendation dedup and monotonic pool cooldown."""
+
+    def __init__(
+        self,
+        notifier: TelegramNotifier,
+        config: TelegramConfig,
+        *,
+        monotonic: Callable[[], float],
+        monitor_session_id: str,
+    ) -> None:
+        self.notifier = notifier
+        self.config = config
+        self.monotonic = monotonic
+        self.monitor_session_id = monitor_session_id
+        self._recommendation_devices: set[str] = set()
+        self._last_pool_alert_at: float | None = None
+
+    def monitor_events(self, events: list[dict[str, Any]]) -> None:
+        for event in events:
+            device = str(event.get("device") or "unknown")
+            if event.get("state") == "RECOVERED":
+                self._recommendation_devices.discard(device)
+            elif event.get("state") == "REALLOCATE_RECOMMENDED":
+                if device not in self._recommendation_devices:
+                    self._recommendation_devices.add(device)
+                    self.notifier.submit(
+                        "REALLOCATE_RECOMMENDED", event,
+                        monitor_session_id=self.monitor_session_id,
+                    )
+
+    def stdout_line(self, line: str, monitor: Fl4shMonitor) -> None:
+        retry_seconds = _parse_pool_connection_failed_retry_seconds(line)
+        if retry_seconds is None:
+            return
+        now = self.monotonic()
+        if (
+            self._last_pool_alert_at is not None
+            and now - self._last_pool_alert_at < self.config.pool_error_cooldown_seconds
+        ):
+            return
+        self._last_pool_alert_at = now
+        event = _pool_alert_context(monitor)
+        event["retry_seconds"] = retry_seconds
+        self.notifier.submit(
+            "POOL_CONNECTION_FAILED", event,
+            monitor_session_id=self.monitor_session_id,
+        )
+
+
+def _parse_pool_connection_failed_retry_seconds(line: str) -> int | None:
+    """Match only the known authorize-timeout/reconnect line, with bounded retry."""
+    if not isinstance(line, str) or len(line) > 256:
+        return None
+    match = POOL_CONNECTION_FAILED_RE.fullmatch(line)
+    if match is None:
+        return None
+    timestamp = match.group("timestamp")
+    if timestamp is not None:
+        try:
+            datetime.strptime(timestamp, "%Y/%m/%d %H:%M:%S")
+        except ValueError:
+            return None
+    retry_seconds = int(match.group("retry_seconds"))
+    if not 1 <= retry_seconds <= MAX_POOL_RETRY_SECONDS:
+        return None
+    return retry_seconds
+
+
+def _pool_alert_context(monitor: Fl4shMonitor) -> dict[str, Any]:
+    state = next(iter(monitor.devices.values())) if len(monitor.devices) == 1 else None
+    floor, _source, _issue = monitor._effective_floor(state)
+    latest = state.samples[-1].sample if state is not None and state.samples else None
+    return {
+        "gpu_key": state.gpu_key if state is not None else "unknown",
+        "device": f"fl4shminer_device:{state.device_index}" if state is not None else "unknown",
+        "floor_ths": floor,
+        "observed_window_mean_ths": state.last_window_mean_ths if state is not None else None,
+        "consecutive_bad_windows": state.consecutive_bad_windows if state is not None else 0,
+        "consecutive_bad_windows_required": monitor.config.consecutive_bad_windows,
+        "stale_counter": (
+            {
+                "numerator": latest.stale_count,
+                "denominator": latest.stale_total,
+                "reported_percent": latest.stale_percent,
+            }
+            if latest is not None and latest.stale_count is not None
+            else None
+        ),
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
 
 
 def _format_number(value: Any) -> str:
@@ -1003,10 +1369,10 @@ class StreamingRedactor:
         return bytes(output)
 
 
-def _redact_complete_text(value: str) -> str:
+def _redact_complete_text(value: str, extra_secrets: list[str] | None = None) -> str:
     """Redact a complete record using the same secret policy as raw streams."""
     secret = os.environ.get("FL4SH_MINING_ID", "")
-    redactor = StreamingRedactor([secret])
+    redactor = StreamingRedactor([secret, *(extra_secrets or [])])
     return redactor.feed(value.encode("utf-8"), final=True).decode("utf-8", errors="replace")
 
 
@@ -1057,6 +1423,8 @@ def run_supervisor(
     *,
     monotonic=time.monotonic,
     popen_factory=subprocess.Popen,
+    telegram_config: TelegramConfig | None = None,
+    telegram_sender: Callable[[TelegramConfig, str], bool] | None = None,
 ) -> int:
     if not config.enabled:
         print("FL4SH_MONITOR requires FL4SH_MONITOR_ENABLED=1", file=sys.stderr, flush=True)
@@ -1064,20 +1432,38 @@ def run_supervisor(
     if not command:
         print("FL4SH_MONITOR requires a fixed miner command", file=sys.stderr, flush=True)
         return 64
+    try:
+        notifier_config = telegram_config or TelegramConfig.from_env()
+    except TelegramConfigError as exc:
+        print(f"FL4SH_TELEGRAM configuration invalid: {exc}", file=sys.stderr, flush=True)
+        return 64
 
     started_at = monotonic()
     monitor = Fl4shMonitor(config, start_monotonic=started_at)
-    print(format_config(config), flush=True)
+    print(format_config(config, telegram_enabled=notifier_config.enabled), flush=True)
     event_queue: queue.Queue[tuple[str, bytes | None]] = queue.Queue(maxsize=256)
     child_ref: dict[str, subprocess.Popen[bytes] | None] = {"child": None}
     previous_signals, pending_signal = _install_signal_forwarding(child_ref)
     try:
-        child = popen_factory(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-        )
+        child_kwargs: dict[str, Any] = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "bufsize": 0,
+        }
+        if notifier_config.enabled:
+            child_environment = os.environ.copy()
+            # Telegram credentials are for the supervisor only. The miner
+            # child never inherits notifier settings when alerts are enabled.
+            for secret_name in (
+                TELEGRAM_TOKEN_ENV,
+                TELEGRAM_CHAT_ENV,
+                TELEGRAM_ENABLED_ENV,
+                TELEGRAM_COOLDOWN_ENV,
+                TELEGRAM_LABEL_ENV,
+            ):
+                child_environment.pop(secret_name, None)
+            child_kwargs["env"] = child_environment
+        child = popen_factory(command, **child_kwargs)
     except OSError as exc:
         for signum, handler in previous_signals.items():
             signal.signal(signum, handler)
@@ -1107,20 +1493,55 @@ def run_supervisor(
     for reader in readers:
         reader.start()
 
+    relay_secrets = [
+        os.environ.get("FL4SH_MINING_ID", ""),
+        notifier_config.bot_token or "",
+        notifier_config.chat_id or "",
+    ]
     redactors = {
-        "stdout": StreamingRedactor([os.environ.get("FL4SH_MINING_ID", "")]),
-        "stderr": StreamingRedactor([os.environ.get("FL4SH_MINING_ID", "")]),
+        "stdout": StreamingRedactor(relay_secrets),
+        "stderr": StreamingRedactor(relay_secrets),
     }
     parsers = {"stdout": BoundedLineParser()}
     open_streams = {"stdout": True, "stderr": True}
     write_lock = threading.Lock()
     finished_streams: set[str] = set()
     last_monitor_error = False
+    monitor_session_id = str(uuid.uuid4()) if notifier_config.enabled else ""
+
+    def telegram_audit(line: str) -> None:
+        _write_stream("stdout", (line + "\n").encode("utf-8"), open_streams, write_lock)
+
+    notifier = TelegramNotifier(
+        notifier_config,
+        audit=telegram_audit,
+        sender=telegram_sender,
+    )
+    alert_coordinator = (
+        TelegramAlertCoordinator(
+            notifier,
+            notifier_config,
+            monotonic=monotonic,
+            monitor_session_id=monitor_session_id,
+        )
+        if notifier_config.enabled
+        else None
+    )
 
     def emit(events: list[dict[str, Any]]) -> None:
         for event in events:
-            line = _redact_complete_text(format_event(event) + "\n").encode("utf-8")
+            line = _redact_complete_text(
+                format_event(event) + "\n",
+                [notifier_config.bot_token or "", notifier_config.chat_id or ""],
+            ).encode("utf-8")
             _write_stream("stdout", line, open_streams, write_lock)
+        if alert_coordinator is not None:
+            alert_coordinator.monitor_events(events)
+
+    def process_stdout_line(line_text: str) -> None:
+        emit(monitor.observe_line(line_text, now=monotonic()))
+        if alert_coordinator is not None:
+            alert_coordinator.stdout_line(line_text, monitor)
 
     def safe_tick() -> None:
         nonlocal last_monitor_error
@@ -1148,7 +1569,7 @@ def run_supervisor(
                 if name == "stdout":
                     try:
                         for line_text in parsers[name].feed(b"", final=True):
-                            emit(monitor.observe_line(line_text, now=monotonic()))
+                            process_stdout_line(line_text)
                     except Exception as exc:  # A malformed sample is not a miner failure.
                         if not last_monitor_error:
                             _write_stream(
@@ -1166,7 +1587,7 @@ def run_supervisor(
             if name == "stdout":
                 try:
                     for line_text in parsers[name].feed(data):
-                        emit(monitor.observe_line(line_text, now=monotonic()))
+                        process_stdout_line(line_text)
                 except Exception as exc:  # A malformed sample is not a miner failure.
                     if not last_monitor_error:
                         _write_stream(
@@ -1189,6 +1610,7 @@ def run_supervisor(
                 pass
         for signum, handler in previous_signals.items():
             signal.signal(signum, handler)
+        notifier.close()
 
     return_code = child.wait()
     # Match the conventional shell status for signal-terminated children. In
@@ -1199,10 +1621,11 @@ def run_supervisor(
 def _check_config() -> int:
     try:
         config = MonitorConfig.from_env(require_enabled=True)
-    except MonitorConfigError as exc:
+        telegram_config = TelegramConfig.from_env()
+    except (MonitorConfigError, TelegramConfigError) as exc:
         print(f"FL4SH_MONITOR configuration invalid: {exc}", file=sys.stderr, flush=True)
         return 64
-    print(format_config(config), flush=True)
+    print(format_config(config, telegram_enabled=telegram_config.enabled), flush=True)
     return 0
 
 
@@ -1212,7 +1635,8 @@ def main(argv: list[str] | None = None) -> int:
         return _check_config()
     try:
         config = MonitorConfig.from_env(require_enabled=True)
-    except MonitorConfigError as exc:
+        telegram_config = TelegramConfig.from_env()
+    except (MonitorConfigError, TelegramConfigError) as exc:
         print(f"FL4SH_MONITOR configuration invalid: {exc}", file=sys.stderr, flush=True)
         return 64
     if "--" not in args:
@@ -1222,7 +1646,11 @@ def main(argv: list[str] | None = None) -> int:
     if separator != 0:
         print("FL4SH_MONITOR accepts only a command after --", file=sys.stderr, flush=True)
         return 64
-    return run_supervisor(config, args[separator + 1 :])
+    return run_supervisor(
+        config,
+        args[separator + 1 :],
+        telegram_config=telegram_config,
+    )
 
 
 if __name__ == "__main__":

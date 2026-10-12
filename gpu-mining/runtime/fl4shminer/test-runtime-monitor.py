@@ -26,6 +26,13 @@ MONITOR = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MONITOR
 SPEC.loader.exec_module(MONITOR)
 
+POOL_CONNECTION_FAILED_WITHOUT_TIMESTAMP = (
+    f"{MONITOR.POOL_CONNECTION_FAILED_LINE}; reconnecting; retrying in 10s"
+)
+POOL_CONNECTION_FAILED_WITH_TIMESTAMP = (
+    "2026/10/12 22:04:33 " + POOL_CONNECTION_FAILED_WITHOUT_TIMESTAMP
+)
+
 
 def make_config(**overrides: str) -> MONITOR.MonitorConfig:
     values = {
@@ -63,6 +70,16 @@ def make_auto_config(**overrides: str) -> MONITOR.MonitorConfig:
 
 def line(rate: float, *, device: int = 1, stale: str = "0/0 (0.0%)") -> str:
     return f"Device [{device}] hashRate: {rate:.2f} TH/s, stale: {stale}, warm: 0"
+
+
+def make_telegram_config(**overrides: str) -> MONITOR.TelegramConfig:
+    values = {
+        "FL4SH_TELEGRAM_ENABLED": "1",
+        "FL4SH_TELEGRAM_BOT_TOKEN": "synthetic:telegram_test_token",
+        "FL4SH_TELEGRAM_CHAT_ID": "-1001234567890",
+    }
+    values.update(overrides)
+    return MONITOR.TelegramConfig.from_env(values)
 
 
 class MonitorConfigTests(unittest.TestCase):
@@ -159,6 +176,7 @@ class MonitorConfigTests(unittest.TestCase):
         self.assertIn("provider_binding=UNKNOWN", rendered)
         self.assertNotIn("FL4SH_MINING_ID", rendered)
 
+
     def test_dynamic_floor_registry_overrides_defaults_and_supports_new_gpu_keys(self) -> None:
         config = make_auto_config(
             SALAD_G5_GPU_FLOOR_RTX_5080_LAPTOP_THS="125",
@@ -226,6 +244,539 @@ class MonitorConfigTests(unittest.TestCase):
         self.assertEqual(config.profile, "RTX_5080_LAPTOP")
         self.assertEqual(config.floor_ths, 110)
         self.assertEqual(config.floor_source, "ENV_REGISTRY")
+
+
+class TelegramAuditTests(unittest.TestCase):
+    def test_default_disabled_creates_no_worker_and_never_calls_sender(self) -> None:
+        audit: list[str] = []
+        notifier = MONITOR.TelegramNotifier(
+            MONITOR.TelegramConfig.from_env({}),
+            audit=audit.append,
+            sender=lambda *_args: self.fail("disabled notifier called sender"),
+        )
+        self.assertIsNone(notifier._worker)
+        self.assertIsNone(notifier._queue)
+        self.assertIsNone(
+            notifier.submit("POOL_CONNECTION_FAILED", {}, monitor_session_id="synthetic-session")
+        )
+        self.assertEqual(audit, [])
+        notifier.close()
+
+    def test_enabled_requires_token_and_chat_without_echoing_token(self) -> None:
+        token = "synthetic_sensitive_bot_token"
+        with self.assertRaises(MONITOR.TelegramConfigError) as caught:
+            MONITOR.TelegramConfig.from_env(
+                {"FL4SH_TELEGRAM_ENABLED": "1", "FL4SH_TELEGRAM_BOT_TOKEN": token}
+            )
+        self.assertNotIn(token, str(caught.exception))
+        with self.assertRaises(MONITOR.TelegramConfigError):
+            MONITOR.TelegramConfig.from_env(
+                {
+                    "FL4SH_TELEGRAM_ENABLED": "1",
+                    "FL4SH_TELEGRAM_BOT_TOKEN": token,
+                    "FL4SH_TELEGRAM_CHAT_ID": "invalid chat id",
+                }
+            )
+        self.assertNotIn(token, repr(make_telegram_config()))
+        with self.assertRaises(MONITOR.TelegramConfigError) as label_error:
+            make_telegram_config(FL4SH_MONITOR_LABEL="lab synthetic:telegram_test_token")
+        self.assertNotIn("synthetic:telegram_test_token", str(label_error.exception))
+
+    def test_token_and_chat_are_not_in_monitor_config_or_policy_hash(self) -> None:
+        token = "synthetic_sensitive_bot_token"
+        baseline = {
+            "FL4SH_MONITOR_ENABLED": "1",
+            "FL4SH_MONITOR_PROFILE": "RTX_5090_LAPTOP",
+            "SALAD_G5_WARMUP_SECONDS": "0",
+            "SALAD_G5_EXPECTED_SAMPLE_INTERVAL_SECONDS": "10",
+            "SALAD_G5_HASH_WINDOW_SECONDS": "20",
+            "SALAD_G5_REEVALUATION_INTERVAL_SECONDS": "5",
+            "SALAD_G5_MINIMUM_SAMPLES_PER_WINDOW": "2",
+            "SALAD_G5_MAXIMUM_SAMPLE_GAP_SECONDS": "10",
+            "SALAD_G5_MINIMUM_WINDOW_COVERAGE_RATIO": "0.8",
+            "SALAD_G5_CONSECUTIVE_BAD_WINDOWS": "2",
+        }
+        first = MONITOR.MonitorConfig.from_env(baseline, require_enabled=True)
+        with_secrets = dict(baseline)
+        with_secrets.update(
+            FL4SH_TELEGRAM_ENABLED="1",
+            FL4SH_TELEGRAM_BOT_TOKEN=token,
+            FL4SH_TELEGRAM_CHAT_ID="-1001234567890",
+        )
+        second = MONITOR.MonitorConfig.from_env(
+            with_secrets, require_enabled=True
+        )
+        self.assertEqual(first.policy_hash, second.policy_hash)
+        self.assertNotIn("telegram_enabled=", MONITOR.format_config(first))
+        self.assertNotIn(token, MONITOR.format_config(second, telegram_enabled=True))
+        self.assertNotIn("-1001234567890", MONITOR.format_config(second, telegram_enabled=True))
+
+    def test_message_has_same_valid_alert_id_fields_and_optional_session(self) -> None:
+        import uuid
+
+        alert_id = str(uuid.uuid4())
+        event = {
+            "gpu_key": "RTX_5080_LAPTOP",
+            "device": "fl4shminer_device:1",
+            "floor_ths": 110.0,
+            "observed_window_mean_ths": 104.25,
+            "consecutive_bad_windows": 2,
+            "consecutive_bad_windows_required": 2,
+            "stale_counter": {
+                "numerator": 3,
+                "denominator": 80,
+                "reported_percent": 3.75,
+            },
+            "timestamp_utc": "2026-10-12T12:30:00+00:00",
+        }
+        message = MONITOR.format_telegram_message(
+            "REALLOCATE_RECOMMENDED", event,
+            alert_id=alert_id, monitor_session_id=None, label="lab one",
+        )
+        self.assertIn(f"alert_id: {alert_id}", message)
+        self.assertIn("monitor_session_id: unknown", message)
+        self.assertIn("label: lab one", message)
+        self.assertIn("GPU: RTX_5080_LAPTOP", message)
+        self.assertIn("device: fl4shminer_device:1", message)
+        self.assertIn("floor_ths: 110", message)
+        self.assertIn("observed_window_mean_ths: 104.25", message)
+        self.assertIn("bad_windows: 2/2", message)
+        self.assertIn("stale_counter: 3/80 (3.75%)", message)
+        self.assertIn("actions_performed: false", message)
+        self.assertIn("Machine ID: correlate Alert ID in Salad Logs", message)
+
+    def test_message_marks_stale_percentage_unknown_when_not_reported(self) -> None:
+        message = MONITOR.format_telegram_message(
+            "REALLOCATE_RECOMMENDED",
+            {"stale_counter": {"numerator": 3, "denominator": 80}},
+            alert_id="synthetic-alert",
+            monitor_session_id=None,
+            label=None,
+        )
+        self.assertIn("stale_counter: 3/80 (unknown)", message)
+
+    def test_https_sender_uses_only_fixed_host_tls_and_one_post(self) -> None:
+        config = make_telegram_config()
+        captured: dict[str, object] = {}
+
+        class Response:
+            status = 200
+
+            def read(self, size: int) -> bytes:
+                captured["response_limit"] = size
+                return b'{"ok":true}'
+
+        class Connection:
+            def __init__(self, host: str, port: int, **kwargs: object) -> None:
+                captured.update(host=host, port=port, **kwargs)
+
+            def request(self, method: str, target: str, **kwargs: object) -> None:
+                captured.update(method=method, target=target, request=kwargs)
+
+            def getresponse(self) -> Response:
+                captured["getresponse_count"] = int(captured.get("getresponse_count", 0)) + 1
+                return Response()
+
+            def close(self) -> None:
+                captured["closed"] = True
+
+        self.assertTrue(
+            MONITOR._send_telegram_message(
+                config, "synthetic message", connection_factory=Connection
+            )
+        )
+        self.assertEqual(captured["host"], "api.telegram.org")
+        self.assertEqual(captured["port"], 443)
+        self.assertEqual(captured["timeout"], MONITOR.TELEGRAM_TIMEOUT_SECONDS)
+        self.assertEqual(captured["context"].verify_mode, MONITOR.ssl.CERT_REQUIRED)
+        self.assertTrue(captured["context"].check_hostname)
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(
+            captured["target"],
+            f"/bot{config.bot_token}/sendMessage",
+        )
+        self.assertEqual(captured["getresponse_count"], 1)
+        self.assertEqual(captured["response_limit"], MONITOR.TELEGRAM_MAX_RESPONSE_BYTES + 1)
+        self.assertTrue(captured["closed"])
+
+    def test_https_exception_with_secret_url_is_sanitized_and_not_retried(self) -> None:
+        config = make_telegram_config()
+        token = config.bot_token
+        calls: list[int] = []
+
+        class Connection:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+            def request(self, *_args: object, **_kwargs: object) -> None:
+                calls.append(1)
+                raise OSError(f"synthetic failure /bot{token}/sendMessage")
+
+            def close(self) -> None:
+                return None
+
+        self.assertFalse(
+            MONITOR._send_telegram_message(
+                config, "synthetic message", connection_factory=Connection
+            )
+        )
+        self.assertEqual(calls, [1])
+
+    def test_https_redirect_is_a_failure_without_following_another_request(self) -> None:
+        config = make_telegram_config()
+        calls: list[str] = []
+
+        class Response:
+            status = 302
+
+            def read(self, _size: int) -> bytes:
+                return b'{"ok":true}'
+
+        class Connection:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+            def request(self, method: str, target: str, **_kwargs: object) -> None:
+                calls.append(f"{method} {target}")
+
+            def getresponse(self) -> Response:
+                return Response()
+
+            def close(self) -> None:
+                return None
+
+        self.assertFalse(
+            MONITOR._send_telegram_message(
+                config, "synthetic message", connection_factory=Connection
+            )
+        )
+        self.assertEqual(len(calls), 1)
+
+    def test_recommendation_is_once_per_episode_and_rearmed_by_recovery(self) -> None:
+        class FakeNotifier:
+            def __init__(self) -> None:
+                self.events: list[str] = []
+
+            def submit(self, event_name: str, _event: object, *, monitor_session_id: str) -> str:
+                self.events.append(event_name)
+                self.assert_session = monitor_session_id
+                return "synthetic-alert-id"
+
+        fake = FakeNotifier()
+        config = make_telegram_config()
+        coordinator = MONITOR.TelegramAlertCoordinator(
+            fake, config, monotonic=lambda: 0.0, monitor_session_id="session-local"
+        )
+        recommendation = {
+            "state": "REALLOCATE_RECOMMENDED",
+            "device": "fl4shminer_device:1",
+        }
+        coordinator.monitor_events([recommendation, recommendation])
+        coordinator.monitor_events([{"state": "RECOVERED", "device": "fl4shminer_device:1"}])
+        coordinator.monitor_events([recommendation])
+        self.assertEqual(fake.events, ["REALLOCATE_RECOMMENDED", "REALLOCATE_RECOMMENDED"])
+        self.assertEqual(fake.assert_session, "session-local")
+
+    def test_pool_failure_matches_real_forms_includes_retry_and_uses_cooldown(self) -> None:
+        class FakeNotifier:
+            def __init__(self) -> None:
+                self.events: list[str] = []
+                self.payloads: list[dict[str, object]] = []
+
+            def submit(self, event_name: str, event: dict[str, object], *, monitor_session_id: str) -> str:
+                self.events.append(event_name)
+                self.payloads.append(event)
+                return "synthetic-alert-id"
+
+        current = [0.0]
+        fake = FakeNotifier()
+        config = make_telegram_config(FL4SH_TELEGRAM_POOL_ERROR_COOLDOWN_SECONDS="300")
+        monitor = MONITOR.Fl4shMonitor(make_config(), start_monotonic=0.0)
+        coordinator = MONITOR.TelegramAlertCoordinator(
+            fake, config, monotonic=lambda: current[0], monitor_session_id="session-local"
+        )
+        monitor.observe_line(line(90, stale="3/80 (3.75%)"), now=1.0)
+        coordinator.stdout_line(POOL_CONNECTION_FAILED_WITH_TIMESTAMP, monitor)
+        current[0] = 100.0
+        coordinator.stdout_line(POOL_CONNECTION_FAILED_WITH_TIMESTAMP, monitor)
+        current[0] = 299.0
+        coordinator.stdout_line(POOL_CONNECTION_FAILED_WITHOUT_TIMESTAMP, monitor)
+        current[0] = 300.0
+        coordinator.stdout_line(POOL_CONNECTION_FAILED_WITHOUT_TIMESTAMP, monitor)
+        current[0] = 301.0
+        coordinator.stdout_line(POOL_CONNECTION_FAILED_WITH_TIMESTAMP, monitor)
+        self.assertEqual(fake.events, ["POOL_CONNECTION_FAILED", "POOL_CONNECTION_FAILED"])
+        self.assertEqual([event["retry_seconds"] for event in fake.payloads], [10, 10])
+        self.assertEqual(
+            fake.payloads[0]["stale_counter"],
+            {"numerator": 3, "denominator": 80, "reported_percent": 3.75},
+        )
+        message = MONITOR.format_telegram_message(
+            fake.events[0],
+            fake.payloads[0],
+            alert_id="synthetic-alert",
+            monitor_session_id="session-local",
+            label=None,
+        )
+        self.assertIn("reason: MINING_AUTHORIZE_RESPONSE_TIMEOUT", message)
+        self.assertIn("retry: 10s", message)
+        self.assertIn("stale_counter: 3/80 (3.75%)", message)
+        self.assertNotIn(POOL_CONNECTION_FAILED_WITH_TIMESTAMP, message)
+        self.assertNotIn(POOL_CONNECTION_FAILED_WITHOUT_TIMESTAMP, message)
+        self.assertNotIn("retry_seconds", message)
+
+    def test_pool_alert_rejects_nonmatching_errors_and_out_of_bounds_retries(self) -> None:
+        class FakeNotifier:
+            def __init__(self) -> None:
+                self.events: list[tuple[str, dict[str, object]]] = []
+
+            def submit(self, event_name: str, event: dict[str, object], *, monitor_session_id: str) -> str:
+                self.events.append((event_name, event))
+                return "synthetic-alert-id"
+
+        fake = FakeNotifier()
+        coordinator = MONITOR.TelegramAlertCoordinator(
+            fake,
+            make_telegram_config(),
+            monotonic=lambda: 0.0,
+            monitor_session_id="session-local",
+        )
+        monitor = MONITOR.Fl4shMonitor(make_config())
+        nonmatching_lines = [
+            "Pool connection failed: connection refused",
+            "mining.authorize rejected",
+            "arbitrary text containing response timeout",
+            MONITOR.POOL_CONNECTION_FAILED_LINE,
+            "Pool connection failed: mining.authorize response timeout; reconnecting; retrying in 0s",
+            "Pool connection failed: mining.authorize response timeout; reconnecting; retrying in 86401s",
+            "Pool connection failed: mining.authorize response timeout; reconnecting; retrying in 999999s",
+            "2026/13/12 22:04:33 " + POOL_CONNECTION_FAILED_WITHOUT_TIMESTAMP,
+            "Pool connection failed: mining.authorize response timeout; reconnecting after 10s",
+        ]
+        for candidate in nonmatching_lines:
+            coordinator.stdout_line(candidate, monitor)
+        self.assertEqual(fake.events, [])
+        coordinator.stdout_line(POOL_CONNECTION_FAILED_WITHOUT_TIMESTAMP, monitor)
+        self.assertEqual(len(fake.events), 1)
+        event_name, event = fake.events[0]
+        self.assertEqual(event["retry_seconds"], 10)
+        message = MONITOR.format_telegram_message(
+            event_name,
+            event,
+            alert_id="synthetic-alert",
+            monitor_session_id="session-local",
+            label=None,
+        )
+        self.assertIn("reason: MINING_AUTHORIZE_RESPONSE_TIMEOUT", message)
+        self.assertIn("retry: 10s", message)
+        self.assertNotIn(POOL_CONNECTION_FAILED_WITHOUT_TIMESTAMP, message)
+        self.assertNotIn("retry_seconds", message)
+        self.assertNotIn("raw_line", event)
+
+    def test_notifier_transport_failure_is_nonfatal_and_sanitized(self) -> None:
+        secret = "synthetic_sensitive_bot_token"
+        config = make_telegram_config(FL4SH_TELEGRAM_BOT_TOKEN=secret)
+        audit: list[str] = []
+        done = threading.Event()
+
+        def capture(line_text: str) -> None:
+            audit.append(line_text)
+            if "TELEGRAM_NOTIFY_FAILED" in line_text:
+                done.set()
+
+        def failure(_config: object, _message: str) -> bool:
+            raise OSError(f"synthetic /bot{secret}/sendMessage failure")
+
+        notifier = MONITOR.TelegramNotifier(config, audit=capture, sender=failure)
+        alert_id = notifier.submit(
+            "POOL_CONNECTION_FAILED", {}, monitor_session_id="session-local"
+        )
+        self.assertTrue(done.wait(timeout=2.0))
+        notifier.close()
+        rendered = "\n".join(audit)
+        self.assertIsNotNone(alert_id)
+        self.assertIn(f"alert_id={alert_id}", rendered)
+        self.assertIn("reason=TRANSPORT", rendered)
+        self.assertNotIn(secret, rendered)
+
+    def test_bounded_queue_reports_full_without_blocking_submitter(self) -> None:
+        config = make_telegram_config()
+        started = threading.Event()
+        release = threading.Event()
+        audit: list[str] = []
+
+        def slow_sender(_config: object, _message: str) -> bool:
+            started.set()
+            release.wait(timeout=2.0)
+            return False
+
+        notifier = MONITOR.TelegramNotifier(
+            config, audit=audit.append, sender=slow_sender, queue_capacity=1
+        )
+        notifier.submit("POOL_CONNECTION_FAILED", {}, monitor_session_id="session")
+        self.assertTrue(started.wait(timeout=1.0))
+        notifier.submit("POOL_CONNECTION_FAILED", {}, monitor_session_id="session")
+        notifier.submit("POOL_CONNECTION_FAILED", {}, monitor_session_id="session")
+        self.assertTrue(any("reason=QUEUE_FULL" in line_text for line_text in audit))
+        release.set()
+        notifier.close()
+
+    def test_sender_error_does_not_change_harmless_child_exit_status(self) -> None:
+        secret = "synthetic_sensitive_bot_token"
+        telegram = make_telegram_config(FL4SH_TELEGRAM_BOT_TOKEN=secret)
+        code = f"print({POOL_CONNECTION_FAILED_WITHOUT_TIMESTAMP!r}, flush=True); raise SystemExit(7)"
+        output = io.BytesIO()
+        error = io.BytesIO()
+        fake_sys = SimpleNamespace(stdout=SimpleNamespace(buffer=output), stderr=SimpleNamespace(buffer=error))
+
+        def fail_sender(_config: object, _message: str) -> bool:
+            raise OSError(f"do not expose /bot{secret}/sendMessage")
+
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(
+            MONITOR, "sys", fake_sys
+        ), mock.patch.dict(
+            MONITOR.os.environ,
+            {
+                "FL4SH_TELEGRAM_ENABLED": "1",
+                "FL4SH_TELEGRAM_BOT_TOKEN": secret,
+                "FL4SH_TELEGRAM_CHAT_ID": "-1001234567890",
+            },
+            clear=False,
+        ):
+            result = MONITOR.run_supervisor(
+                make_config(),
+                [sys.executable, "-c", code],
+                telegram_config=telegram,
+                telegram_sender=fail_sender,
+            )
+        log_output = (output.getvalue() + error.getvalue()).decode("utf-8", "replace")
+        self.assertEqual(result, 7)
+        self.assertIn("TELEGRAM_NOTIFY_FAILED", log_output)
+        self.assertNotIn(secret, log_output)
+
+    def test_supervisor_keeps_credentials_out_of_child_and_alert_id_matches_payload(self) -> None:
+        config = make_config()
+        telegram = make_telegram_config(FL4SH_MONITOR_LABEL="synthetic lab")
+        token = telegram.bot_token or ""
+        chat_id = telegram.chat_id or ""
+        child_code = (
+            "import os; print('child_secret_env=' + repr((os.getenv('FL4SH_TELEGRAM_BOT_TOKEN'), "
+            "os.getenv('FL4SH_TELEGRAM_CHAT_ID'))), flush=True); "
+            f"print('synthetic echo {token}', flush=True); "
+            f"print({POOL_CONNECTION_FAILED_WITH_TIMESTAMP!r}, flush=True)"
+        )
+        output = io.BytesIO()
+        error = io.BytesIO()
+        fake_sys = SimpleNamespace(stdout=SimpleNamespace(buffer=output), stderr=SimpleNamespace(buffer=error))
+        messages: list[str] = []
+        sent = threading.Event()
+
+        def sender(_config: object, message: str) -> bool:
+            messages.append(message)
+            sent.set()
+            return True
+
+        environment = {
+            "FL4SH_TELEGRAM_BOT_TOKEN": token,
+            "FL4SH_TELEGRAM_CHAT_ID": chat_id,
+            "FL4SH_TELEGRAM_ENABLED": "1",
+            "FL4SH_TELEGRAM_POOL_ERROR_COOLDOWN_SECONDS": "300",
+            "FL4SH_MONITOR_LABEL": "synthetic lab",
+        }
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(
+            MONITOR, "sys", fake_sys
+        ), mock.patch.dict(MONITOR.os.environ, environment, clear=False):
+            result = MONITOR.run_supervisor(
+                config,
+                [sys.executable, "-c", child_code],
+                telegram_config=telegram,
+                telegram_sender=sender,
+            )
+        self.assertEqual(result, 0)
+        self.assertTrue(sent.wait(timeout=0.1))
+        log_output = (output.getvalue() + error.getvalue()).decode("utf-8", "replace")
+        self.assertNotIn(token, log_output)
+        self.assertNotIn(chat_id, log_output)
+        self.assertNotIn(token, repr(messages))
+        self.assertNotIn(chat_id, repr(messages))
+        self.assertIn("child_secret_env=(None, None)", log_output)
+        self.assertIn("[REDACTED]", log_output)
+        self.assertIn(POOL_CONNECTION_FAILED_WITH_TIMESTAMP, log_output.splitlines())
+        alert_lines = [line_text for line_text in log_output.splitlines() if "state=TELEGRAM_ALERT" in line_text]
+        self.assertEqual(len(alert_lines), 1)
+        import re
+        alert_id_match = re.search(r"alert_id=([0-9a-f-]{36})", alert_lines[0])
+        self.assertIsNotNone(alert_id_match)
+        assert alert_id_match is not None
+        self.assertIn(f"alert_id: {alert_id_match.group(1)}", messages[0])
+        self.assertIn("event: POOL_CONNECTION_FAILED", messages[0])
+        self.assertIn("monitor_session_id: ", messages[0])
+        self.assertIn("Machine ID: correlate Alert ID in Salad Logs", messages[0])
+        self.assertIn("TELEGRAM_NOTIFY_SENT", log_output)
+
+    def test_telegram_disabled_preserves_original_popen_kwargs_inheritance_and_exit_code(self) -> None:
+        config = make_config()
+        telegram = MONITOR.TelegramConfig.from_env({"FL4SH_TELEGRAM_ENABLED": "0"})
+        captured: dict[str, object] = {}
+        output = io.BytesIO()
+        error = io.BytesIO()
+        fake_sys = SimpleNamespace(stdout=SimpleNamespace(buffer=output), stderr=SimpleNamespace(buffer=error))
+        child_code = (
+            "import os; print('inherited=' + os.environ.get('FL4SH_TEST_INHERITED', 'missing'), flush=True); "
+            "raise SystemExit(7)"
+        )
+        real_popen = subprocess.Popen
+
+        def capture_popen(command: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+            captured["command"] = list(command)
+            captured["kwargs"] = dict(kwargs)
+            return real_popen(command, **kwargs)
+
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(
+            MONITOR, "sys", fake_sys
+        ), mock.patch.dict(
+            MONITOR.os.environ,
+            {
+                "FL4SH_TELEGRAM_ENABLED": "0",
+                "FL4SH_TEST_INHERITED": "available",
+            },
+            clear=False,
+        ):
+            result = MONITOR.run_supervisor(
+                config,
+                [sys.executable, "-c", child_code],
+                telegram_config=telegram,
+                popen_factory=capture_popen,
+            )
+
+        self.assertEqual(result, 7)
+        self.assertEqual(captured["command"], [sys.executable, "-c", child_code])
+        self.assertEqual(
+            captured["kwargs"],
+            {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "bufsize": 0},
+        )
+        self.assertIn(b"inherited=available", output.getvalue())
+
+    def test_enabled_telegram_config_is_rejected_before_child_launch(self) -> None:
+        secret = "synthetic_sensitive_bot_token"
+        called = False
+
+        def should_not_start(*_args: object, **_kwargs: object) -> object:
+            nonlocal called
+            called = True
+            raise AssertionError("child must not start with invalid notifier config")
+
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured), mock.patch.dict(
+            MONITOR.os.environ,
+            {"FL4SH_TELEGRAM_ENABLED": "1", "FL4SH_TELEGRAM_BOT_TOKEN": secret},
+            clear=False,
+        ):
+            result = MONITOR.run_supervisor(make_config(), ["stub"], popen_factory=should_not_start)
+        self.assertEqual(result, 64)
+        self.assertFalse(called)
+        self.assertNotIn(secret, captured.getvalue())
+
 
 
 class ParsingAndWindowTests(unittest.TestCase):

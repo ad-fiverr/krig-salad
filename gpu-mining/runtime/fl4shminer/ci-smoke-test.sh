@@ -18,6 +18,10 @@ mode="${1:-}"
 [[ "$#" -eq 1 && ( "$mode" == --source || "$mode" == --image ) ]] ||
   fail "usage: $0 --source | --image"
 
+# Keep developer or CI notifier credentials out of this isolated smoke process.
+unset FL4SH_TELEGRAM_ENABLED FL4SH_TELEGRAM_BOT_TOKEN FL4SH_TELEGRAM_CHAT_ID \
+  FL4SH_TELEGRAM_POOL_ERROR_COOLDOWN_SECONDS FL4SH_MONITOR_LABEL || true
+
 if [[ "$mode" == --source ]]; then
   for script in "$ENTRYPOINT" "$HEALTHCHECK" "$VERIFIER" "$SCRIPT_DIR/ci-smoke-test.sh"; do
     bash -n "$script" || fail "Bash syntax check failed: $(basename "$script")"
@@ -45,6 +49,8 @@ if [[ "$mode" == --source ]]; then
     python_bin=python
   fi
   command -v "$python_bin" >/dev/null 2>&1 || fail "Python is required for isolated smoke checks"
+  temporary="$(mktemp -d)"
+  trap 'rm -rf -- "$temporary"' EXIT
   [[ -f "$MONITOR" && -f "$MONITOR_TESTS" ]] || fail "runtime monitor source and tests are required"
   monitor_env_keys=(
     FL4SH_MONITOR_ENABLED FL4SH_MONITOR_PROFILE FL4SH_MONITOR_GPU_FLOORS_JSON
@@ -54,6 +60,8 @@ if [[ "$mode" == --source ]]; then
     SALAD_G5_HASH_WINDOW_SECONDS SALAD_G5_REEVALUATION_INTERVAL_SECONDS
     SALAD_G5_MINIMUM_SAMPLES_PER_WINDOW SALAD_G5_MAXIMUM_SAMPLE_GAP_SECONDS
     SALAD_G5_MINIMUM_WINDOW_COVERAGE_RATIO SALAD_G5_CONSECUTIVE_BAD_WINDOWS
+    FL4SH_TELEGRAM_ENABLED FL4SH_TELEGRAM_BOT_TOKEN FL4SH_TELEGRAM_CHAT_ID
+    FL4SH_TELEGRAM_POOL_ERROR_COOLDOWN_SECONDS FL4SH_MONITOR_LABEL
   )
   monitor_env_unset=()
   for env_name in "${monitor_env_keys[@]}"; do monitor_env_unset+=(-u "$env_name"); done
@@ -66,6 +74,23 @@ if [[ "$mode" == --source ]]; then
     FL4SH_MONITOR_GPU_FLOORS_JSON='{"RTX_5080_LAPTOP":110,"RTX_5090_LAPTOP":115,"RTX_5070_TI_LAPTOP":100}' \
     "$python_bin" -B "$MONITOR" --check-config >/dev/null 2>&1 ||
     fail "valid autodetected GPU floor registry was rejected"
+  if env "${monitor_env_unset[@]}" FL4SH_MONITOR_ENABLED=1 FL4SH_TELEGRAM_ENABLED=1 \
+    "$python_bin" -B "$MONITOR" --check-config > /dev/null 2>&1; then
+    fail "Telegram enabled without credentials was accepted"
+  fi
+  telegram_token='123456:synthetic_token_for_source_smoke'
+  telegram_chat='-1001234567890'
+  env "${monitor_env_unset[@]}" FL4SH_MONITOR_ENABLED=1 \
+    FL4SH_TELEGRAM_ENABLED=1 FL4SH_TELEGRAM_BOT_TOKEN="$telegram_token" \
+    FL4SH_TELEGRAM_CHAT_ID="$telegram_chat" \
+    "$python_bin" -B "$MONITOR" --check-config > "$temporary.telegram-config.out" 2>&1 ||
+    fail "valid synthetic Telegram config was rejected"
+  grep -Fq 'telegram_enabled=true' "$temporary.telegram-config.out" ||
+    fail "monitor config did not expose the Telegram enabled state"
+  if grep -Fq "$telegram_token" "$temporary.telegram-config.out" ||
+    grep -Fq "$telegram_chat" "$temporary.telegram-config.out"; then
+    fail "Telegram configuration leaked to monitor output"
+  fi
   "$python_bin" -B "$MONITOR_TESTS" || fail "runtime monitor unit tests failed"
   if command -v ruby >/dev/null 2>&1; then
     ruby -e 'require "yaml"; doc = YAML.load_file(ARGV.fetch(0)); abort "workflow jobs missing" unless doc.is_a?(Hash) && doc["jobs"].is_a?(Hash)' \
@@ -76,8 +101,6 @@ if [[ "$mode" == --source ]]; then
       fail "workflow YAML could not be parsed (Ruby or Python PyYAML is required)"
   fi
 
-  temporary="$(mktemp -d)"
-  trap 'rm -rf -- "$temporary"' EXIT
   mkdir -p "$temporary/bin"
   cat > "$temporary/bin/nvidia-smi" <<'STUB'
 #!/usr/bin/env bash
@@ -179,6 +202,13 @@ PY
   expect_rejected "invalid monitor switch" env FL4SH_POOL_URL="$pool" \
     FL4SH_MINING_ID="$mining_id" FL4SH_MONITOR_ENABLED=true \
     bash "$ENTRYPOINT" --validate-config
+  if env FL4SH_POOL_URL="$pool" FL4SH_MINING_ID="$mining_id" \
+    FL4SH_TELEGRAM_ENABLED=1 FL4SH_MONITOR_ENABLED=0 \
+    bash "$ENTRYPOINT" --validate-config > "$temporary.telegram-guard.out" 2>&1; then
+    fail "Telegram enabled while monitor disabled was accepted"
+  fi
+  grep -Fq 'requires FL4SH_MONITOR_ENABLED=1' "$temporary.telegram-guard.out" ||
+    fail "Telegram/monitor dependency guard returned an unexpected message"
 
   FL4SH_POOL_URL="$pool" FL4SH_MINING_ID="$mining_id" \
     FL4SH_MONITOR_ENABLED=1 FL4SH_MONITOR_PROFILE=RTX_5090_LAPTOP \
@@ -225,7 +255,7 @@ if command -v dpkg-query >/dev/null 2>&1; then
   [[ -z "$driver_packages" ]] || fail "runtime image contains host driver packages: $driver_packages"
 fi
 command -v python3 >/dev/null 2>&1 || fail "runtime image is missing the opt-in monitor Python interpreter"
-if ! python3 -c 'import collections, dataclasses, datetime, hashlib, json, math, os, queue, re, signal, subprocess, sys, threading, time, typing' >/tmp/fl4sh-python-stdlib.out 2>&1; then
+if ! python3 -c 'import collections, dataclasses, datetime, hashlib, http.client, json, math, os, queue, re, signal, ssl, subprocess, sys, threading, time, typing, uuid' >/tmp/fl4sh-python-stdlib.out 2>&1; then
   printf 'Python standard-library import diagnostic (first 12 lines):\n' >&2
   head -n 12 /tmp/fl4sh-python-stdlib.out | sed -E 's/(api[_-]?key|token|secret|password)([=: ]+)[^[:space:]]+/\1\2[REDACTED]/Ig' >&2
   fail "runtime image is missing required Python standard-library modules"
