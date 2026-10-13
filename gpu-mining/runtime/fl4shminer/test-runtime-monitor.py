@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+from datetime import datetime, timedelta, timezone
 import importlib.util
 import io
 import os
@@ -160,8 +161,54 @@ class MonitorConfigTests(unittest.TestCase):
         first = make_config()
         changed_floor = make_config(SALAD_G5_GPU_FLOOR_RTX_5090_LAPTOP_THS="115")
         changed_window = make_config(SALAD_G5_HASH_WINDOW_SECONDS="30")
+        changed_tolerance = make_config(FL4SH_MONITOR_FLOOR_TOLERANCE_THS="2.5")
         self.assertNotEqual(first.policy_hash, changed_floor.policy_hash)
         self.assertNotEqual(first.policy_hash, changed_window.policy_hash)
+        self.assertNotEqual(first.policy_hash, changed_tolerance.policy_hash)
+
+    def test_floor_tolerance_and_renotify_configuration_is_bounded_and_visible(self) -> None:
+        config = make_config(
+            FL4SH_MONITOR_FLOOR_TOLERANCE_THS="2.5",
+            FL4SH_MONITOR_REALLOCATE_RENOTIFY_DROP_THS="4.25",
+        )
+        self.assertEqual(config.floor_tolerance_ths, 2.5)
+        self.assertEqual(config.reallocate_renotify_drop_ths, 4.25)
+        rendered = MONITOR.format_config(config)
+        self.assertIn("floor_tolerance_ths=2.5", rendered)
+        self.assertIn("reallocate_renotify_drop_ths=4.25", rendered)
+        for value in ("0", "0.5", "3.01", "nan", "inf", "secret-floor"):
+            with self.subTest(value=value), self.assertRaises(MONITOR.MonitorConfigError):
+                make_config(FL4SH_MONITOR_FLOOR_TOLERANCE_THS=value)
+        for value in ("0", "nan", "inf", "1001", "secret-drop"):
+            with self.subTest(value=value), self.assertRaises(MONITOR.MonitorConfigError):
+                make_config(FL4SH_MONITOR_REALLOCATE_RENOTIFY_DROP_THS=value)
+
+    def test_configuration_failure_output_uses_only_allowlisted_reason_codes(self) -> None:
+        secret_json = '{"RTX_5080_LAPTOP":110,"token":"synthetic-secret"}'
+        with mock.patch.dict(
+            MONITOR.os.environ,
+            {"FL4SH_MONITOR_ENABLED": "1", "FL4SH_MONITOR_GPU_FLOORS_JSON": secret_json},
+            clear=True,
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stderr(output):
+                result = MONITOR._check_config()
+        self.assertEqual(result, 64)
+        self.assertEqual(output.getvalue().strip(),
+                         "FL4SH_MONITOR configuration invalid: INVALID_GPU_FLOORS_JSON")
+        self.assertNotIn("synthetic-secret", output.getvalue())
+
+        for env, expected in (
+            ({"FL4SH_MONITOR_ENABLED": "1", "FL4SH_TELEGRAM_ENABLED": "1"}, "MISSING_TELEGRAM_TOKEN"),
+            ({"FL4SH_MONITOR_ENABLED": "1", "FL4SH_TELEGRAM_ENABLED": "1",
+              "FL4SH_TELEGRAM_BOT_TOKEN": "synthetic:valid-token"}, "MISSING_TELEGRAM_CHAT_ID"),
+        ):
+            with self.subTest(expected=expected), mock.patch.dict(MONITOR.os.environ, env, clear=True):
+                output = io.StringIO()
+                with contextlib.redirect_stderr(output):
+                    result = MONITOR._check_config()
+                self.assertEqual(result, 64)
+                self.assertIn(f"configuration invalid: {expected}", output.getvalue())
 
     def test_effective_policy_and_hash_are_visible_without_secrets(self) -> None:
         config = make_config(
@@ -343,7 +390,9 @@ class TelegramAuditTests(unittest.TestCase):
         self.assertIn("bad_windows: 2/2", message)
         self.assertIn("stale_counter: 3/80 (3.75%)", message)
         self.assertIn("actions_performed: false", message)
-        self.assertIn("Machine ID: correlate Alert ID in Salad Logs", message)
+        self.assertIn("Provider Machine ID: unavailable in local container", message)
+        self.assertIn("Identity source: LOCAL_MONITOR_ONLY", message)
+        self.assertNotIn("Machine ID: correlate", message)
 
     def test_message_marks_stale_percentage_unknown_when_not_reported(self) -> None:
         message = MONITOR.format_telegram_message(
@@ -457,7 +506,7 @@ class TelegramAuditTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.events: list[str] = []
 
-            def submit(self, event_name: str, _event: object, *, monitor_session_id: str) -> str:
+            def submit(self, event_name: str, _event: object, *, monitor_session_id: str, alert_id: str | None = None) -> str:
                 self.events.append(event_name)
                 self.assert_session = monitor_session_id
                 return "synthetic-alert-id"
@@ -477,60 +526,306 @@ class TelegramAuditTests(unittest.TestCase):
         self.assertEqual(fake.events, ["REALLOCATE_RECOMMENDED", "REALLOCATE_RECOMMENDED"])
         self.assertEqual(fake.assert_session, "session-local")
 
-    def test_pool_failure_matches_real_forms_includes_retry_and_uses_cooldown(self) -> None:
+    def test_recommendation_allows_deduplicated_sequences_in_one_episode(self) -> None:
         class FakeNotifier:
             def __init__(self) -> None:
-                self.events: list[str] = []
-                self.payloads: list[dict[str, object]] = []
+                self.events: list[tuple[str, dict[str, object]]] = []
 
-            def submit(self, event_name: str, event: dict[str, object], *, monitor_session_id: str) -> str:
-                self.events.append(event_name)
-                self.payloads.append(event)
+            def submit(self, event_name: str, event: dict[str, object], *, monitor_session_id: str, alert_id: str | None = None) -> str:
+                self.events.append((event_name, event))
                 return "synthetic-alert-id"
 
+        fake = FakeNotifier()
+        coordinator = MONITOR.TelegramAlertCoordinator(
+            fake, make_telegram_config(), monotonic=lambda: 0.0, monitor_session_id="session-local"
+        )
+        episode = "11111111-1111-4111-8111-111111111111"
+        first = {"state": "REALLOCATE_RECOMMENDED", "device": "fl4shminer_device:1",
+                 "degradation_episode_id": episode, "alert_sequence": 1}
+        second = {**first, "alert_sequence": 2}
+        third = {**first, "alert_sequence": 3}
+        coordinator.monitor_events([first, first, second, second, third])
+        self.assertEqual([item[0] for item in fake.events], [
+            "REALLOCATE_RECOMMENDED", "REALLOCATE_RECOMMENDED", "REALLOCATE_RECOMMENDED",
+        ])
+        coordinator.monitor_events([{"state": "RECOVERED", "device": "fl4shminer_device:1"}])
+        coordinator.monitor_events([{**first, "degradation_episode_id": "22222222-2222-4222-8222-222222222222"}])
+        self.assertEqual(len(fake.events), 4)
+
+    def test_pool_failures_form_one_episode_and_escalate_after_five_minutes(self) -> None:
+        class FakeNotifier:
+            def __init__(self) -> None:
+                self.events: list[tuple[str, dict[str, object]]] = []
+                self.audit_lines: list[str] = []
+
+            def submit(self, event_name: str, event: dict[str, object], *, monitor_session_id: str, alert_id: str | None = None) -> str:
+                self.events.append((event_name, event))
+                return alert_id or "synthetic-alert-id"
+
+            def audit(self, line_text: str) -> None:
+                self.audit_lines.append(line_text)
+
         current = [0.0]
+        base_utc = datetime(2026, 10, 13, 17, 43, 30, tzinfo=timezone.utc)
         fake = FakeNotifier()
         config = make_telegram_config(FL4SH_TELEGRAM_POOL_ERROR_COOLDOWN_SECONDS="300")
         monitor = MONITOR.Fl4shMonitor(make_config(), start_monotonic=0.0)
         coordinator = MONITOR.TelegramAlertCoordinator(
-            fake, config, monotonic=lambda: current[0], monitor_session_id="session-local"
+            fake, config, monotonic=lambda: current[0],
+            monitor_session_id="11111111-1111-4111-8111-111111111111",
+            utc_now=lambda: base_utc + timedelta(seconds=current[0]),
         )
         monitor.observe_line(line(90, stale="3/80 (3.75%)"), now=1.0)
         coordinator.stdout_line(POOL_CONNECTION_FAILED_WITH_TIMESTAMP, monitor)
-        current[0] = 100.0
-        coordinator.stdout_line(POOL_CONNECTION_FAILED_WITH_TIMESTAMP, monitor)
-        current[0] = 299.0
-        coordinator.stdout_line(POOL_CONNECTION_FAILED_WITHOUT_TIMESTAMP, monitor)
         current[0] = 300.0
         coordinator.stdout_line(POOL_CONNECTION_FAILED_WITHOUT_TIMESTAMP, monitor)
-        current[0] = 301.0
+        current[0] = 600.0
         coordinator.stdout_line(POOL_CONNECTION_FAILED_WITH_TIMESTAMP, monitor)
-        self.assertEqual(fake.events, ["POOL_CONNECTION_FAILED", "POOL_CONNECTION_FAILED"])
-        self.assertEqual([event["retry_seconds"] for event in fake.payloads], [10, 10])
+        self.assertEqual([name for name, _event in fake.events], [
+            "POOL_CONNECTION_FAILED", "POOL_CONNECTION_UNSTABLE",
+        ])
+        failed = fake.events[0][1]
+        unstable = fake.events[1][1]
+        self.assertEqual(failed["failure_count"], 1)
+        self.assertEqual(failed["pool_alert_sequence"], 1)
+        self.assertEqual(unstable["failure_count"], 2)
+        self.assertEqual(unstable["pool_alert_sequence"], 2)
+        self.assertEqual(unstable["notification_reason"], "PERSISTENT_FAILURES")
+        self.assertEqual(unstable["first_failure_utc"], "2026-10-13T17:43:30Z")
+        self.assertEqual(unstable["latest_failure_utc"], "2026-10-13T17:48:30Z")
+        self.assertEqual(failed["pool_episode_id"], unstable["pool_episode_id"])
         self.assertEqual(
-            fake.payloads[0]["stale_counter"],
+            failed["stale_counter"],
             {"numerator": 3, "denominator": 80, "reported_percent": 3.75},
         )
         message = MONITOR.format_telegram_message(
-            fake.events[0],
-            fake.payloads[0],
+            "POOL_CONNECTION_UNSTABLE",
+            unstable,
             alert_id="synthetic-alert",
-            monitor_session_id="session-local",
+            monitor_session_id="11111111-1111-4111-8111-111111111111",
             label=None,
         )
         self.assertIn("reason: MINING_AUTHORIZE_RESPONSE_TIMEOUT", message)
-        self.assertIn("retry: 10s", message)
-        self.assertIn("stale_counter: 3/80 (3.75%)", message)
+        self.assertIn("notification_reason: PERSISTENT_FAILURES", message)
+        self.assertIn("Recommendation: CHECK_POOL_OR_NETWORK", message)
         self.assertNotIn(POOL_CONNECTION_FAILED_WITH_TIMESTAMP, message)
         self.assertNotIn(POOL_CONNECTION_FAILED_WITHOUT_TIMESTAMP, message)
         self.assertNotIn("retry_seconds", message)
+        self.assertEqual(len(fake.audit_lines), 2)
+        self.assertTrue(all("actions_performed=false" in line_text for line_text in fake.audit_lines))
+
+    def test_three_exact_pool_timeouts_escalate_as_burst_once(self) -> None:
+        class FakeNotifier:
+            def __init__(self) -> None:
+                self.events: list[tuple[str, dict[str, object]]] = []
+                self.audit_lines: list[str] = []
+
+            def submit(self, event_name: str, event: dict[str, object], *, monitor_session_id: str, alert_id: str | None = None) -> str:
+                self.events.append((event_name, event))
+                return alert_id or "synthetic-alert-id"
+
+            def audit(self, line_text: str) -> None:
+                self.audit_lines.append(line_text)
+
+        current = [0.0]
+        base_utc = datetime(2026, 10, 13, 17, 43, 30, tzinfo=timezone.utc)
+        fake = FakeNotifier()
+        coordinator = MONITOR.TelegramAlertCoordinator(
+            fake, make_telegram_config(), monotonic=lambda: current[0],
+            monitor_session_id="22222222-2222-4222-8222-222222222222",
+            utc_now=lambda: base_utc + timedelta(seconds=current[0]),
+        )
+        monitor = MONITOR.Fl4shMonitor(make_config(), start_monotonic=0)
+        for elapsed in (0.0, 30.0, 89.0):
+            current[0] = elapsed
+            coordinator.stdout_line(POOL_CONNECTION_FAILED_WITH_TIMESTAMP, monitor)
+        self.assertEqual([name for name, _event in fake.events], [
+            "POOL_CONNECTION_FAILED", "POOL_CONNECTION_UNSTABLE",
+        ])
+        unstable = fake.events[-1][1]
+        self.assertEqual(unstable["failure_count"], 3)
+        self.assertEqual(unstable["recent_failure_count"], 3)
+        self.assertEqual(unstable["notification_reason"], "BURST_FAILURES")
+        message = MONITOR.format_telegram_message(
+            "POOL_CONNECTION_UNSTABLE", unstable,
+            alert_id="synthetic-alert", monitor_session_id="22222222-2222-4222-8222-222222222222", label=None,
+        )
+        self.assertIn("notification_reason: BURST_FAILURES", message)
+        self.assertNotIn("Pool connection failed", message)
+        self.assertEqual(len(fake.audit_lines), 2)
+        self.assertIn("state=POOL_CONNECTION_UNSTABLE", fake.audit_lines[-1])
+
+    def test_unstable_reminder_requires_elapsed_cooldown_and_new_failure(self) -> None:
+        class FakeNotifier:
+            def __init__(self) -> None:
+                self.events: list[tuple[str, dict[str, object]]] = []
+                self.audit_lines: list[str] = []
+
+            def submit(self, event_name: str, event: dict[str, object], *, monitor_session_id: str, alert_id: str | None = None) -> str:
+                self.events.append((event_name, event))
+                return alert_id or "synthetic-alert-id"
+
+            def audit(self, line_text: str) -> None:
+                self.audit_lines.append(line_text)
+
+        current = [0.0]
+        base_utc = datetime(2026, 10, 13, 17, 43, 30, tzinfo=timezone.utc)
+        fake = FakeNotifier()
+        coordinator = MONITOR.TelegramAlertCoordinator(
+            fake, make_telegram_config(), monotonic=lambda: current[0],
+            monitor_session_id="33333333-3333-4333-8333-333333333333",
+            utc_now=lambda: base_utc + timedelta(seconds=current[0]),
+        )
+        monitor = MONITOR.Fl4shMonitor(make_config(), start_monotonic=0)
+        for elapsed in (0.0, 30.0, 60.0):
+            current[0] = elapsed
+            coordinator.stdout_line(POOL_CONNECTION_FAILED_WITHOUT_TIMESTAMP, monitor)
+        # Time alone never emits a reminder.
+        current[0] = 960.0
+        self.assertEqual(len(fake.events), 2)
+        current[0] = 959.9
+        coordinator.stdout_line(POOL_CONNECTION_FAILED_WITH_TIMESTAMP, monitor)
+        self.assertEqual([name for name, _event in fake.events].count("POOL_CONNECTION_UNSTABLE"), 1)
+        current[0] = 960.0
+        coordinator.stdout_line(POOL_CONNECTION_FAILED_WITH_TIMESTAMP, monitor)
+        reminders = [event for name, event in fake.events if name == "POOL_CONNECTION_UNSTABLE"]
+        self.assertEqual(len(reminders), 2)
+        self.assertEqual(reminders[-1]["notification_reason"], "STILL_UNSTABLE")
+        self.assertEqual(reminders[-1]["pool_alert_sequence"], 3)
+        self.assertEqual(reminders[-1]["failure_count"], 5)
+
+    def test_solutions_accepted_recovers_once_and_next_timeout_starts_new_episode(self) -> None:
+        class FakeNotifier:
+            def __init__(self) -> None:
+                self.events: list[tuple[str, dict[str, object]]] = []
+                self.audit_lines: list[str] = []
+
+            def submit(self, event_name: str, event: dict[str, object], *, monitor_session_id: str, alert_id: str | None = None) -> str:
+                self.events.append((event_name, event))
+                return alert_id or "synthetic-alert-id"
+
+            def audit(self, line_text: str) -> None:
+                self.audit_lines.append(line_text)
+
+        current = [0.0]
+        base_utc = datetime(2026, 10, 13, 17, 43, 30, tzinfo=timezone.utc)
+        fake = FakeNotifier()
+        coordinator = MONITOR.TelegramAlertCoordinator(
+            fake, make_telegram_config(), monotonic=lambda: current[0],
+            monitor_session_id="44444444-4444-4444-8444-444444444444",
+            utc_now=lambda: base_utc + timedelta(seconds=current[0]),
+        )
+        monitor = MONITOR.Fl4shMonitor(make_config(), start_monotonic=0)
+        coordinator.stdout_line(POOL_CONNECTION_FAILED_WITHOUT_TIMESTAMP, monitor)
+        first_episode = fake.events[0][1]["pool_episode_id"]
+        current[0] = 300.0
+        coordinator.stdout_line(POOL_CONNECTION_FAILED_WITH_TIMESTAMP, monitor)
+        self.assertEqual(fake.events[-1][0], "POOL_CONNECTION_UNSTABLE")
+        self.assertEqual(fake.events[-1][1]["pool_alert_sequence"], 2)
+        accepted_line = "Solutions accepted: 5-NVIDIA GeForce RTX 5090 Laptop GPU, 0 stale"
+        current[0] = 305.0
+        coordinator.stdout_line(accepted_line, monitor)
+        coordinator.stdout_line("Solutions accepted: 5-NVIDIA GeForce RTX 5090 Laptop GPU, 0 stale", monitor)
+        recovered = [event for name, event in fake.events if name == "POOL_CONNECTION_RECOVERED"]
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["pool_episode_id"], first_episode)
+        self.assertEqual(recovered[0]["pool_alert_sequence"], 3)
+        self.assertEqual(recovered[0]["prior_failure_count"], 2)
+        self.assertEqual(recovered[0]["failure_count"], 2)
+        self.assertEqual(recovered[0]["retry_seconds"], 10)
+        evidence_marker = next(line_text for line_text in fake.audit_lines if "state=POOL_RECOVERY_EVIDENCE" in line_text)
+        self.assertEqual(sum("state=POOL_RECOVERY_EVIDENCE" in line_text for line_text in fake.audit_lines), 1)
+        self.assertIn("pool_alert_sequence=3", evidence_marker)
+        self.assertIn(
+            "solutions_evidence_sha256=" + MONITOR.hashlib.sha256(accepted_line.encode("utf-8")).hexdigest(),
+            evidence_marker,
+        )
+        self.assertEqual(recovered[0]["recovery_signal"], "SOLUTIONS_ACCEPTED")
+        recovery_message = MONITOR.format_telegram_message(
+            "POOL_CONNECTION_RECOVERED", recovered[0], alert_id="synthetic-alert",
+            monitor_session_id=coordinator.monitor_session_id, label=None,
+        )
+        self.assertIn("recovery_signal: SOLUTIONS_ACCEPTED", recovery_message)
+        self.assertIn("pool_alert_sequence: 3", recovery_message)
+        self.assertIn("failure_count: 2", recovery_message)
+        self.assertIn("retry reported by miner: 10s", recovery_message)
+        self.assertIn("timestamp_utc: 2026-10-13T17:48:35Z", recovery_message)
+        self.assertNotIn("Machine ID: correlate", recovery_message)
+        self.assertEqual([name for name, _event in fake.events], [
+            "POOL_CONNECTION_FAILED", "POOL_CONNECTION_UNSTABLE", "POOL_CONNECTION_RECOVERED",
+        ])
+        current[0] = 306.0
+        coordinator.stdout_line(POOL_CONNECTION_FAILED_WITHOUT_TIMESTAMP, monitor)
+        next_episode = fake.events[-1][1]["pool_episode_id"]
+        self.assertNotEqual(first_episode, next_episode)
+        self.assertEqual(fake.events[-1][1]["pool_alert_sequence"], 1)
+
+    def test_delayed_first_failure_does_not_reject_a_later_valid_burst_window(self) -> None:
+        class FakeNotifier:
+            def __init__(self) -> None:
+                self.events: list[tuple[str, dict[str, object]]] = []
+
+            def submit(self, event_name: str, event: dict[str, object], *, monitor_session_id: str, alert_id: str | None = None) -> str:
+                self.events.append((event_name, event))
+                return alert_id or "synthetic-alert-id"
+
+            def audit(self, _line_text: str) -> None:
+                return None
+
+        current = [0.0]
+        base_utc = datetime(2026, 10, 13, 17, 43, 30, tzinfo=timezone.utc)
+        fake = FakeNotifier()
+        coordinator = MONITOR.TelegramAlertCoordinator(
+            fake, make_telegram_config(), monotonic=lambda: current[0],
+            monitor_session_id="77777777-7777-4777-8777-777777777777",
+            utc_now=lambda: base_utc + timedelta(seconds=current[0]),
+        )
+        monitor = MONITOR.Fl4shMonitor(make_config(), start_monotonic=0)
+        for elapsed in (0.0, 200.0, 210.0, 220.0):
+            current[0] = elapsed
+            coordinator.stdout_line(POOL_CONNECTION_FAILED_WITH_TIMESTAMP, monitor)
+
+        unstable = [event for name, event in fake.events if name == "POOL_CONNECTION_UNSTABLE"]
+        self.assertEqual(len(unstable), 1)
+        self.assertEqual(unstable[0]["notification_reason"], "BURST_FAILURES")
+        self.assertEqual(unstable[0]["recent_failure_count"], 3)
+        self.assertEqual(unstable[0]["recent_failure_window_start_utc"], "2026-10-13T17:46:50Z")
+        self.assertEqual(unstable[0]["latest_failure_utc"], "2026-10-13T17:47:10Z")
+
+    def test_hashrate_does_not_recover_pool_and_new_monitor_session_has_no_episode(self) -> None:
+        class FakeNotifier:
+            def __init__(self) -> None:
+                self.events: list[tuple[str, dict[str, object]]] = []
+
+            def submit(self, event_name: str, event: dict[str, object], *, monitor_session_id: str, alert_id: str | None = None) -> str:
+                self.events.append((event_name, event))
+                return alert_id or "synthetic-alert-id"
+
+            def audit(self, _line_text: str) -> None:
+                return None
+
+        fake = FakeNotifier()
+        monitor = MONITOR.Fl4shMonitor(make_config(), start_monotonic=0)
+        first = MONITOR.TelegramAlertCoordinator(
+            fake, make_telegram_config(), monotonic=lambda: 0.0,
+            monitor_session_id="55555555-5555-4555-8555-555555555555",
+        )
+        first.stdout_line(POOL_CONNECTION_FAILED_WITHOUT_TIMESTAMP, monitor)
+        first.stdout_line(line(150), monitor)
+        self.assertEqual([name for name, _event in fake.events], ["POOL_CONNECTION_FAILED"])
+        restarted = MONITOR.TelegramAlertCoordinator(
+            fake, make_telegram_config(), monotonic=lambda: 1.0,
+            monitor_session_id="66666666-6666-4666-8666-666666666666",
+        )
+        restarted.stdout_line("Solutions accepted: 5-NVIDIA GeForce RTX 5090 Laptop GPU, 0 stale", monitor)
+        self.assertEqual([name for name, _event in fake.events], ["POOL_CONNECTION_FAILED"])
 
     def test_pool_alert_rejects_nonmatching_errors_and_out_of_bounds_retries(self) -> None:
         class FakeNotifier:
             def __init__(self) -> None:
                 self.events: list[tuple[str, dict[str, object]]] = []
 
-            def submit(self, event_name: str, event: dict[str, object], *, monitor_session_id: str) -> str:
+            def submit(self, event_name: str, event: dict[str, object], *, monitor_session_id: str, alert_id: str | None = None) -> str:
                 self.events.append((event_name, event))
                 return "synthetic-alert-id"
 
@@ -711,7 +1006,9 @@ class TelegramAuditTests(unittest.TestCase):
         self.assertIn(f"alert_id: {alert_id_match.group(1)}", messages[0])
         self.assertIn("event: POOL_CONNECTION_FAILED", messages[0])
         self.assertIn("monitor_session_id: ", messages[0])
-        self.assertIn("Machine ID: correlate Alert ID in Salad Logs", messages[0])
+        self.assertIn("Provider Machine ID: unavailable in local container", messages[0])
+        self.assertIn("Identity source: LOCAL_MONITOR_ONLY", messages[0])
+        self.assertNotIn("Machine ID: correlate", messages[0])
         self.assertIn("TELEGRAM_NOTIFY_SENT", log_output)
 
     def test_telegram_disabled_preserves_original_popen_kwargs_inheritance_and_exit_code(self) -> None:
@@ -756,6 +1053,41 @@ class TelegramAuditTests(unittest.TestCase):
             {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "bufsize": 0},
         )
         self.assertIn(b"inherited=available", output.getvalue())
+
+    def test_pool_episode_audit_records_are_emitted_when_direct_telegram_is_off(self) -> None:
+        config = make_config()
+        telegram = MONITOR.TelegramConfig.from_env({"FL4SH_TELEGRAM_ENABLED": "0"})
+        accepted = "Solutions accepted: 5-NVIDIA GeForce RTX 5090 Laptop GPU, 0 stale"
+        child_code = (
+            f"print({POOL_CONNECTION_FAILED_WITHOUT_TIMESTAMP!r}, flush=True); "
+            f"print({accepted!r}, flush=True)"
+        )
+        output = io.BytesIO()
+        error = io.BytesIO()
+        fake_sys = SimpleNamespace(stdout=SimpleNamespace(buffer=output), stderr=SimpleNamespace(buffer=error))
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(
+            MONITOR, "sys", fake_sys
+        ), mock.patch.dict(MONITOR.os.environ, {"FL4SH_TELEGRAM_ENABLED": "0"}, clear=False):
+            result = MONITOR.run_supervisor(
+                config,
+                [sys.executable, "-c", child_code],
+                telegram_config=telegram,
+            )
+        log_output = (output.getvalue() + error.getvalue()).decode("utf-8", "replace")
+        self.assertEqual(result, 0)
+        failed = [line_text for line_text in log_output.splitlines() if "state=POOL_CONNECTION_FAILED" in line_text]
+        recovered = [line_text for line_text in log_output.splitlines() if "state=POOL_CONNECTION_RECOVERED" in line_text]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(len(recovered), 1)
+        self.assertNotIn("state=TELEGRAM_ALERT", log_output)
+        import re
+        episode_match = re.search(r"pool_episode_id=([0-9a-f-]{36})", failed[0])
+        self.assertIsNotNone(episode_match)
+        assert episode_match is not None
+        self.assertIn(f"pool_episode_id={episode_match.group(1)}", recovered[0])
+        self.assertIn("recovery_signal=SOLUTIONS_ACCEPTED", recovered[0])
+        self.assertIn("actions_performed=false", failed[0])
+        self.assertIn("actions_performed=false", recovered[0])
 
     def test_enabled_telegram_config_is_rejected_before_child_launch(self) -> None:
         secret = "synthetic_sensitive_bot_token"
@@ -1199,6 +1531,88 @@ class PolicyTransitionTests(unittest.TestCase):
         self.assertFalse(second[0]["actions_performed"])
         self.assertEqual(second[0]["provider_binding_status"], "UNKNOWN")
         self.assertEqual(monitor.tick(now=40), [])
+
+    def test_floor_tolerance_band_is_non_actionable_and_exact_threshold_is_not_low(self) -> None:
+        config = make_config(SALAD_G5_CONSECUTIVE_BAD_WINDOWS="1")
+        for rate in (118.0, 118.5, 119.9):
+            with self.subTest(rate=rate):
+                monitor = MONITOR.Fl4shMonitor(config, start_monotonic=0)
+                monitor.observe_line(line(rate), now=0)
+                monitor.observe_line(line(rate), now=10)
+                events = monitor.tick(now=20)
+                self.assertEqual([event["state"] for event in events], ["WITHIN_FLOOR_TOLERANCE"])
+                self.assertFalse(any(event["state"] == "REALLOCATE_RECOMMENDED" for event in events))
+                self.assertEqual(events[0]["floor_tolerance_ths"], 2.0)
+                self.assertEqual(events[0]["decision_threshold_ths"], 118.0)
+
+        monitor = MONITOR.Fl4shMonitor(config, start_monotonic=0)
+        monitor.observe_line(line(117.99), now=0)
+        monitor.observe_line(line(117.99), now=10)
+        result = monitor.tick(now=20)
+        self.assertEqual(result[0]["state"], "REALLOCATE_RECOMMENDED")
+
+    def test_realerts_follow_new_windows_and_configured_drop_from_previous_alert(self) -> None:
+        monitor = MONITOR.Fl4shMonitor(make_config(), start_monotonic=0)
+        observations = [
+            107.8, 107.8, 107.1, 105.2, 104.7, 102.5, 101.6,
+        ]
+        monitor.observe_line(line(150), now=0)
+        means = iter(observations)
+        monitor._window_stats = lambda _state, _now: {
+            "mean_ths": next(means), "coverage_ratio": 1.0, "sample_count": 4,
+            "covered_seconds": 20.0, "maximum_observed_gap_seconds": 10.0, "valid": True,
+        }
+        emitted: list[dict[str, object]] = []
+        for index, rate in enumerate(observations):
+            now = 20 + index * 10
+            monitor.observe_line(line(rate), now=now)
+            emitted.extend(monitor.tick(now=now))
+        recommendations = [event for event in emitted if event["state"] == "REALLOCATE_RECOMMENDED"]
+        self.assertEqual([event["alert_sequence"] for event in recommendations], [1, 2, 3])
+        self.assertEqual([event["observed_window_mean_ths"] for event in recommendations], [107.8, 104.7, 101.6])
+        self.assertEqual(recommendations[0]["notification_reason"], "INITIAL_THRESHOLD_CROSSING")
+        self.assertEqual(recommendations[1]["notification_reason"], "WORSENED")
+        self.assertEqual(recommendations[1]["previous_alert_mean_ths"], 107.8)
+        self.assertAlmostEqual(recommendations[1]["deterioration_since_previous_alert_ths"], 3.1)
+        self.assertEqual(recommendations[2]["previous_alert_mean_ths"], 104.7)
+        for event in recommendations:
+            self.assertNotIn("alert_reason", event)
+            self.assertNotIn("deterioration_ths", event)
+
+        formatted = MONITOR.format_event(recommendations[1])
+        self.assertIn("notification_reason=WORSENED", formatted)
+        self.assertIn("previous_alert_mean_ths=107.8", formatted)
+        self.assertIn("deterioration_since_previous_alert_ths=3.1", formatted)
+        self.assertNotIn("alert_reason=", formatted)
+        self.assertNotIn("deterioration_ths=", formatted)
+        telegram = MONITOR.format_telegram_message(
+            "REALLOCATE_RECOMMENDED", recommendations[1], alert_id="synthetic-alert",
+            monitor_session_id="synthetic-session", label=None,
+        )
+        self.assertIn("notification_reason: WORSENED", telegram)
+        self.assertIn("previous_alert_mean_ths: 107.8", telegram)
+        self.assertIn("deterioration_since_previous_alert_ths: 3.1", telegram)
+        self.assertNotIn("alert_reason:", telegram)
+        self.assertNotIn("deterioration_ths:", telegram)
+
+    def test_recovery_resets_episode_and_later_breach_gets_new_episode_id(self) -> None:
+        monitor = MONITOR.Fl4shMonitor(make_config(SALAD_G5_CONSECUTIVE_BAD_WINDOWS="1"), start_monotonic=0)
+        monitor.observe_line(line(150), now=0)
+        means = iter((90.0, 118.0, 90.0))
+        monitor._window_stats = lambda _state, _now: {
+            "mean_ths": next(means), "coverage_ratio": 1.0, "sample_count": 4,
+            "covered_seconds": 20.0, "maximum_observed_gap_seconds": 10.0, "valid": True,
+        }
+        monitor.observe_line(line(90), now=20)
+        first = monitor.tick(now=20)
+        first_id = first[0]["degradation_episode_id"]
+        monitor.observe_line(line(118), now=30)
+        recovery = monitor.tick(now=30)
+        self.assertEqual([event["state"] for event in recovery], ["RECOVERED", "WITHIN_FLOOR_TOLERANCE"])
+        monitor.observe_line(line(90), now=40)
+        second = monitor.tick(now=40)
+        self.assertEqual(second[0]["state"], "REALLOCATE_RECOMMENDED")
+        self.assertNotEqual(first_id, second[0]["degradation_episode_id"])
 
     def test_healthy_window_reports_current_observed_rate_on_each_reevaluation(self) -> None:
         monitor = MONITOR.Fl4shMonitor(make_config(), start_monotonic=0)

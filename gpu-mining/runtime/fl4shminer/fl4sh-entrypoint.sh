@@ -3,8 +3,19 @@ set -Eeuo pipefail
 umask 077
 ulimit -c 0 2>/dev/null || true
 
+monitor_config_diagnostic_emitted=0
+
 fail() {
-  printf 'fl4sh-entrypoint: %s\n' "$*" >&2
+  if [[ -n "${FL4SH_MONITOR_ENABLED:-}" && "${FL4SH_MONITOR_ENABLED:-0}" != 0 &&
+    "$monitor_config_diagnostic_emitted" != 1 ]]; then
+    # Emit only an allowlisted reason code; never echo supplied values while
+    # the optional monitor path is requested. The enricher consumes this exact
+    # normalized record. Legacy monitor-off diagnostics remain unchanged.
+    printf 'FL4SH_MONITOR configuration invalid: INVALID_ENTRYPOINT_CONFIGURATION\n' >&2
+    printf 'fl4sh-entrypoint: configuration rejected before miner startup\n' >&2
+  else
+    printf 'fl4sh-entrypoint: %s\n' "$*" >&2
+  fi
   exit 64
 }
 
@@ -47,8 +58,11 @@ fi
 validate_monitor_config() {
   [[ "$monitor_enabled" == 1 ]] || return 0
   command -v python3 >/dev/null 2>&1 || fail "Python 3 is required when FL4SH_MONITOR_ENABLED=1"
-  python3 /opt/fl4shminer/fl4sh-runtime-monitor.py --check-config ||
+  if ! python3 /opt/fl4shminer/fl4sh-runtime-monitor.py --check-config; then
+    # --check-config already emits the monitor's normalized, sanitized reason.
+    monitor_config_diagnostic_emitted=1
     fail "Fl4sh runtime monitor configuration is invalid"
+  fi
 }
 
 if [[ "${1:-}" == --validate-config ]]; then

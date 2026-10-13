@@ -60,6 +60,7 @@ if [[ "$mode" == --source ]]; then
     SALAD_G5_HASH_WINDOW_SECONDS SALAD_G5_REEVALUATION_INTERVAL_SECONDS
     SALAD_G5_MINIMUM_SAMPLES_PER_WINDOW SALAD_G5_MAXIMUM_SAMPLE_GAP_SECONDS
     SALAD_G5_MINIMUM_WINDOW_COVERAGE_RATIO SALAD_G5_CONSECUTIVE_BAD_WINDOWS
+    FL4SH_MONITOR_FLOOR_TOLERANCE_THS FL4SH_MONITOR_REALLOCATE_RENOTIFY_DROP_THS
     FL4SH_TELEGRAM_ENABLED FL4SH_TELEGRAM_BOT_TOKEN FL4SH_TELEGRAM_CHAT_ID
     FL4SH_TELEGRAM_POOL_ERROR_COOLDOWN_SECONDS FL4SH_MONITOR_LABEL
   )
@@ -74,6 +75,22 @@ if [[ "$mode" == --source ]]; then
     FL4SH_MONITOR_GPU_FLOORS_JSON='{"RTX_5080_LAPTOP":110,"RTX_5090_LAPTOP":115,"RTX_5070_TI_LAPTOP":100}' \
     "$python_bin" -B "$MONITOR" --check-config >/dev/null 2>&1 ||
     fail "valid autodetected GPU floor registry was rejected"
+  env "${monitor_env_unset[@]}" FL4SH_MONITOR_ENABLED=1 \
+    FL4SH_MONITOR_PROFILE=RTX_5090_LAPTOP FL4SH_MONITOR_FLOOR_TOLERANCE_THS=2.5 \
+    FL4SH_MONITOR_REALLOCATE_RENOTIFY_DROP_THS=4.25 \
+    "$python_bin" -B "$MONITOR" --check-config > "$temporary.monitor-policy.out" 2>&1 ||
+    fail "valid floor tolerance or re-alert policy was rejected"
+  grep -Fq 'floor_tolerance_ths=2.5' "$temporary.monitor-policy.out" ||
+    fail "monitor output omitted the effective floor tolerance"
+  grep -Fq 'reallocate_renotify_drop_ths=4.25' "$temporary.monitor-policy.out" ||
+    fail "monitor output omitted the effective re-alert drop threshold"
+  if env "${monitor_env_unset[@]}" FL4SH_MONITOR_ENABLED=1 \
+    FL4SH_MONITOR_PROFILE=RTX_5090_LAPTOP FL4SH_MONITOR_FLOOR_TOLERANCE_THS=3.1 \
+    "$python_bin" -B "$MONITOR" --check-config > "$temporary.invalid-policy.out" 2>&1; then
+    fail "out-of-range floor tolerance was accepted"
+  fi
+  grep -Fq 'configuration invalid: INVALID_MONITOR_SETTING' "$temporary.invalid-policy.out" ||
+    fail "invalid monitor policy did not use its sanitized error code"
   if env "${monitor_env_unset[@]}" FL4SH_MONITOR_ENABLED=1 FL4SH_TELEGRAM_ENABLED=1 \
     "$python_bin" -B "$MONITOR" --check-config > /dev/null 2>&1; then
     fail "Telegram enabled without credentials was accepted"
@@ -158,6 +175,42 @@ PY
   }
   expect_rejected "missing pool" env -u FL4SH_POOL_URL FL4SH_MINING_ID="$mining_id" \
     bash "$ENTRYPOINT" --validate-config
+  if env -u FL4SH_POOL_URL FL4SH_MINING_ID="$mining_id" FL4SH_MONITOR_ENABLED=1 \
+    bash "$ENTRYPOINT" --validate-config > "$temporary.monitor-preflight.out" 2>&1; then
+    fail "monitor-enabled preflight accepted a missing pool"
+  else
+    preflight_status=$?
+  fi
+  [[ "$preflight_status" -eq 64 ]] || fail "monitor preflight did not preserve exit code 64"
+  grep -Fxq 'FL4SH_MONITOR configuration invalid: INVALID_ENTRYPOINT_CONFIGURATION' \
+    "$temporary.monitor-preflight.out" ||
+    fail "monitor preflight did not emit its normalized configuration event"
+  if grep -Fq "$mining_id" "$temporary.monitor-preflight.out"; then
+    fail "monitor preflight leaked the mining identifier"
+  fi
+  if env -u FL4SH_POOL_URL FL4SH_MINING_ID="$mining_id" FL4SH_MONITOR_ENABLED=0 \
+    bash "$ENTRYPOINT" --validate-config > "$temporary.monitor-off-preflight.out" 2>&1; then
+    fail "monitor-off preflight accepted a missing pool"
+  else
+    monitor_off_status=$?
+  fi
+  [[ "$monitor_off_status" -eq 64 ]] || fail "monitor-off preflight changed exit code 64"
+  grep -Fxq 'fl4sh-entrypoint: FL4SH_POOL_URL is required; select an explicit stratum+tcp host and port' \
+    "$temporary.monitor-off-preflight.out" ||
+    fail "monitor-off preflight did not preserve its legacy diagnostic"
+  if grep -Fq 'FL4SH_MONITOR configuration invalid:' "$temporary.monitor-off-preflight.out"; then
+    fail "monitor-off preflight unexpectedly emitted a monitor alert"
+  fi
+  if env FL4SH_POOL_URL="$pool" FL4SH_MINING_ID="$mining_id" FL4SH_MONITOR_ENABLED=1 \
+    bash "$ENTRYPOINT" --help > "$temporary.monitor-flags.out" 2>&1; then
+    fail "monitor-enabled entrypoint accepted an unsupported command"
+  else
+    invalid_flags_status=$?
+  fi
+  [[ "$invalid_flags_status" -eq 64 ]] || fail "unsupported monitor command changed exit code 64"
+  grep -Fxq 'FL4SH_MONITOR configuration invalid: INVALID_ENTRYPOINT_CONFIGURATION' \
+    "$temporary.monitor-flags.out" ||
+    fail "unsupported monitor command did not emit a normalized configuration event"
   expect_rejected "invalid scheme" env FL4SH_POOL_URL='http://pool.example:7048' \
     FL4SH_MINING_ID="$mining_id" bash "$ENTRYPOINT" --validate-config
   expect_rejected "invalid port" env FL4SH_POOL_URL='stratum+tcp://pool.example:65536' \

@@ -58,6 +58,13 @@ MAX_PARSE_LINE_BYTES = 64 * 1024
 MAX_GPU_REGISTRY_BYTES = 16 * 1024
 MAX_GPU_REGISTRY_ENTRIES = 64
 MAX_GPU_FLOOR_THS = 10_000.0
+FLOOR_TOLERANCE_ENV = "FL4SH_MONITOR_FLOOR_TOLERANCE_THS"
+DEFAULT_FLOOR_TOLERANCE_THS = 2.0
+MIN_FLOOR_TOLERANCE_THS = 1.0
+MAX_FLOOR_TOLERANCE_THS = 3.0
+RENOTIFY_DROP_ENV = "FL4SH_MONITOR_REALLOCATE_RENOTIFY_DROP_THS"
+DEFAULT_RENOTIFY_DROP_THS = 3.0
+MAX_RENOTIFY_DROP_THS = 1_000.0
 
 PROFILE_FLOORS: dict[str, tuple[str, float]] = {
     "RTX_5080_LAPTOP": ("SALAD_G5_GPU_FLOOR_RTX_5080_LAPTOP_THS", 120.0),
@@ -77,6 +84,19 @@ POOL_CONNECTION_FAILED_RE = re.compile(
     r"; reconnecting; retrying in (?P<retry_seconds>[0-9]{1,5})s"
 )
 MAX_POOL_RETRY_SECONDS = 86_400
+POOL_BURST_WINDOW_SECONDS = 90
+POOL_BURST_FAILURES = 3
+POOL_PERSISTENT_MIN_FAILURES = 2
+POOL_PERSISTENT_INTERVAL_SECONDS = 300
+POOL_UNSTABLE_RENOTIFY_SECONDS = 900
+POOL_RECENT_FAILURES_MAX = 64
+POOL_FAILURE_COUNT_MAX = 1_000_000
+SOLUTIONS_ACCEPTED_RECOVERY_RE = re.compile(
+    r"Solutions accepted:\s+[0-9]{1,10}-NVIDIA GeForce RTX "
+    r"[A-Za-z0-9 .+()/_-]{1,192}"
+    r"(?:,\s*(?:[0-9]{1,10} stale|stale=[0-9]{1,10}|[0-9]{1,10} accepted))?",
+    re.IGNORECASE,
+)
 TELEGRAM_QUEUE_CAPACITY = 32
 TELEGRAM_TIMEOUT_SECONDS = 5.0
 TELEGRAM_MAX_RESPONSE_BYTES = 4096
@@ -169,6 +189,8 @@ class MonitorConfig:
     maximum_sample_gap_seconds: int
     minimum_window_coverage_ratio: float
     consecutive_bad_windows: int
+    floor_tolerance_ths: float
+    reallocate_renotify_drop_ths: float
     policy_hash: str
 
     @classmethod
@@ -226,12 +248,28 @@ class MonitorConfig:
                 timing[key] = value
 
         _validate_timing(timing)
+        floor_tolerance = _parse_finite_number(
+            env.get(FLOOR_TOLERANCE_ENV, str(DEFAULT_FLOOR_TOLERANCE_THS)),
+            FLOOR_TOLERANCE_ENV,
+            allow_zero=False,
+        )
+        if not MIN_FLOOR_TOLERANCE_THS <= floor_tolerance <= MAX_FLOOR_TOLERANCE_THS:
+            raise MonitorConfigError(f"{FLOOR_TOLERANCE_ENV} must be within 1..3 TH/s")
+        renotify_drop = _parse_finite_number(
+            env.get(RENOTIFY_DROP_ENV, str(DEFAULT_RENOTIFY_DROP_THS)),
+            RENOTIFY_DROP_ENV,
+            allow_zero=False,
+        )
+        if renotify_drop > MAX_RENOTIFY_DROP_THS:
+            raise MonitorConfigError(f"{RENOTIFY_DROP_ENV} exceeds the supported limit")
         policy = {
             "profile": profile,
             "floor_ths": floor,
             "floor_source": floor_source,
             "floor_registry": sorted(floor_registry.items()),
             "floor_registry_sources": sorted(floor_sources.items()),
+            "floor_tolerance_ths": floor_tolerance,
+            "reallocate_renotify_drop_ths": renotify_drop,
             **timing,
         }
         policy_hash = hashlib.sha256(
@@ -244,6 +282,8 @@ class MonitorConfig:
             floor_source=floor_source,
             floor_registry=tuple(sorted(floor_registry.items())),
             floor_registry_sources=tuple(sorted(floor_sources.items())),
+            floor_tolerance_ths=floor_tolerance,
+            reallocate_renotify_drop_ths=renotify_drop,
             **timing,
             policy_hash=policy_hash,
         )
@@ -490,6 +530,13 @@ class DeviceState:
     last_state: str | None = None
     consecutive_bad_windows: int = 0
     recommendation_emitted: bool = False
+    degradation_episode_id: str | None = None
+    alert_sequence: int = 0
+    last_alert_mean_ths: float | None = None
+    valid_windows_since_alert: int = 0
+    notification_reason: str | None = None
+    previous_alert_mean_ths: float | None = None
+    deterioration_since_previous_alert_ths: float | None = None
     last_window_mean_ths: float | None = None
     last_coverage_ratio: float = 0.0
     last_window_sample_count: int = 0
@@ -562,6 +609,46 @@ class Fl4shMonitor:
             return None, "UNCONFIGURED", "NO_FLOOR_CONFIGURED"
         return floor, sources.get(state.gpu_key, "ENV_REGISTRY"), None
 
+    @staticmethod
+    def _reset_degradation_episode(state: DeviceState) -> None:
+        state.recommendation_emitted = False
+        state.degradation_episode_id = None
+        state.alert_sequence = 0
+        state.last_alert_mean_ths = None
+        state.valid_windows_since_alert = 0
+        state.notification_reason = None
+        state.previous_alert_mean_ths = None
+        state.deterioration_since_previous_alert_ths = None
+
+    def _recommendation_event(
+        self, state: DeviceState, mean_rate: float, stats: Mapping[str, Any], *, initial: bool
+    ) -> list[dict[str, Any]]:
+        if initial:
+            state.degradation_episode_id = str(uuid.uuid4())
+            state.alert_sequence = 1
+            state.last_alert_mean_ths = mean_rate
+            state.valid_windows_since_alert = 0
+            state.notification_reason = "INITIAL_THRESHOLD_CROSSING"
+            state.previous_alert_mean_ths = None
+            state.deterioration_since_previous_alert_ths = None
+        else:
+            previous = state.last_alert_mean_ths
+            state.alert_sequence += 1
+            state.notification_reason = "WORSENED"
+            state.previous_alert_mean_ths = previous
+            state.deterioration_since_previous_alert_ths = (
+                max(0.0, previous - mean_rate) if previous is not None else None
+            )
+            state.last_alert_mean_ths = mean_rate
+            state.valid_windows_since_alert = 0
+        state.recommendation_emitted = True
+        return self._set_state(
+            state,
+            "REALLOCATE_RECOMMENDED",
+            observed=mean_rate,
+            stats=stats,
+        )
+
     def _apply_identity(
         self, state: DeviceState, observation: GpuIdentityObservation
     ) -> list[dict[str, Any]]:
@@ -580,7 +667,7 @@ class Fl4shMonitor:
             state.gpu_identity_status = "UNKNOWN"
             state.gpu_key = None
             state.consecutive_bad_windows = 0
-            state.recommendation_emitted = False
+            self._reset_degradation_episode(state)
             if is_primary or state.gpu_raw_name is None:
                 state.gpu_raw_name = observation.raw_name
                 state.gpu_identity_source = observation.source
@@ -594,7 +681,7 @@ class Fl4shMonitor:
             state.gpu_identity_status = "CONFLICT"
             state.profile_mismatch = False
             state.consecutive_bad_windows = 0
-            state.recommendation_emitted = False
+            self._reset_degradation_episode(state)
             state.last_state = "GPU_IDENTITY_CONFLICT"
             if prior_status != "CONFLICT":
                 return [self._event(state, "GPU_IDENTITY_CONFLICT", observed=self._latest_rate(state))]
@@ -610,7 +697,7 @@ class Fl4shMonitor:
                 state.gpu_key = None
                 state.gpu_identity_status = "UNKNOWN"
                 state.consecutive_bad_windows = 0
-                state.recommendation_emitted = False
+                self._reset_degradation_episode(state)
                 state.last_state = "GPU_IDENTITY_UNKNOWN"
                 if prior_status != "UNKNOWN":
                     return [self._event(state, "GPU_IDENTITY_UNKNOWN", observed=self._latest_rate(state))]
@@ -625,7 +712,7 @@ class Fl4shMonitor:
             state.profile_mismatch = True
             state.gpu_identity_status = "PROFILE_MISMATCH"
             state.consecutive_bad_windows = 0
-            state.recommendation_emitted = False
+            self._reset_degradation_episode(state)
             state.last_state = "GPU_PROFILE_MISMATCH"
             if prior_status != "PROFILE_MISMATCH":
                 return [self._event(state, "GPU_PROFILE_MISMATCH", observed=self._latest_rate(state))]
@@ -683,6 +770,7 @@ class Fl4shMonitor:
             _floor, _floor_source, identity_issue = self._effective_floor(state)
             if identity_issue in {"GPU_IDENTITY_CONFLICT", "GPU_PROFILE_MISMATCH"}:
                 state.consecutive_bad_windows = 0
+                state.valid_windows_since_alert = 0
                 events.extend(
                     self._set_state(state, identity_issue, observed=self._latest_rate(state))
                 )
@@ -693,6 +781,7 @@ class Fl4shMonitor:
             age = timestamp - state.samples[-1].monotonic_seconds
             if age > self.config.maximum_sample_gap_seconds:
                 state.consecutive_bad_windows = 0
+                state.valid_windows_since_alert = 0
                 events.extend(self._set_state(state, "TELEMETRY_STALE", observed=None))
                 continue
             if timestamp - self.started_at < (
@@ -701,6 +790,7 @@ class Fl4shMonitor:
                 # G5's first evaluation is anchored after a complete post-warmup
                 # window. A high-coverage rolling prefix is not a substitute.
                 state.consecutive_bad_windows = 0
+                state.valid_windows_since_alert = 0
                 stats = self._window_stats(state, timestamp)
                 events.extend(
                     self._set_state(
@@ -714,6 +804,7 @@ class Fl4shMonitor:
             floor, _floor_source, floor_issue = self._effective_floor(state)
             if floor is None:
                 state.consecutive_bad_windows = 0
+                state.valid_windows_since_alert = 0
                 stats = self._window_stats(state, timestamp)
                 events.extend(
                     self._set_state(
@@ -728,6 +819,7 @@ class Fl4shMonitor:
             stats = self._window_stats(state, timestamp)
             if not stats["valid"]:
                 state.consecutive_bad_windows = 0
+                state.valid_windows_since_alert = 0
                 events.extend(
                     self._set_state(
                         state,
@@ -742,37 +834,55 @@ class Fl4shMonitor:
             state.last_window_mean_ths = mean_rate
             state.last_coverage_ratio = float(stats["coverage_ratio"])
             state.last_window_sample_count = int(stats["sample_count"])
-            if mean_rate < floor:
-                state.consecutive_bad_windows += 1
-                if (
-                    state.consecutive_bad_windows >= self.config.consecutive_bad_windows
-                    and not state.recommendation_emitted
-                ):
-                    state.recommendation_emitted = True
-                    events.extend(
-                        self._set_state(
-                            state,
-                            "REALLOCATE_RECOMMENDED",
-                            observed=mean_rate,
-                            stats=stats,
-                        )
-                    )
-                elif not state.recommendation_emitted:
-                    events.extend(
-                        self._set_state(state, "BELOW_FLOOR", observed=mean_rate, stats=stats)
-                    )
-            else:
-                recovered = state.consecutive_bad_windows > 0 or state.recommendation_emitted
+            if floor <= self.config.floor_tolerance_ths:
                 state.consecutive_bad_windows = 0
-                state.recommendation_emitted = False
+                self._reset_degradation_episode(state)
                 events.extend(
                     self._set_state(
                         state,
-                        "RECOVERED" if recovered else "HEALTHY",
+                        "FLOOR_TOLERANCE_NON_ACTIONABLE",
                         observed=mean_rate,
                         stats=stats,
                     )
                 )
+                continue
+
+            decision_threshold = floor - self.config.floor_tolerance_ths
+            if mean_rate < decision_threshold:
+                state.consecutive_bad_windows += 1
+                if state.degradation_episode_id is None:
+                    if state.consecutive_bad_windows >= self.config.consecutive_bad_windows:
+                        events.extend(self._recommendation_event(state, mean_rate, stats, initial=True))
+                    else:
+                        events.extend(
+                            self._set_state(state, "BELOW_FLOOR", observed=mean_rate, stats=stats)
+                        )
+                else:
+                    state.valid_windows_since_alert += 1
+                    prior_mean = state.last_alert_mean_ths
+                    deterioration = prior_mean - mean_rate if prior_mean is not None else 0.0
+                    if (
+                        state.valid_windows_since_alert >= self.config.consecutive_bad_windows
+                        and deterioration >= self.config.reallocate_renotify_drop_ths
+                    ):
+                        events.extend(self._recommendation_event(state, mean_rate, stats, initial=False))
+                    else:
+                        events.extend(
+                            self._set_state(state, "BELOW_FLOOR", observed=mean_rate, stats=stats)
+                        )
+            else:
+                had_episode = state.degradation_episode_id is not None
+                recovered = state.consecutive_bad_windows > 0 or had_episode
+                state.consecutive_bad_windows = 0
+                self._reset_degradation_episode(state)
+                if recovered:
+                    events.extend(self._set_state(
+                        state, "RECOVERED", observed=mean_rate, stats=stats,
+                    ))
+                next_state = "WITHIN_FLOOR_TOLERANCE" if mean_rate < floor else "HEALTHY"
+                events.extend(self._set_state(
+                    state, next_state, observed=mean_rate, stats=stats,
+                ))
         return events
 
     def _trim_samples(self, state: DeviceState, now: float) -> None:
@@ -877,6 +987,11 @@ class Fl4shMonitor:
         latest = state.samples[-1].sample if state is not None and state.samples else None
         device = f"fl4shminer_device:{state.device_index}" if state is not None else "unobserved"
         floor, floor_source, _identity_issue = self._effective_floor(state)
+        decision_threshold = (
+            floor - self.config.floor_tolerance_ths
+            if floor is not None and floor > self.config.floor_tolerance_ths
+            else None
+        )
         identity_sources = sorted(state.identity_sources) if state is not None else []
         return {
             "component": "FL4SH_MONITOR",
@@ -892,6 +1007,8 @@ class Fl4shMonitor:
             "gpu_identity_candidates": sorted(state.identity_candidates) if state is not None else [],
             "floor_ths": floor,
             "floor_source": floor_source,
+            "floor_tolerance_ths": self.config.floor_tolerance_ths,
+            "decision_threshold_ths": decision_threshold,
             "observed_window_mean_ths": observed,
             "latest_device_hashrate_ths": self._latest_rate(state) if state is not None else None,
             "window_coverage_ratio": float(stats["coverage_ratio"]) if stats is not None else None,
@@ -901,6 +1018,13 @@ class Fl4shMonitor:
             ),
             "consecutive_bad_windows": state.consecutive_bad_windows if state is not None else 0,
             "consecutive_bad_windows_required": self.config.consecutive_bad_windows,
+            "degradation_episode_id": state.degradation_episode_id if state is not None else None,
+            "alert_sequence": state.alert_sequence if state is not None else 0,
+            "notification_reason": state.notification_reason if state is not None else None,
+            "previous_alert_mean_ths": state.previous_alert_mean_ths if state is not None else None,
+            "deterioration_since_previous_alert_ths": (
+                state.deterioration_since_previous_alert_ths if state is not None else None
+            ),
             "stale_counter": (
                 {
                     "numerator": latest.stale_count,
@@ -944,11 +1068,23 @@ def format_event(event: Mapping[str, Any]) -> str:
         f'floor={_format_number(floor)}',
         f'floor_ths={_format_number(floor)}',
         f'floor_source={event["floor_source"]}',
+        f'tolerance_ths={_format_number(event["floor_tolerance_ths"])}',
+        f'decision_threshold_ths={_format_number(event["decision_threshold_ths"])}',
         f'observed={_format_number(observed)}',
         f'bad_windows={bad}',
         f'coverage={_format_number(coverage)}',
         f'window_samples={_format_number(event["window_sample_count"])}',
     ]
+    if event.get("degradation_episode_id") is not None:
+        fields.append(f'episode_id={event["degradation_episode_id"]}')
+        fields.append(f'alert_sequence={event["alert_sequence"]}')
+        fields.append(f'notification_reason={event["notification_reason"] or "unknown"}')
+        if event.get("previous_alert_mean_ths") is not None:
+            fields.append(f'previous_alert_mean_ths={_format_number(event["previous_alert_mean_ths"])}')
+            fields.append(
+                "deterioration_since_previous_alert_ths="
+                f'{_format_number(event["deterioration_since_previous_alert_ths"])}'
+            )
     if stale is not None:
         fields.append(
             f'stale={stale["numerator"]}/{stale["denominator"]}'
@@ -975,6 +1111,8 @@ def format_config(config: MonitorConfig, *, telegram_enabled: bool = False) -> s
         f"profile={config.profile or 'unknown'}",
         f"floor={_format_number(config.floor_ths)}",
         f"floor_source={config.floor_source}",
+        f"floor_tolerance_ths={_format_number(config.floor_tolerance_ths)}",
+        f"reallocate_renotify_drop_ths={_format_number(config.reallocate_renotify_drop_ths)}",
         f"floor_registry_entries={len(config.floor_registry)}",
         "floor_registry_sources=G5_DEFAULT+SALAD_G5_GPU_FLOOR_*+FL4SH_MONITOR_GPU_FLOORS_JSON",
         f"warmup_seconds={config.warmup_seconds}",
@@ -1043,6 +1181,40 @@ def format_telegram_message(
             fields.append(f"retry: {retry_seconds}s")
         else:
             fields.append("retry: unknown")
+        fields.extend([
+            f"pool_episode_id: {event.get('pool_episode_id') or 'unknown'}",
+            f"pool_alert_sequence: {event.get('pool_alert_sequence') or 'unknown'}",
+            f"failure_count: {event.get('failure_count', 'unknown')}",
+            f"first_failure_utc: {event.get('first_failure_utc') or 'unknown'}",
+            f"latest_failure_utc: {event.get('latest_failure_utc') or 'unknown'}",
+        ])
+    elif event_name == "POOL_CONNECTION_UNSTABLE":
+        fields.extend([
+            "reason: MINING_AUTHORIZE_RESPONSE_TIMEOUT",
+            f"notification_reason: {event.get('notification_reason') or 'unknown'}",
+            f"pool_episode_id: {event.get('pool_episode_id') or 'unknown'}",
+            f"pool_alert_sequence: {event.get('pool_alert_sequence') or 'unknown'}",
+            f"failure_count: {event.get('failure_count', 'unknown')}",
+            f"recent_failure_count: {event.get('recent_failure_count', 'unknown')}",
+            f"first_failure_utc: {event.get('first_failure_utc') or 'unknown'}",
+            f"latest_failure_utc: {event.get('latest_failure_utc') or 'unknown'}",
+            f"retry reported by miner: {event.get('retry_seconds', 'unknown')}s",
+            f"unstable_duration_seconds: {event.get('unstable_duration_seconds', 'unknown')}",
+            "Recommendation: CHECK_POOL_OR_NETWORK",
+        ])
+    elif event_name == "POOL_CONNECTION_RECOVERED":
+        fields.extend([
+            f"pool_episode_id: {event.get('pool_episode_id') or 'unknown'}",
+            f"pool_alert_sequence: {event.get('pool_alert_sequence') or 'unknown'}",
+            f"failure_count: {event.get('failure_count', 'unknown')}",
+            f"retry reported by miner: {event.get('retry_seconds', 'unknown')}s",
+            f"prior_failure_count: {event.get('prior_failure_count', 'unknown')}",
+            f"first_failure_utc: {event.get('first_failure_utc') or 'unknown'}",
+            f"latest_failure_utc: {event.get('latest_failure_utc') or 'unknown'}",
+            "recovery_signal: SOLUTIONS_ACCEPTED",
+            f"timestamp_utc: {event.get('timestamp_utc') or 'unknown'}",
+            f"recovered_at_utc: {event.get('recovered_at_utc') or 'unknown'}",
+        ])
     if label:
         fields.append(f"label: {label}")
     fields.extend(
@@ -1050,15 +1222,33 @@ def format_telegram_message(
             f"GPU: {event.get('gpu_key') or 'unknown'}",
             f"device: {event.get('device') or 'unknown'}",
             f"floor_ths: {_format_number(event.get('floor_ths'))}",
+            f"floor_tolerance_ths: {_format_number(event.get('floor_tolerance_ths'))}",
+            f"decision_threshold_ths: {_format_number(event.get('decision_threshold_ths'))}",
             f"observed_window_mean_ths: {_format_number(event.get('observed_window_mean_ths'))}",
             "bad_windows: "
             f"{event.get('consecutive_bad_windows', 0)}/{event.get('consecutive_bad_windows_required', 0)}",
             f"stale_counter: {stale_text}",
             f"timestamp_utc: {timestamp}",
             "actions_performed: false",
-            "Machine ID: correlate Alert ID in Salad Logs",
+            "Provider Machine ID: unavailable in local container",
+            "Instance ID: unavailable in local container",
+            "Container Group: unavailable in local container",
+            "Identity source: LOCAL_MONITOR_ONLY",
         ]
     )
+    if event_name == "REALLOCATE_RECOMMENDED":
+        fields.append(f"episode_id: {event.get('degradation_episode_id') or 'unknown'}")
+        fields.append(f"alert_sequence: {event.get('alert_sequence') or 1}")
+        fields.append(
+            "notification_reason: "
+            f"{event.get('notification_reason') or 'INITIAL_THRESHOLD_CROSSING'}"
+        )
+        if event.get("previous_alert_mean_ths") is not None:
+            fields.append(f"previous_alert_mean_ths: {_format_number(event.get('previous_alert_mean_ths'))}")
+            fields.append(
+                "deterioration_since_previous_alert_ths: "
+                f"{_format_number(event.get('deterioration_since_previous_alert_ths'))}"
+            )
     # All inserted data is local and bounded by parser/config validation. This
     # final cap also protects Telegram's message limit if a future event grows.
     return "\n".join(fields)[:3500]
@@ -1138,10 +1328,17 @@ class TelegramNotifier:
             self._worker = threading.Thread(target=self._run, name="fl4sh-telegram-audit", daemon=True)
             self._worker.start()
 
-    def submit(self, event_name: str, event: Mapping[str, Any], *, monitor_session_id: str) -> str | None:
+    def submit(
+        self,
+        event_name: str,
+        event: Mapping[str, Any],
+        *,
+        monitor_session_id: str,
+        alert_id: str | None = None,
+    ) -> str | None:
         if not self.config.enabled or self._queue is None:
             return None
-        alert_id = str(uuid.uuid4())
+        alert_id = alert_id or str(uuid.uuid4())
         message = format_telegram_message(
             event_name,
             event,
@@ -1151,7 +1348,10 @@ class TelegramNotifier:
         )
         self.audit(
             f"FL4SH_MONITOR state=TELEGRAM_ALERT alert_id={alert_id} "
-            f"event={event_name} actions_performed=false"
+            f"event={event_name}"
+            f"{(' episode_id=' + str(event.get('degradation_episode_id')) + ' alert_sequence=' + str(event.get('alert_sequence'))) if event_name == 'REALLOCATE_RECOMMENDED' and event.get('degradation_episode_id') else ''} "
+            f"{(' monitor_session_id=' + monitor_session_id + ' pool_episode_id=' + str(event.get('pool_episode_id')) + ' pool_alert_sequence=' + str(event.get('pool_alert_sequence'))) if event_name.startswith('POOL_CONNECTION_') and event.get('pool_episode_id') else ''} "
+            "actions_performed=false"
         )
         try:
             self._queue.put_nowait((alert_id, event_name, message))
@@ -1199,7 +1399,7 @@ class TelegramNotifier:
 
 
 class TelegramAlertCoordinator:
-    """Apply per-episode recommendation dedup and monotonic pool cooldown."""
+    """Track local pool retry episodes and keep pool health separate from hash health."""
 
     def __init__(
         self,
@@ -1208,22 +1408,31 @@ class TelegramAlertCoordinator:
         *,
         monotonic: Callable[[], float],
         monitor_session_id: str,
+        utc_now: Callable[[], datetime] | None = None,
     ) -> None:
         self.notifier = notifier
         self.config = config
         self.monotonic = monotonic
         self.monitor_session_id = monitor_session_id
-        self._recommendation_devices: set[str] = set()
-        self._last_pool_alert_at: float | None = None
+        self.utc_now = utc_now or (lambda: datetime.now(timezone.utc))
+        self._recommendation_alerts: set[tuple[str, str, int]] = set()
+        self._pool_episode: dict[str, Any] | None = None
 
     def monitor_events(self, events: list[dict[str, Any]]) -> None:
         for event in events:
             device = str(event.get("device") or "unknown")
             if event.get("state") == "RECOVERED":
-                self._recommendation_devices.discard(device)
+                self._recommendation_alerts = {
+                    item for item in self._recommendation_alerts if item[0] != device
+                }
             elif event.get("state") == "REALLOCATE_RECOMMENDED":
-                if device not in self._recommendation_devices:
-                    self._recommendation_devices.add(device)
+                episode_id = str(event.get("degradation_episode_id") or "legacy")
+                sequence = event.get("alert_sequence", 1)
+                if type(sequence) is not int or sequence < 1:
+                    sequence = 1
+                dedupe_key = (device, episode_id, sequence)
+                if dedupe_key not in self._recommendation_alerts:
+                    self._recommendation_alerts.add(dedupe_key)
                     self.notifier.submit(
                         "REALLOCATE_RECOMMENDED", event,
                         monitor_session_id=self.monitor_session_id,
@@ -1231,25 +1440,237 @@ class TelegramAlertCoordinator:
 
     def stdout_line(self, line: str, monitor: Fl4shMonitor) -> None:
         retry_seconds = _parse_pool_connection_failed_retry_seconds(line)
-        if retry_seconds is None:
+        if retry_seconds is not None:
+            self._record_pool_failure(retry_seconds, monitor)
+            return
+        if not _is_solutions_accepted_recovery_line(line) or self._pool_episode is None:
+            return
+        episode = self._pool_episode
+        if not episode["warning_emitted"]:
             return
         now = self.monotonic()
-        if (
-            self._last_pool_alert_at is not None
-            and now - self._last_pool_alert_at < self.config.pool_error_cooldown_seconds
-        ):
-            return
-        self._last_pool_alert_at = now
+        recovered_at_utc = _utc_timestamp(self.utc_now())
+        episode["pool_alert_sequence"] += 1
+        recovery_sequence = episode["pool_alert_sequence"]
+        solutions_evidence_sha256 = hashlib.sha256(line.encode("utf-8")).hexdigest()
+        self._emit_pool_recovery_evidence(
+            episode,
+            recovery_sequence=recovery_sequence,
+            timestamp_utc=recovered_at_utc,
+            solutions_evidence_sha256=solutions_evidence_sha256,
+        )
         event = _pool_alert_context(monitor)
-        event["retry_seconds"] = retry_seconds
+        event.update({
+            "pool_episode_id": episode["pool_episode_id"],
+            "pool_alert_sequence": recovery_sequence,
+            "monitor_session_id": self.monitor_session_id,
+            "prior_failure_count": episode["total_failure_count"],
+            "failure_count": episode["total_failure_count"],
+            "retry_seconds": episode["last_retry_seconds"],
+            "first_failure_utc": episode["first_failure_utc"],
+            "latest_failure_utc": episode["latest_failure_utc"],
+            "recovery_signal": "SOLUTIONS_ACCEPTED",
+            "recovered_at_utc": recovered_at_utc,
+            "timestamp_utc": recovered_at_utc,
+            "solutions_evidence_sha256": solutions_evidence_sha256,
+            "actions_performed": False,
+        })
+        self._emit_pool_alert("POOL_CONNECTION_RECOVERED", event)
+        self._pool_episode = None
+
+    def _record_pool_failure(self, retry_seconds: int, monitor: Fl4shMonitor) -> None:
+        now = self.monotonic()
+        failure_utc = _utc_timestamp(self.utc_now())
+        episode = self._pool_episode
+        if episode is None:
+            episode = {
+                "pool_episode_id": str(uuid.uuid4()),
+                "first_failure_monotonic": now,
+                "first_failure_utc": failure_utc,
+                "latest_failure_monotonic": now,
+                "latest_failure_utc": failure_utc,
+                "total_failure_count": 0,
+                "recent_failure_monotonic": deque(maxlen=POOL_RECENT_FAILURES_MAX),
+                "recent_failure_utc": deque(maxlen=POOL_RECENT_FAILURES_MAX),
+                "last_retry_seconds": retry_seconds,
+                "warning_emitted": False,
+                "unstable_emitted": False,
+                "last_unstable_notification_monotonic": None,
+                "pool_alert_sequence": 0,
+            }
+            self._pool_episode = episode
+        episode["latest_failure_monotonic"] = now
+        episode["latest_failure_utc"] = failure_utc
+        episode["total_failure_count"] = min(
+            POOL_FAILURE_COUNT_MAX, episode["total_failure_count"] + 1
+        )
+        episode["recent_failure_monotonic"].append(now)
+        episode["recent_failure_utc"].append(failure_utc)
+        episode["last_retry_seconds"] = retry_seconds
+        recent = episode["recent_failure_monotonic"]
+        while recent and now - recent[0] > POOL_BURST_WINDOW_SECONDS:
+            recent.popleft()
+            episode["recent_failure_utc"].popleft()
+
+        if not episode["warning_emitted"]:
+            episode["warning_emitted"] = True
+            episode["pool_alert_sequence"] = 1
+            event = self._pool_episode_context(episode, monitor, failure_utc)
+            self._emit_pool_alert("POOL_CONNECTION_FAILED", event)
+
+        elapsed = max(0.0, now - episode["first_failure_monotonic"])
+        burst = len(recent) >= POOL_BURST_FAILURES
+        persistent = (
+            episode["total_failure_count"] >= POOL_PERSISTENT_MIN_FAILURES
+            and elapsed >= POOL_PERSISTENT_INTERVAL_SECONDS
+        )
+        if not episode["unstable_emitted"] and (burst or persistent):
+            episode["unstable_emitted"] = True
+            episode["pool_alert_sequence"] += 1
+            episode["last_unstable_notification_monotonic"] = now
+            reason = "BURST_FAILURES" if burst else "PERSISTENT_FAILURES"
+            event = self._pool_episode_context(episode, monitor, failure_utc)
+            event.update({
+                "notification_reason": reason,
+                "recent_failure_count": len(recent),
+                "unstable_duration_seconds": min(2_592_000, int(elapsed)),
+            })
+            self._emit_pool_alert("POOL_CONNECTION_UNSTABLE", event)
+            return
+
+        last_unstable = episode["last_unstable_notification_monotonic"]
+        if (
+            episode["unstable_emitted"]
+            and last_unstable is not None
+            and now - last_unstable >= POOL_UNSTABLE_RENOTIFY_SECONDS
+            and now > last_unstable
+        ):
+            episode["pool_alert_sequence"] += 1
+            episode["last_unstable_notification_monotonic"] = now
+            event = self._pool_episode_context(episode, monitor, failure_utc)
+            event.update({
+                "notification_reason": "STILL_UNSTABLE",
+                "recent_failure_count": len(recent),
+                "unstable_duration_seconds": min(2_592_000, int(elapsed)),
+            })
+            self._emit_pool_alert("POOL_CONNECTION_UNSTABLE", event)
+
+    def _pool_episode_context(
+        self,
+        episode: Mapping[str, Any],
+        monitor: Fl4shMonitor,
+        failure_utc: str,
+    ) -> dict[str, Any]:
+        recent = episode["recent_failure_monotonic"]
+        recent_utc = episode["recent_failure_utc"]
+        active_recent_utc = [
+            timestamp for observed, timestamp in zip(recent, recent_utc)
+            if episode["latest_failure_monotonic"] - observed <= POOL_BURST_WINDOW_SECONDS
+        ]
+        return {
+            **_pool_alert_context(monitor),
+            "pool_episode_id": episode["pool_episode_id"],
+            "pool_alert_sequence": episode["pool_alert_sequence"],
+            "monitor_session_id": self.monitor_session_id,
+            "reason": "MINING_AUTHORIZE_RESPONSE_TIMEOUT",
+            "failure_count": episode["total_failure_count"],
+            "recent_failure_count": sum(
+                1 for observed in recent
+                if episode["latest_failure_monotonic"] - observed <= POOL_BURST_WINDOW_SECONDS
+            ),
+            "recent_failure_window_start_utc": active_recent_utc[0] if active_recent_utc else failure_utc,
+            "retry_seconds": episode["last_retry_seconds"],
+            "first_failure_utc": episode["first_failure_utc"],
+            "latest_failure_utc": episode["latest_failure_utc"],
+            "timestamp_utc": failure_utc,
+            "actions_performed": False,
+        }
+
+    def _emit_pool_recovery_evidence(
+        self,
+        episode: Mapping[str, Any],
+        *,
+        recovery_sequence: int,
+        timestamp_utc: str,
+        solutions_evidence_sha256: str,
+    ) -> None:
+        audit = getattr(self.notifier, "audit", None)
+        if not callable(audit):
+            return
+        audit(" ".join((
+            "FL4SH_MONITOR",
+            "state=POOL_RECOVERY_EVIDENCE",
+            f"monitor_session_id={self.monitor_session_id}",
+            f"pool_episode_id={episode['pool_episode_id']}",
+            f"pool_alert_sequence={recovery_sequence}",
+            "recovery_signal=SOLUTIONS_ACCEPTED",
+            f"timestamp_utc={timestamp_utc}",
+            f"solutions_evidence_sha256={solutions_evidence_sha256}",
+            "actions_performed=false",
+        )))
+
+    def _emit_pool_alert(self, event_name: str, event: Mapping[str, Any]) -> None:
+        alert_id = str(uuid.uuid4())
+        enriched = dict(event)
+        enriched["alert_id"] = alert_id
+        fields = [
+            "FL4SH_MONITOR",
+            f"state={event_name}",
+            f"monitor_session_id={self.monitor_session_id}",
+            f"pool_episode_id={event['pool_episode_id']}",
+            f"pool_alert_sequence={event['pool_alert_sequence']}",
+            "reason=MINING_AUTHORIZE_RESPONSE_TIMEOUT",
+            f"first_failure_utc={event.get('first_failure_utc', 'unknown')}",
+            f"latest_failure_utc={event.get('latest_failure_utc', 'unknown')}",
+            "actions_performed=false",
+        ]
+        if event_name == "POOL_CONNECTION_FAILED":
+            fields.extend([
+                f"retry_seconds={event.get('retry_seconds', 0)}",
+                "failure_count=1",
+            ])
+        elif event_name == "POOL_CONNECTION_UNSTABLE":
+            fields.extend([
+                f"retry_seconds={event.get('retry_seconds', 0)}",
+                f"failure_count={event['failure_count']}",
+                f"recent_failure_count={event['recent_failure_count']}",
+                f"notification_reason={event['notification_reason']}",
+                f"unstable_duration_seconds={event['unstable_duration_seconds']}",
+                f"recent_failure_window_start_utc={event['recent_failure_window_start_utc']}",
+            ])
+        else:
+            fields.extend([
+                f"failure_count={event['failure_count']}",
+                f"prior_failure_count={event['prior_failure_count']}",
+                f"retry_seconds={event['retry_seconds']}",
+                f"timestamp_utc={event['timestamp_utc']}",
+                "recovery_signal=SOLUTIONS_ACCEPTED",
+                f"recovered_at_utc={event['recovered_at_utc']}",
+                f"solutions_evidence_sha256={event['solutions_evidence_sha256']}",
+            ])
+        fields.extend([
+            f"gpu_key={event.get('gpu_key') or 'unknown'}",
+            f"device={event.get('device') or 'unknown'}",
+        ])
+        audit = getattr(self.notifier, "audit", None)
+        if callable(audit):
+            audit(" ".join(fields))
         self.notifier.submit(
-            "POOL_CONNECTION_FAILED", event,
+            event_name,
+            enriched,
             monitor_session_id=self.monitor_session_id,
+            alert_id=alert_id,
         )
 
 
 def _parse_pool_connection_failed_retry_seconds(line: str) -> int | None:
     """Match only the known authorize-timeout/reconnect line, with bounded retry."""
+    observation = _parse_pool_failure_observation(line)
+    return observation[0] if observation is not None else None
+
+
+def _parse_pool_failure_observation(line: str) -> tuple[int, str] | None:
+    """Return only the bounded known timeout and a normalized UTC timestamp."""
     if not isinstance(line, str) or len(line) > 256:
         return None
     match = POOL_CONNECTION_FAILED_RE.fullmatch(line)
@@ -1261,10 +1682,26 @@ def _parse_pool_connection_failed_retry_seconds(line: str) -> int | None:
             datetime.strptime(timestamp, "%Y/%m/%d %H:%M:%S")
         except ValueError:
             return None
+    # The miner timestamp has no timezone contract. Use the monitor's UTC
+    # receipt time for rolling-window evidence rather than relabeling it UTC.
+    observed_at = datetime.now(timezone.utc)
     retry_seconds = int(match.group("retry_seconds"))
     if not 1 <= retry_seconds <= MAX_POOL_RETRY_SECONDS:
         return None
-    return retry_seconds
+    return retry_seconds, observed_at.isoformat(timespec="seconds")
+
+
+def _is_solutions_accepted_recovery_line(line: str) -> bool:
+    """Accept only one bounded Fl4shMiner accepted-solutions record."""
+    return isinstance(line, str) and len(line) <= 256 and bool(
+        SOLUTIONS_ACCEPTED_RECOVERY_RE.fullmatch(line)
+    )
+
+
+def _utc_timestamp(value: datetime) -> str:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _pool_alert_context(monitor: Fl4shMonitor) -> dict[str, Any]:
@@ -1435,7 +1872,11 @@ def run_supervisor(
     try:
         notifier_config = telegram_config or TelegramConfig.from_env()
     except TelegramConfigError as exc:
-        print(f"FL4SH_TELEGRAM configuration invalid: {exc}", file=sys.stderr, flush=True)
+        print(
+            f"FL4SH_MONITOR configuration invalid: {_configuration_failure_reason(exc)}",
+            file=sys.stderr,
+            flush=True,
+        )
         return 64
 
     started_at = monotonic()
@@ -1507,7 +1948,9 @@ def run_supervisor(
     write_lock = threading.Lock()
     finished_streams: set[str] = set()
     last_monitor_error = False
-    monitor_session_id = str(uuid.uuid4()) if notifier_config.enabled else ""
+    # The central log enricher needs a process/session boundary even when the
+    # direct Telegram fallback is disabled.
+    monitor_session_id = str(uuid.uuid4())
 
     def telegram_audit(line: str) -> None:
         _write_stream("stdout", (line + "\n").encode("utf-8"), open_streams, write_lock)
@@ -1517,15 +1960,11 @@ def run_supervisor(
         audit=telegram_audit,
         sender=telegram_sender,
     )
-    alert_coordinator = (
-        TelegramAlertCoordinator(
-            notifier,
-            notifier_config,
-            monotonic=monotonic,
-            monitor_session_id=monitor_session_id,
-        )
-        if notifier_config.enabled
-        else None
+    alert_coordinator = TelegramAlertCoordinator(
+        notifier,
+        notifier_config,
+        monotonic=monotonic,
+        monitor_session_id=monitor_session_id,
     )
 
     def emit(events: list[dict[str, Any]]) -> None:
@@ -1535,13 +1974,11 @@ def run_supervisor(
                 [notifier_config.bot_token or "", notifier_config.chat_id or ""],
             ).encode("utf-8")
             _write_stream("stdout", line, open_streams, write_lock)
-        if alert_coordinator is not None:
-            alert_coordinator.monitor_events(events)
+        alert_coordinator.monitor_events(events)
 
     def process_stdout_line(line_text: str) -> None:
         emit(monitor.observe_line(line_text, now=monotonic()))
-        if alert_coordinator is not None:
-            alert_coordinator.stdout_line(line_text, monitor)
+        alert_coordinator.stdout_line(line_text, monitor)
 
     def safe_tick() -> None:
         nonlocal last_monitor_error
@@ -1623,7 +2060,11 @@ def _check_config() -> int:
         config = MonitorConfig.from_env(require_enabled=True)
         telegram_config = TelegramConfig.from_env()
     except (MonitorConfigError, TelegramConfigError) as exc:
-        print(f"FL4SH_MONITOR configuration invalid: {exc}", file=sys.stderr, flush=True)
+        print(
+            f"FL4SH_MONITOR configuration invalid: {_configuration_failure_reason(exc)}",
+            file=sys.stderr,
+            flush=True,
+        )
         return 64
     print(format_config(config, telegram_enabled=telegram_config.enabled), flush=True)
     return 0
@@ -1637,7 +2078,11 @@ def main(argv: list[str] | None = None) -> int:
         config = MonitorConfig.from_env(require_enabled=True)
         telegram_config = TelegramConfig.from_env()
     except (MonitorConfigError, TelegramConfigError) as exc:
-        print(f"FL4SH_MONITOR configuration invalid: {exc}", file=sys.stderr, flush=True)
+        print(
+            f"FL4SH_MONITOR configuration invalid: {_configuration_failure_reason(exc)}",
+            file=sys.stderr,
+            flush=True,
+        )
         return 64
     if "--" not in args:
         print("FL4SH_MONITOR miner command separator is required", file=sys.stderr, flush=True)
@@ -1651,6 +2096,19 @@ def main(argv: list[str] | None = None) -> int:
         args[separator + 1 :],
         telegram_config=telegram_config,
     )
+
+
+def _configuration_failure_reason(exc: Exception) -> str:
+    """Map parser failures to a fixed allowlist; never echo values or details."""
+    message = str(exc)
+    if isinstance(exc, MonitorConfigError) and GPU_REGISTRY_ENV in message:
+        return "INVALID_GPU_FLOORS_JSON"
+    if isinstance(exc, TelegramConfigError):
+        if TELEGRAM_TOKEN_ENV in message:
+            return "MISSING_TELEGRAM_TOKEN" if not os.environ.get(TELEGRAM_TOKEN_ENV) else "INVALID_MONITOR_SETTING"
+        if TELEGRAM_CHAT_ENV in message:
+            return "MISSING_TELEGRAM_CHAT_ID" if not os.environ.get(TELEGRAM_CHAT_ENV) else "INVALID_MONITOR_SETTING"
+    return "INVALID_MONITOR_SETTING"
 
 
 if __name__ == "__main__":
