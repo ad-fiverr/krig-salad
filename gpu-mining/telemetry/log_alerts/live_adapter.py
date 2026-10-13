@@ -379,7 +379,7 @@ class LiveLogQueryAdapter:
 
     def _acquire_secret(self) -> Any:
         offline = self.transport._offline_exchange is not None
-        if not offline and PRODUCTION_NETWORK_ALLOWED is not True:
+        if not offline and PRODUCTION_NETWORK_ALLOWED is not True and not self.transport._live_read_enabled():
             raise LiveTransportBlocked("Salad production network access is disabled")
         interactive_provider, synthetic_provider, secret_material = secret_boundary_types()
         expected_provider = synthetic_provider if offline else interactive_provider

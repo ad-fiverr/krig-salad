@@ -5,10 +5,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Callable, Iterable
 import hashlib
 import json
 import math
+import re
 
 from .contract import (
     DATA_CLASSIFICATION,
@@ -251,19 +252,43 @@ def _has_bounded_pool_recovery_evidence(
 
 def _render_message(payload: Mapping[str, Any]) -> str:
     event_type = payload["event_type"]
-    if event_type == "CUDA_DRIVER_INCOMPATIBLE":
-        return render_cuda_message(payload)
     identity = payload["identity"]
-    title = (
-        f"🚨 {event_type}"
-        if event_type == "RUNNING_READY_BUT_MINER_NOT_STARTED"
-        else f"ALERT: {event_type}"
-    )
-    lines = [title]
-    lines.append(f"Identity status: {identity['identity_status']}")
-    lines.append(f"Machine ID: {identity.get('machine_id') or 'UNKNOWN'}")
-    lines.append(f"Instance ID: {identity.get('instance_id') or 'UNKNOWN'}")
-    lines.append(f"Container Group: {identity.get('container_group_name') or 'UNKNOWN'}")
+    if not isinstance(identity, Mapping):
+        raise UnsafeQueryCycle("prepared identity is malformed")
+    if event_type == "CUDA_DRIVER_INCOMPATIBLE":
+        cuda_lines = render_cuda_message(payload).splitlines()
+        # CUDA uses the same six-line provider identity prefix as every other
+        # central alert; the dedicated renderer supplies its bounded details.
+        title = cuda_lines[6]
+        body = cuda_lines[8:]
+    else:
+        body = []
+        title = (
+            f"🚨 {event_type}"
+            if event_type == "RUNNING_READY_BUT_MINER_NOT_STARTED"
+            else f"ALERT: {event_type}"
+        )
+    lines = [
+        f"Organization: {_safe_field_text(payload.get('query_organization') or 'UNKNOWN')}",
+        f"Project: {_safe_field_text(identity.get('project_name') or 'UNKNOWN')}",
+        f"Container Group: {_safe_field_text(identity.get('container_group_name') or 'UNKNOWN')}",
+        f"Machine ID: {_safe_field_text(identity.get('machine_id') or 'UNKNOWN')}",
+        f"Instance ID: {_safe_field_text(identity.get('instance_id') or 'UNKNOWN')}",
+        f"Identity source: {_safe_field_text(identity.get('identity_source') or 'UNKNOWN')}",
+        title,
+        f"Identity status: {_safe_field_text(identity.get('identity_status') or 'UNKNOWN')}",
+    ]
+    lines.extend(body)
+    if event_type == "CUDA_DRIVER_INCOMPATIBLE":
+        lines.extend([
+            f"Event time: {payload['event_time_utc']}",
+            f"Alert ID: {payload.get('alert_id') or 'unknown'}",
+            f"Evidence: {payload.get('data_classification', DATA_CLASSIFICATION)}",
+        ])
+        message = "\n".join(lines)
+        if len(message) > MAX_TELEGRAM_MESSAGE_CHARS:
+            raise UnsafeQueryCycle("prepared alert exceeds the local message limit")
+        return message
     if event_type == "REALLOCATE_RECOMMENDED":
         fields = payload["event_fields"]
         lines.extend([
@@ -279,6 +304,7 @@ def _render_message(payload: Mapping[str, Any]) -> str:
         if fields.get("floor_tolerance_ths") is not None:
             lines.append(f"Tolerance: {_format_number(fields.get('floor_tolerance_ths'))} TH/s")
             lines.append(f"Decision threshold: {_format_number(fields.get('decision_threshold_ths'))} TH/s")
+        lines.append("Recommendation: REALLOCATE")
         if fields.get("degradation_episode_id"):
             lines.extend([
                 f"Degradation episode: {_safe_field_text(fields.get('degradation_episode_id'))}",
@@ -406,10 +432,23 @@ class LogAlertEnricher:
         ledger: SQLiteAlertLedger,
         limits: QueryLimits | LiveQueryLimits | None = None,
         secret_provider: Any = None,
+        allowed_projects: Iterable[str] | None = None,
+        identity_resolver: Callable[[NormalizedLogEntry], NormalizedLogEntry] | None = None,
     ) -> None:
         if type(ledger) is not SQLiteAlertLedger:
             raise TypeError("a local SQLiteAlertLedger is required")
         self.approved_organization = approved_organization
+        projects = None if allowed_projects is None else tuple(sorted(set(allowed_projects)))
+        if projects is not None and (
+            not projects or any(not isinstance(value, str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,61}[a-z0-9]", value) for value in projects)
+        ):
+            raise ValueError("allowed project names are invalid")
+        if identity_resolver is not None and not callable(identity_resolver):
+            raise TypeError("identity resolver must be callable")
+        if identity_resolver is not None and type(transport) is not LiveSaladReadTransport:
+            raise TypeError("provider identity fallback requires the live Salad adapter")
+        self.allowed_projects = projects
+        self.identity_resolver = identity_resolver
         self.transport = transport
         self.ledger = ledger
         if type(transport) is FixtureLogQueryTransport:
@@ -543,6 +582,26 @@ class LogAlertEnricher:
                 query=query,
             )
             normalized.extend(live_result.entries)
+            if self.allowed_projects is not None:
+                normalized = [
+                    entry for entry in normalized
+                    if entry.identity.project_name in self.allowed_projects
+                ]
+            if self.identity_resolver is not None:
+                resolved: list[NormalizedLogEntry] = []
+                for entry in normalized:
+                    updated = self.identity_resolver(entry)
+                    if (
+                        type(updated) is not NormalizedLogEntry
+                        or updated.data_classification != entry.data_classification
+                        or updated.event_time_utc != entry.event_time_utc
+                        or updated.evidence_sha256 != entry.evidence_sha256
+                        or updated.resource_labels != entry.resource_labels
+                        or updated.alert != entry.alert
+                    ):
+                        raise UnsafeQueryCycle("identity resolver changed non-identity evidence")
+                    resolved.append(updated)
+                normalized = resolved
             classification = live_result.data_classification
             query_count = live_result.subqueries_seen
             provider_response_evidence = live_result.response_evidence
@@ -621,10 +680,14 @@ class LogAlertEnricher:
         )
 
     def _scope_for_query(self, query: str) -> dict[str, str]:
+        scope_material = json.dumps(
+            {"query": query, "allowed_projects": self.allowed_projects},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        )
         return {
             "organization_name": self.approved_organization,
             "operation": "READ_LOG_QUERY",
-            "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+            "query_sha256": hashlib.sha256(scope_material.encode("ascii")).hexdigest(),
             "data_classification": PROVIDER_OBSERVED,
         }
 
@@ -632,7 +695,9 @@ class LogAlertEnricher:
         alert = entry.alert
         assert alert is not None
         identity = entry.identity.public_fields()
-        identity_key = entry.identity.resource_key()
+        # Dedupe identity is fixed to the raw provider-label source record;
+        # optional List Instances enrichment changes only the presentation.
+        identity_key = entry.identity.source_identity_key()
         fields = dict(alert.fields)
         if alert.event_type == "NO_FLOOR_CONFIGURED":
             dedupe_evidence = json.dumps(

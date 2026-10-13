@@ -98,7 +98,9 @@ def _cuda_cooldown_context(
     names = ("organization_name", "project_name", "container_group_name", "machine_id")
     if (
         identity.get("identity_status") not in {DATA_CLASSIFICATION, PROVIDER_OBSERVED}
-        or identity.get("identity_source") != "resource.labels"
+        or identity.get("identity_source") not in {
+            "resource.labels", "list_container_group_instances",
+        }
         or any(not isinstance(identity.get(name), str) or not identity[name] for name in names)
         or identity.get("organization_name") != payload.get("query_organization")
     ):
@@ -120,9 +122,82 @@ def _cuda_cooldown_context(
     return hashlib.sha256(canonical.encode("ascii")).hexdigest(), context
 
 
+def _merge_notification_identity(
+    existing: Any, incoming: Any, *, query_organization: Any,
+) -> dict[str, Any]:
+    """Merge only monotonic presentation enrichment for one stable source log."""
+    if not isinstance(existing, Mapping) or not isinstance(incoming, Mapping):
+        raise LedgerConflictError("deduplicated alert identity is malformed")
+    allowed_sources = {"resource.labels", "list_container_group_instances"}
+    for identity in (existing, incoming):
+        if identity.get("identity_status") == "CONFLICTING":
+            raise LedgerConflictError("deduplicated alert identity is conflicting")
+        if identity.get("identity_source") not in allowed_sources:
+            raise LedgerConflictError("deduplicated alert identity source changed")
+
+    merged = dict(existing)
+    fixed_fields = (
+        "project_name", "container_group_name", "instance_id",
+    )
+    for name in fixed_fields:
+        if existing.get(name) != incoming.get(name):
+            raise LedgerConflictError("deduplicated alert provider scope changed")
+
+    old_org = existing.get("organization_name")
+    new_org = incoming.get("organization_name")
+    if old_org != new_org:
+        if old_org is None and new_org == query_organization:
+            merged["organization_name"] = new_org
+        elif new_org is None and old_org == query_organization:
+            pass
+        else:
+            raise LedgerConflictError("deduplicated alert organization identity changed")
+
+    old_machine = existing.get("machine_id")
+    new_machine = incoming.get("machine_id")
+    if old_machine is not None and new_machine is not None and old_machine != new_machine:
+        raise LedgerConflictError("deduplicated alert machine identity changed")
+    if old_machine is None and new_machine is not None:
+        if not all(incoming.get(name) for name in (
+            "organization_name", "project_name", "container_group_name", "instance_id",
+        )):
+            raise LedgerConflictError("deduplicated alert enrichment is incomplete")
+        merged.update(incoming)
+    elif old_machine is not None:
+        # A failed or stale later GET may not downgrade previously proven IDs.
+        merged.update(existing)
+        if incoming.get("identity_source") == "resource.labels":
+            merged["identity_source"] = "resource.labels"
+    else:
+        # No machine ID was proved in either observation. Preserve the first
+        # presentation and any independently known source fields.
+        if merged.get("identity_source") != existing.get("identity_source"):
+            merged["identity_source"] = existing.get("identity_source")
+
+    # If both observations are resolved, only the evidence source may improve.
+    if old_machine is not None and new_machine is not None:
+        old_status = existing.get("identity_status")
+        new_status = incoming.get("identity_status")
+        if old_status != new_status:
+            raise LedgerConflictError("deduplicated alert identity classification changed")
+    if merged.get("machine_id") is not None:
+        if merged.get("identity_status") not in {DATA_CLASSIFICATION, PROVIDER_OBSERVED}:
+            raise LedgerConflictError("deduplicated alert has an unverified resolved identity")
+    else:
+        merged["identity_status"] = "UNKNOWN"
+    return merged
+
+
 def _merge_cuda_exit_evidence(
     existing: Mapping[str, Any], incoming: Mapping[str, Any],
 ) -> dict[str, Any]:
+    if existing.get("identity") is None and incoming.get("identity") is None:
+        merged_identity = None
+    else:
+        merged_identity = _merge_notification_identity(
+            existing.get("identity"), incoming.get("identity"),
+            query_organization=existing.get("query_organization"),
+        )
     exit_keys = {
         "miner_exit_status", "exit_status_confirmed", "exit_status_event_time_utc",
         "exit_evidence_sha256",
@@ -162,6 +237,8 @@ def _merge_cuda_exit_evidence(
 
     def merged_payload(base: Mapping[str, Any], *audit_sources: Mapping[str, Any]) -> dict[str, Any]:
         result = dict(base)
+        if merged_identity is not None:
+            result["identity"] = merged_identity
         fields = dict(result.get("event_fields", {}))
         audit = audit_union(*audit_sources)
         fields.update(audit)
@@ -187,6 +264,8 @@ def _merge_cuda_exit_evidence(
 
     def core(payload: Mapping[str, Any]) -> dict[str, Any]:
         result = dict(payload)
+        if merged_identity is not None:
+            result["identity"] = merged_identity
         fields = dict(result.get("event_fields", {}))
         for key in exit_keys | audit_keys:
             fields.pop(key, None)
@@ -281,6 +360,15 @@ def _merge_cuda_exit_evidence(
     ):
         raise LedgerConflictError("CUDA alert delayed exit evidence is malformed")
     return merged_payload(incoming, *audit_sources)
+
+
+def _render_stored_message(payload: Mapping[str, Any]) -> str:
+    # Use the same central renderer for every persisted outbox update. In
+    # particular, CUDA messages include event time, alert ID, and evidence
+    # classification in addition to the dedicated renderer's bounded body.
+    # The lazy import avoids the engine/ledger module import cycle.
+    from .engine import _render_message
+    return _render_message(payload)
 
 
 class SQLiteAlertLedger:
@@ -574,6 +662,27 @@ class SQLiteAlertLedger:
             for item, _payload_json, _message in prepared
             if item.get("event_type") == "CUDA_DRIVER_INCOMPATIBLE"
         }
+
+        def persist_enriched_alert(dedupe_key: str, payload: Mapping[str, Any]) -> None:
+            merged_payload = dict(payload)
+            _validate_payload(merged_payload)
+            merged_json = _canonical_json(merged_payload)
+            merged_message = _render_stored_message(merged_payload)
+            identity = merged_payload.get("identity", {})
+            self._db.execute(
+                """UPDATE log_alerts SET alert_id=?,identity_status=?,machine_id=?,
+                       instance_id=?,container_group_name=?,payload_json=? WHERE dedupe_key=?""",
+                (
+                    merged_payload.get("alert_id"), identity.get("identity_status", "UNKNOWN"),
+                    identity.get("machine_id"), identity.get("instance_id"),
+                    identity.get("container_group_name"), merged_json, dedupe_key,
+                ),
+            )
+            self._db.execute(
+                "UPDATE log_alert_outbox SET payload_json=?,message_text=? WHERE dedupe_key=?",
+                (merged_json, merged_message, dedupe_key),
+            )
+
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
@@ -656,10 +765,7 @@ class SQLiteAlertLedger:
                         if event_type in {"NO_FLOOR_CONFIGURED", "MONITOR_CONFIGURATION_INVALID"}:
                             old_fields = old_payload.get("event_fields", {})
                             new_fields = new_payload.get("event_fields", {})
-                            if (
-                                old_payload.get("event_type") != new_payload.get("event_type")
-                                or old_payload.get("identity") != new_payload.get("identity")
-                            ):
+                            if old_payload.get("event_type") != new_payload.get("event_type"):
                                 raise LedgerConflictError("stable allocation alert identity changed")
                             if event_type == "NO_FLOOR_CONFIGURED":
                                 same_key = all(
@@ -670,48 +776,45 @@ class SQLiteAlertLedger:
                                 same_key = old_fields.get("reason") == new_fields.get("reason")
                             if not same_key:
                                 raise LedgerConflictError("stable allocation alert evidence conflicted")
+                            merged_identity = _merge_notification_identity(
+                                old_payload.get("identity"), new_payload.get("identity"),
+                                query_organization=old_payload.get("query_organization"),
+                            )
+                            merged_payload = dict(old_payload)
+                            merged_payload["identity"] = merged_identity
+                            if merged_payload != old_payload:
+                                persist_enriched_alert(item["dedupe_key"], merged_payload)
                             # Repeated observations intentionally retain the
-                            # first evidence record for allocation-scoped warnings.
+                            # first evidence record while allowing verified ID enrichment.
                             continue
                         if event_type == "CUDA_DRIVER_INCOMPATIBLE":
                             merged_payload = _merge_cuda_exit_evidence(old_payload, new_payload)
                             if merged_payload != old_payload:
-                                merged_json = _canonical_json(merged_payload)
-                                _validate_payload(merged_payload)
-                                from .cuda_guard import render_cuda_message
-
-                                merged_message = render_cuda_message(merged_payload)
-                                self._db.execute(
-                                    "UPDATE log_alerts SET payload_json=? WHERE dedupe_key=?",
-                                    (merged_json, item["dedupe_key"]),
-                                )
-                                self._db.execute(
-                                    "UPDATE log_alert_outbox SET payload_json=?, message_text=? WHERE dedupe_key=?",
-                                    (merged_json, merged_message, item["dedupe_key"]),
-                                )
+                                persist_enriched_alert(item["dedupe_key"], merged_payload)
                             continue
                         old_alert_id = old_payload.get("alert_id")
                         new_alert_id = new_payload.get("alert_id")
+                        merged_identity = _merge_notification_identity(
+                            old_payload.get("identity"), new_payload.get("identity"),
+                            query_organization=old_payload.get("query_organization"),
+                        )
                         old_without_id = dict(old_payload)
                         new_without_id = dict(new_payload)
+                        old_without_id["identity"] = merged_identity
+                        new_without_id["identity"] = merged_identity
                         old_without_id["alert_id"] = None
                         new_without_id["alert_id"] = None
                         if old_without_id != new_without_id:
                             raise LedgerConflictError("deduplicated alert evidence changed")
                         if old_alert_id is not None and new_alert_id is not None and old_alert_id != new_alert_id:
                             raise LedgerConflictError("deduplicated alert has conflicting IDs")
-                        if old_alert_id is None and new_alert_id is not None:
-                            # A marker can arrive in a later overlapping poll.
-                            # Enrich the already-prepared item in place without
-                            # producing a second outbox notification.
-                            self._db.execute(
-                                "UPDATE log_alerts SET alert_id=?, payload_json=? WHERE dedupe_key=?",
-                                (new_alert_id, payload_json, item["dedupe_key"]),
-                            )
-                            self._db.execute(
-                                "UPDATE log_alert_outbox SET payload_json=?, message_text=? WHERE dedupe_key=?",
-                                (payload_json, message, item["dedupe_key"]),
-                            )
+                        merged_payload = dict(old_payload)
+                        merged_payload["identity"] = merged_identity
+                        merged_payload["alert_id"] = old_alert_id or new_alert_id
+                        if merged_payload != old_payload:
+                            # Update presentation in place. The delivery state
+                            # is untouched, so SENT/DELIVERY_UNKNOWN never re-send.
+                            persist_enriched_alert(item["dedupe_key"], merged_payload)
                         continue
                     if item.get("event_type") == "MONITOR_CONFIGURATION_INVALID":
                         new_payload = json.loads(payload_json)

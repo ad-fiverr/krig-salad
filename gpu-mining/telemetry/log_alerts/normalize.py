@@ -126,6 +126,10 @@ class ProviderIdentity:
     source: str
     labels_fingerprint: str
 
+    def source_identity_key(self) -> str:
+        """Stable source-label identity unaffected by optional enrichment."""
+        return self.labels_fingerprint
+
     def resource_key(self) -> str:
         if self.machine_id and self.instance_id:
             values = [self.organization_name, self.project_name, self.container_group_name,
@@ -134,12 +138,14 @@ class ProviderIdentity:
         return self.labels_fingerprint
 
     def public_fields(self) -> dict[str, Any]:
-        identity_known = self.status in {DATA_CLASSIFICATION, PROVIDER_OBSERVED}
         identity_conflict = self.status == "CONFLICTING"
         return {
             "identity_status": self.status,
-            "machine_id": self.machine_id if identity_known else None,
-            "instance_id": self.instance_id if identity_known else None,
+            # Non-conflicting partial provider IDs remain useful as observed
+            # evidence; UNKNOWN means incomplete identity, not that every
+            # independently supplied label should be discarded.
+            "machine_id": None if identity_conflict else self.machine_id,
+            "instance_id": None if identity_conflict else self.instance_id,
             "container_group_name": None if identity_conflict else self.container_group_name,
             "organization_name": None if identity_conflict else self.organization_name,
             "project_name": None if identity_conflict else self.project_name,
@@ -307,7 +313,6 @@ def resolve_provider_identity(
     if any(value is not None and not _SAFE_ID_RE.fullmatch(value) for value in (
         machine_id, instance_id, group_name, organization, project
     )):
-        machine_id = instance_id = None
         conflicting = True
     label_digest = hashlib.sha256(_canonical_json(safe_labels).encode("utf-8")).hexdigest()
     if conflicting:

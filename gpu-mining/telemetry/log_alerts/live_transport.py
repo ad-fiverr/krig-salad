@@ -1,9 +1,8 @@
-"""Disabled-by-default HTTPS boundary for Salad's log-query operation.
+"""Explicitly gated HTTPS boundary for fixed Salad read operations.
 
-Only the exact organization log-query POST is represented here. The
-production network gate is intentionally closed in this release. Offline
-tests can use an explicitly named in-memory exchange that has no socket or
-DNS implementation.
+Normal execution is network-disabled. A per-invocation capability can open
+only the fixed organization log-query POST and List Container Group Instances
+GET. Offline tests use an in-memory exchange with no socket or DNS behavior.
 """
 
 from __future__ import annotations
@@ -119,29 +118,36 @@ class OfflineSaladExchange:
         self._responder = responder
         self.calls: list[dict[str, Any]] = []
 
-    def exchange(self, host: str, path: str, headers: Mapping[str, str], body: bytes) -> SaladTransportResponse:
+    def exchange(self, host: str, path: str, headers: Mapping[str, str], body: bytes,
+                 *, method: str = "POST") -> SaladTransportResponse:
         self.calls.append({"host": host, "path": path, "headers": {
             key: ("[REDACTED]" if key.casefold() in {"salad-api-key", "authorization"} else value)
             for key, value in headers.items()
-        }, "body_bytes": len(body)})
+        }, "body_bytes": len(body), "method": method})
         return self._responder(host, path, headers, body)
 
 
 class LiveSaladReadTransport:
     """One-request HTTPS transport with no redirects, retries or proxy use."""
 
-    __slots__ = ("policy", "_secret_provider", "_offline_exchange")
+    __slots__ = ("policy", "_secret_provider", "_offline_exchange", "_capability")
 
-    def __init__(self, *, policy: LiveLogQueryPolicy, secret_provider: Any = None):
+    def __init__(self, *, policy: LiveLogQueryPolicy, secret_provider: Any = None,
+                 capability: Any = None):
         if type(policy) is not LiveLogQueryPolicy:
             raise TypeError("a fixed LiveLogQueryPolicy is required")
         if secret_provider is not None:
             interactive_provider, _, _ = secret_boundary_types()
             if type(secret_provider) is not interactive_provider:
                 raise TypeError("the exact approved InteractiveSecretProvider is required")
+        if capability is not None:
+            from .live_capability import LiveRuntimeCapability
+            if type(capability) is not LiveRuntimeCapability:
+                raise TypeError("the exact per-invocation live capability is required")
         self.policy = policy
         self._secret_provider = secret_provider
         self._offline_exchange = None
+        self._capability = capability
 
     @classmethod
     def for_offline_test(
@@ -156,10 +162,34 @@ class LiveSaladReadTransport:
         instance.policy = policy
         instance._secret_provider = None
         instance._offline_exchange = exchange
+        instance._capability = None
         return instance
 
     def __repr__(self) -> str:
-        return "LiveSaladReadTransport(host='api.salad.com', route=READ_LOG_QUERY, credentials=[REDACTED], enabled=False)"
+        return "LiveSaladReadTransport(host='api.salad.com', routes=READ_LOG_QUERY|LIST_CONTAINER_GROUP_INSTANCES, credentials=[REDACTED], enabled=False)"
+
+    def _live_read_enabled(self) -> bool:
+        from .live_capability import capability_allows
+        # The module constant remains a closed default and is retained for the
+        # existing explicit test patches. Normal execution needs a capability
+        # created by the CLI for this invocation.
+        return PRODUCTION_NETWORK_ALLOWED is True or capability_allows(self._capability, "salad_read")
+
+    def _validate_live_secret(self, secret: Any) -> None:
+        interactive_provider, _, secret_material = secret_boundary_types()
+        if (
+            type(self._secret_provider) is not interactive_provider
+            or type(secret) is not secret_material
+            or getattr(secret, "source_label", None) != "interactive_tty_session"
+        ):
+            raise LiveTransportBlocked("interactive Salad credential is unavailable")
+        try:
+            if self._secret_provider.acquire() is not secret:
+                raise LiveTransportBlocked("interactive Salad credential source does not match")
+        except LiveTransportBlocked:
+            raise
+        except Exception:
+            raise LiveTransportBlocked("interactive Salad credential source is unavailable") from None
 
     def fetch_query(self, request: LiveReadLogQueryRequest, *, secret: Any = None) -> SaladTransportResponse:
         self.policy.validate(request)
@@ -178,7 +208,7 @@ class LiveSaladReadTransport:
                 ):
                     raise LiveTransportBlocked("offline transport accepts only synthetic test material")
                 headers["Salad-Api-Key"] = secret._header_value()
-            response = self._offline_exchange.exchange(request.host, request.path, headers, body)
+            response = self._offline_exchange.exchange(request.host, request.path, headers, body, method="POST")
             if (
                 type(response) is not SaladTransportResponse
                 or not isinstance(response.body, bytes)
@@ -195,25 +225,88 @@ class LiveSaladReadTransport:
             )
             return SaladTransportResponse(response.status_code, response.body, evidence)
 
-        # This immutable task-level gate is deliberately hard false. It is
-        # checked before credential acquisition and before any connection.
-        if PRODUCTION_NETWORK_ALLOWED is not True:
+        # Network stays closed unless an explicit per-invocation capability is
+        # present; this check precedes credential acquisition and connection.
+        if not self._live_read_enabled():
             raise LiveTransportBlocked("Salad production network access is disabled")
-        interactive_provider, _, secret_material = secret_boundary_types()
-        if (
-            type(self._secret_provider) is not interactive_provider
-            or type(secret) is not secret_material
-            or getattr(secret, "source_label", None) != "interactive_tty_session"
-        ):
-            raise LiveTransportBlocked("interactive Salad credential is unavailable")
+        self._validate_live_secret(secret)
+        return self._https_exchange(request, body, secret)
+
+    def fetch_list_instances(
+        self, *, organization_name: str, project_name: str,
+        container_group_name: str, secret: Any = None,
+    ) -> SaladTransportResponse:
+        """Fetch only the verified Container Group Instances GET route."""
+        if organization_name != self.policy.approved_organization:
+            raise LiveTransportBlocked("List Instances organization is outside the fixed scope")
         try:
-            if self._secret_provider.acquire() is not secret:
-                raise LiveTransportBlocked("interactive Salad credential source does not match")
+            from collector.g4a_salad_get import G4ASaladGetClient
+            org = G4ASaladGetClient._name(organization_name, "organization_name")
+            project = G4ASaladGetClient._name(project_name, "project_name")
+            group = G4ASaladGetClient._name(container_group_name, "container_group_name")
+        except Exception:
+            raise LiveTransportBlocked("List Instances path is invalid") from None
+        path = f"/api/public/organizations/{org}/projects/{project}/containers/{group}/instances"
+        if self._offline_exchange is not None:
+            _, _, secret_material = secret_boundary_types()
+            headers = {"Host": "api.salad.com", "Accept": "application/json"}
+            if secret is not None:
+                if type(secret) is not secret_material or getattr(secret, "source_label", None) != "synthetic_test_provider":
+                    raise LiveTransportBlocked("offline transport accepts only synthetic test material")
+                headers["Salad-Api-Key"] = secret._header_value()
+            response = self._offline_exchange.exchange("api.salad.com", path, headers, b"", method="GET")
+            if type(response) is not SaladTransportResponse or not isinstance(response.body, bytes) or len(response.body) > MAX_RESPONSE_BYTES:
+                raise LiveTransportBlocked("offline List Instances response is outside local limits")
+            evidence = ProviderResponseEvidence(
+                source="offline_test_transport", classification="SYNTHETIC/UNVERIFIED",
+                status_code=response.status_code, response_sha256=_sha256(response.body),
+                _authority=_PROVIDER_RESPONSE_AUTHORITY,
+            )
+            return SaladTransportResponse(response.status_code, response.body, evidence)
+        if not self._live_read_enabled():
+            raise LiveTransportBlocked("Salad production network access is disabled")
+        self._validate_live_secret(secret)
+        return self._https_get_instances(path, secret)
+
+    def _https_get_instances(self, path: str, secret: Any) -> SaladTransportResponse:
+        conn: http.client.HTTPSConnection | None = None
+        try:
+            context = ssl.create_default_context()
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            conn = http.client.HTTPSConnection(
+                "api.salad.com", 443, timeout=CONNECT_TIMEOUT_SECONDS, context=context,
+            )
+            conn.connect()
+            if conn.sock is not None:
+                conn.sock.settimeout(READ_TIMEOUT_SECONDS)
+            conn.putrequest("GET", path, skip_host=True, skip_accept_encoding=True)
+            conn.putheader("Host", "api.salad.com")
+            conn.putheader("Accept", "application/json")
+            conn.putheader("Salad-Api-Key", secret._header_value())
+            conn.endheaders()
+            response = conn.getresponse()
+            if 300 <= response.status < 400:
+                raise LiveTransportBlocked("Salad redirects are not followed")
+            if response.status != 200:
+                raise LiveTransportBlocked(f"Salad List Instances returned HTTP {response.status}")
+            response_body = response.read(MAX_RESPONSE_BYTES + 1)
+            if len(response_body) > MAX_RESPONSE_BYTES:
+                raise LiveTransportBlocked("Salad response exceeds the local byte limit")
+            evidence = ProviderResponseEvidence(
+                source="salad_https_fixed_route", classification=PROVIDER_OBSERVED,
+                status_code=response.status, response_sha256=_sha256(response_body),
+                _authority=_PROVIDER_RESPONSE_AUTHORITY,
+            )
+            return SaladTransportResponse(response.status, response_body, evidence)
         except LiveTransportBlocked:
             raise
+        except TimeoutError:
+            raise LiveTransportBlocked("Salad List Instances timeout; details redacted") from None
         except Exception:
-            raise LiveTransportBlocked("interactive Salad credential source is unavailable") from None
-        return self._https_exchange(request, body, secret)
+            raise LiveTransportBlocked("Salad List Instances HTTPS request failed; details redacted") from None
+        finally:
+            if conn is not None:
+                conn.close()
 
     def _https_exchange(
         self, request: LiveReadLogQueryRequest, body: bytes, secret: Any,
@@ -257,6 +350,8 @@ class LiveSaladReadTransport:
             return SaladTransportResponse(response.status, response_body, evidence)
         except LiveTransportBlocked:
             raise
+        except TimeoutError:
+            raise LiveTransportBlocked("Salad HTTPS query timeout; details redacted") from None
         except Exception:
             # Never echo http.client exceptions, request headers or URL context.
             raise LiveTransportBlocked("Salad HTTPS query failed; details redacted") from None

@@ -1,11 +1,13 @@
 # Offline Salad log alert enricher
 
-**Status:** offline implementation with a prepared, hard-disabled live
+**Status:** offline implementation with a prepared, explicit per-invocation live
 boundary. Fixtures and local fake exchanges remain `SYNTHETIC/UNVERIFIED`.
 `PROVIDER_OBSERVED` is reserved for a successful response obtained through the
 exact Salad HTTPS transport; it does not verify GPU binding, billing, or profit.
-The production Salad and Telegram network gates are both hard-coded OFF, so
-this task's code and tests make no external requests.
+Production reads and Telegram sends require a capability created only by the
+explicit live CLI gates and confirmation phrase. This task and its tests made
+no Salad or Telegram requests; an operator must separately approve and start a
+live invocation.
 
 ## Contract evidence checked 2026-10-13
 
@@ -37,11 +39,11 @@ also exposes `LogEntry` fields for `json_log`, `receive_time`, `resource`,
 | Provider idempotency guarantee | `UNKNOWN` | Not required for the offline fixture; local dedup is not a provider guarantee. |
 | Provider labels prove this Fl4shMiner event belongs to a GPU | `UNKNOWN` | Salad labels identify the log resource only. Binding to a mining device needs separate evidence. |
 
-The official request URL includes `/api/public` as its base path. The local
-route classifier represents the operation-relative path
-`/organizations/{approved_org}/log-entries`; it is not a URL builder or an
-HTTP allowlist implementation. A future live adapter must hardcode the full
-documented URL and be separately reviewed and authorized.
+The official request URL includes `/api/public` as its base path. The live
+transport hardcodes the full documented URL for the exact log query and the
+separate, previously reviewed List Instances GET fallback. The query grammar
+is still `UNKNOWN`; callers must supply a query whose syntax has been verified
+before a live run. No query is inferred or shipped as a default.
 
 ## Processing and identity rules
 
@@ -173,6 +175,46 @@ overlap, and a 60-second marker correlation window. The fixture transport uses
 synthetic page tokens solely to test bounded pagination. Provider continuation
 semantics remain `UNKNOWN`.
 
+## Multi-organization central watcher
+
+`CentralFleetWatcher` extends the same normalizer, enricher, per-organization
+SQLite ledger, delivery coordinator, and centralized Telegram sender. One
+process monitors 1–100 configured `(organization, project)` targets in sorted,
+sequential order. Each organization gets one organization-scoped log query per
+cycle, its own hashed SQLite file, and an independent cursor/dedup/cooldown
+history. A failure for one organization becomes a sanitized status and does not
+stop the next organization. Cycles do not overlap or retry a failed request;
+the next scheduled cycle is the next opportunity. The default poll interval is
+30 seconds and the accepted range is 15–300 seconds.
+
+Every central message starts with the query Organization followed by Project,
+Container Group, Machine ID, Instance ID, identity source, and identity status.
+Organization comes from the endpoint scope, never miner text. Provider
+`resource.labels` remain the primary identity source. If only a canonical
+Instance ID is present, an exact List Container Group Instances GET may resolve
+Machine ID only for that same organization, project, and group, and only when
+exactly one matching row has a canonical Machine ID. Missing, ambiguous,
+conflicting, malformed, incomplete, or failed lookup results leave Machine ID
+`UNKNOWN`. The fallback cache lasts 45 seconds, is keyed by the complete route
+scope, and stores normalized IDs only. Synthetic fallback evidence remains
+`SYNTHETIC/UNVERIFIED` and cannot be delivered to Telegram.
+
+When a watcher target names specific projects, a log entry without a matching
+provider Project label is excluded before identity lookup or alert delivery;
+organization scope alone is not treated as proof that an entry belongs to an
+approved project.
+
+Targets are supplied as repeated `--target organization:project` arguments or
+as a non-secret JSON array with exactly `organization_name` and `project_name`
+per entry. Add organizations by adding target rows; there is no process or
+browser per machine. Query syntax is not confirmed by official documentation,
+so the command requires explicit `--query` text; no query is presented here as
+provider-verified.
+
+See [FLEET_RUNBOOK.md](FLEET_RUNBOOK.md) for the single-command fleet launcher,
+credential prompts, state paths, and preflight gates. That launcher was not run
+as part of this offline implementation.
+
 ## Offline test
 
 From the repository root, run:
@@ -195,24 +237,25 @@ Sequences after 1 include `previous_alert_mean_ths` and
 `deterioration_since_previous_alert_ths`; these names are shared by the
 monitor record, normalizer, and enriched message.
 
-## Prepared live boundary (still disabled)
+## Prepared live boundary (explicitly gated)
 
-The following components are implemented for later review, but cannot make a
-production request in this release:
+The following components are implemented, but no live request or delivery was
+made in this task:
 
 | Capability | Current state | Boundary |
 | --- | --- | --- |
-| Organization log query | Implemented, hard-disabled | Only `POST https://api.salad.com:443/api/public/organizations/{approved_org}/log-entries`, classified `READ_LOG_QUERY`; all other methods, hosts, ports and paths are denied. |
+| Organization log query | Implemented, per-invocation gated | Only `POST https://api.salad.com:443/api/public/organizations/{approved_org}/log-entries`, classified `READ_LOG_QUERY`; all other methods, hosts, ports and paths are denied. Watch mode requires `--watch-live-alerts`, `--enable-live-read`, and the exact `CENTRAL_FLEET_MONITOR` confirmation. |
 | Query | Explicit operator input required | Required start/end/query; query is bounded and rejects control/credential-like content; page size is at most 100 and sort order is `asc`. No query is inferred. |
-| HTTPS | Implemented, hard-disabled | Fixed `api.salad.com:443`, certificate and hostname verification, TLS 1.2 minimum, finite timeouts/bytes, no proxy discovery, redirects or retries. |
-| Completeness | Implemented with local bounds | Alert cycles split saturated responses by time recursively and deduplicate boundary evidence. They fail without cursor advance on excess items over `page_size`, more than 64 subqueries, 5,000 response items, 5 MB cumulative response, unsupported pagination, invalid page bounds, or a saturated minimum slice. The contract probe makes exactly one physical request, never splits, and marks a full page `UNKNOWN_SATURATED`; its completeness is unknown. Provider inclusion/boundary semantics still need a live contract probe. |
-| Salad credential | Reuses exact `InteractiveSecretProvider` / `SecretMaterial` classes from the repository-owned boundary | Future prompt is hidden TTY input, acquired once and kept in memory. The production transport and adapter reject arbitrary provider/material types. Environment, command-line, config, file, browser, Firebase and SQLite sources are not accepted. This task never prompts for a key. |
-| Contract probe | Implemented, not executed | One physical request with a window no longer than the configured maximum; it never splits a saturated page. Output includes completeness status, response counts, resource types, identity status counts and label-key names. It never prints label values, IDs, raw logs or credentials. |
-| Central Telegram | Implemented, hard-disabled | Fixed `api.telegram.org:443` HTTPS `sendMessage`, TLS verification, finite bounds, no redirects/retries. Token/chat ID use hidden TTY input only and remain in memory. |
+| HTTPS | Implemented, per-invocation gated | Fixed `api.salad.com:443`, certificate and hostname verification, TLS 1.2 minimum, finite timeouts/bytes, no proxy discovery, redirects or retries. |
+| Completeness | Implemented with local bounds | Alert cycles split saturated responses by time recursively and deduplicate boundary evidence, up to 64 subqueries per organization cycle. They fail without cursor advance on excess items over `page_size`, more than 64 subqueries, 5,000 response items, 5 MB cumulative response, unsupported pagination, invalid page bounds, or a saturated minimum slice. The contract probe makes exactly one physical request, never splits, and marks a full page `UNKNOWN_SATURATED`; its completeness is unknown. Provider inclusion/boundary semantics still need a live contract probe. |
+| Salad credential | Reuses exact `InteractiveSecretProvider` / `SecretMaterial` classes from the repository-owned boundary | Hidden TTY input only, acquired once and kept in memory for all organizations in the process. The production transport and adapter reject arbitrary provider/material types. Environment, command-line, config, file, browser, Firebase and SQLite sources are not accepted. This task never prompts for a key. |
+| Contract probe | Implemented, not executed | One physical request with a window no longer than the configured maximum; it never splits a saturated page. Output includes completeness status, response counts, resource types, identity status counts and label-key names. It never prints label values, IDs, raw logs or credentials. Probe mode cannot send Telegram. |
+| Central Telegram | Implemented, per-invocation gated | Fixed `api.telegram.org:443` HTTPS `sendMessage`, TLS verification, finite bounds, no redirects/retries. Watch mode requires `--enable-central-telegram`; token and chat ID use hidden TTY input and remain in memory. No delivery occurred in this task. |
 | Delivery | One attempt maximum | Separate durable states: `PENDING`, `DISPATCHING`, `SENT`, `DELIVERY_UNKNOWN`, `FAILED`. A restart in `DISPATCHING` becomes `DELIVERY_UNKNOWN`; no retry occurs. Only newly inserted, unsuppressed `PROVIDER_OBSERVED` alerts can enter delivery. Synthetic alerts are never sent. |
 | Live lifecycle | Disabled | Salad `Running`/`Ready` lifecycle semantics remain unverified; `StartupGuard` runs only on explicitly synthetic lifecycle fixtures. |
 | Reallocation / start / stop | Not implemented | No import, route, client, or action path is present. `actions_performed` remains false. |
-| Firebase / scheduling | Not implemented | This package has no Firebase sink or polling daemon. |
+| Firebase | Not implemented | This package has no Firebase sink. |
+| Scheduling | Implemented locally | `--watch-live-alerts` runs sequential bounded polling in the foreground and stops on Ctrl+C. It is not a hosted scheduler or distributed coordinator. |
 
 `PROVIDER_OBSERVED` is created only by the fixed Salad HTTPS transport after an
 HTTP 200 response and is backed by sealed response evidence before SQLite can
@@ -223,21 +266,23 @@ ledger with unbound fixture history fails closed. Raw log lines and opaque
 resource-label values are not persisted. Identity is parsed only from
 `resource.labels`; missing/conflicting labels remain `UNKNOWN`/`CONFLICTING`.
 
-The local command entrypoints are prepared but must not be run as a live
-operation during this task. Both immutable network gates are closed, so even
-the explicit flags cannot open them. The probe form is:
+The local command entrypoints require explicit per-process gates and hidden
+interactive credentials. They were not run during this task. The standalone
+probe form remains:
 
 ```powershell
 $env:PYTHONPATH = "gpu-mining/telemetry"
 python -m log_alerts.live_cli --probe-live-contract-once --enable-live-read `
-  --organization <approved-org> --query <operator-query> `
+  --confirm-live CENTRAL_FLEET_MONITOR --organization "<approved-org>" `
+  --query "<verified-operator-query>" `
   --start-time <RFC3339-start> --end-time <RFC3339-end>
 ```
 
 The one-shot alert form additionally requires
-`--live-alert-once --enable-central-telegram`; neither command is authorized or
-executable against production by this release. A real Salad probe requires a
-separate task and operator authorization, with Telegram disabled. Central
-Telegram delivery requires its own later review/authorization. Reallocation,
-Firebase production, deployment, billing claims and profitability decisions
-remain outside this package.
+`--live-alert-once --enable-central-telegram`. The fleet watcher requires
+`--watch-live-alerts`, `--enable-live-read`, `--enable-central-telegram`, exact
+confirmation, configured targets, an explicit query, and interactive hidden
+credential prompts. None of these live modes was run in this task. The query
+grammar still requires an independently verified value before a real probe.
+Reallocation, Firebase production, deployment, billing claims and profitability
+decisions remain outside this package.

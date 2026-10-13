@@ -1,4 +1,4 @@
-"""Central, one-shot Telegram sender; production HTTP remains hard-disabled."""
+"""Central Telegram sender; network delivery requires an invocation capability."""
 
 from __future__ import annotations
 
@@ -115,17 +115,23 @@ class TelegramSendResult:
 
 
 class CentralTelegramSender:
-    """Fixed-host sender; the only default behavior is blocked/no network."""
+    """Fixed-host sender; production delivery requires explicit live capability."""
 
-    __slots__ = ("_credentials", "_offline_responder")
+    __slots__ = ("_credentials", "_offline_responder", "_capability")
 
-    def __init__(self, *, credentials: TelegramCredentials, offline_responder: Callable[..., Any] | None = None):
+    def __init__(self, *, credentials: TelegramCredentials, offline_responder: Callable[..., Any] | None = None,
+                 capability: Any = None):
         if type(credentials) is not TelegramCredentials:
             raise TypeError("typed Telegram credentials are required")
         if offline_responder is not None and not callable(offline_responder):
             raise TypeError("offline responder must be callable")
+        if capability is not None:
+            from .live_capability import LiveRuntimeCapability
+            if type(capability) is not LiveRuntimeCapability:
+                raise TypeError("the exact per-invocation live capability is required")
         self._credentials = credentials
         self._offline_responder = offline_responder
+        self._capability = capability
 
     @classmethod
     def for_offline_test(
@@ -147,7 +153,8 @@ class CentralTelegramSender:
             raise TelegramSecretError("Telegram message is outside local limits")
         if self._offline_responder is not None:
             return self._send_offline(message_text)
-        if PRODUCTION_TELEGRAM_ALLOWED is not True:
+        from .live_capability import capability_allows
+        if PRODUCTION_TELEGRAM_ALLOWED is not True and not capability_allows(self._capability, "central_telegram"):
             raise TelegramSecretError("Telegram production delivery is disabled")
         return self._send_https(message_text)
 

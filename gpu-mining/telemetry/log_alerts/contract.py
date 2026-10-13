@@ -1,8 +1,8 @@
-"""Offline fixtures and the exact disabled Salad organization-log contract.
+"""Offline fixtures and the exact Salad organization-log query contract.
 
 The official API reference documents the exact POST operation and page-size
 ceiling. Query-language, provider-label, and full pagination semantics remain
-UNKNOWN. HTTP is implemented separately and hard-disabled by default.
+UNKNOWN. HTTP is implemented separately and disabled unless explicitly gated.
 """
 
 from __future__ import annotations

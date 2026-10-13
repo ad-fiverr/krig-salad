@@ -190,11 +190,14 @@ def render_cuda_message(payload: Mapping[str, Any]) -> str:
         raise ValueError("CUDA alert exit evidence is inconsistent")
 
     lines = [
+        f"Organization: {safe(identity.get('organization_name') or payload.get('query_organization'))}",
+        f"Project: {safe(identity.get('project_name'))}",
+        f"Container Group: {safe(identity.get('container_group_name'))}",
+        f"Machine ID: {safe(identity.get('machine_id'))}",
+        f"Instance ID: {safe(identity.get('instance_id'))}",
+        f"Identity source: {safe(identity.get('identity_source'))}",
         "🚨 CUDA_DRIVER_INCOMPATIBLE",
         f"Identity status: {safe(identity.get('identity_status'))}",
-        f"Machine ID: {safe(identity.get('machine_id'))}",
-        f"Instance ID (at detection): {safe(identity.get('instance_id'))}",
-        f"Container Group: {safe(identity.get('container_group_name'))}",
         f"Error: {CUDA_DRIVER_FAILURE_REASON}",
         "GPU initialized: false",
         f"Miner exit: {exit_status if confirmed else 'UNKNOWN'}",

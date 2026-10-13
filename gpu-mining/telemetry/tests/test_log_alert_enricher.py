@@ -1187,7 +1187,15 @@ class LogAlertEngineTests(unittest.TestCase):
         self.assertEqual(result.prepared_count, 1)
         alert = ledger.list_outbox()[0]
         self.assertEqual(alert["payload"]["event_type"], "RUNNING_READY_BUT_MINER_NOT_STARTED")
-        self.assertTrue(alert["message_text"].startswith("🚨 RUNNING_READY_BUT_MINER_NOT_STARTED"))
+        self.assertEqual(alert["message_text"].splitlines()[:7], [
+            f"Organization: {ORG}",
+            "Project: miners",
+            "Container Group: fl4shminer",
+            "Machine ID: machine-1",
+            "Instance ID: instance-1",
+            "Identity source: resource.labels",
+            "🚨 RUNNING_READY_BUT_MINER_NOT_STARTED",
+        ])
         self.assertEqual(alert["payload"]["identity"]["machine_id"], "machine-1")
         self.assertEqual(alert["payload"]["identity"]["instance_id"], "instance-1")
         self.assertEqual(alert["payload"]["identity"]["container_group_name"], "fl4shminer")
@@ -1973,9 +1981,17 @@ class LogAlertEngineTests(unittest.TestCase):
         self.assertEqual(fields["exit_status_event_time_utc"], "2026-10-13T12:01:00.000000Z")
         self.assertEqual(fields["recommendation"], "REALLOCATE")
         self.assertIs(fields["actions_performed"], False)
+        self.assertEqual(alert["message_text"].splitlines()[:7], [
+            f"Organization: {ORG}",
+            "Project: miners",
+            "Container Group: fl4shminer",
+            "Machine ID: machine-1",
+            "Instance ID: instance-1",
+            "Identity source: resource.labels",
+            "🚨 CUDA_DRIVER_INCOMPATIBLE",
+        ])
         for expected in (
-            "🚨 CUDA_DRIVER_INCOMPATIBLE", "Machine ID: machine-1",
-            "Instance ID (at detection): instance-1", "Container Group: fl4shminer",
+            "Identity status: SYNTHETIC/UNVERIFIED",
             "Error: CUDA_DRIVER_VERSION_INSUFFICIENT", "GPU initialized: false",
             "Miner exit: 1", "Recommendation: REALLOCATE", "Actions performed: false",
         ):

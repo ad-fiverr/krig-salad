@@ -29,15 +29,18 @@ QUERY_HASH = "f" * 64
 ALERT_KEY = "a" * 64
 
 
-def _post_boundary_test_seed(ledger: SQLiteAlertLedger, *, allow_delivery: bool = True) -> str:
+def _post_boundary_test_seed(
+    ledger: SQLiteAlertLedger, *, allow_delivery: bool = True,
+    machine_id: str | None = "unit-test-machine",
+) -> str:
     """Seed a post-validation ledger row, not a synthetic Salad response.
 
     The fixture is only for exercising delivery persistence after the trusted
     transport boundary. Tests use the offline sender and never issue HTTP.
     """
     identity = {
-        "identity_status": PROVIDER_OBSERVED,
-        "machine_id": "unit-test-machine",
+        "identity_status": PROVIDER_OBSERVED if machine_id is not None else "UNKNOWN",
+        "machine_id": machine_id,
         "instance_id": "unit-test-instance",
         "container_group_name": "unit-test-group",
         "organization_name": ORG,
@@ -63,7 +66,7 @@ def _post_boundary_test_seed(ledger: SQLiteAlertLedger, *, allow_delivery: bool 
         "event_type": "POOL_CONNECTION_FAILED",
         "event_time_utc": NOW,
         "identity_key": "c" * 64,
-        "identity_status": PROVIDER_OBSERVED,
+        "identity_status": PROVIDER_OBSERVED if machine_id is not None else "UNKNOWN",
         "machine_id": identity["machine_id"],
         "instance_id": identity["instance_id"],
         "container_group_name": identity["container_group_name"],
@@ -94,6 +97,120 @@ def _post_boundary_test_seed(ledger: SQLiteAlertLedger, *, allow_delivery: bool 
         provider_response_evidence=_internal_test_response_evidence(),
     )
     return return_item[0]["dedupe_key"]
+
+
+def _post_boundary_cuda_test_seed(ledger: SQLiteAlertLedger) -> str:
+    """Seed one validated CUDA event whose provider Machine ID is unknown."""
+    identity = {
+        "identity_status": "UNKNOWN",
+        "machine_id": None,
+        "instance_id": "unit-test-instance",
+        "container_group_name": "unit-test-group",
+        "organization_name": ORG,
+        "project_name": "unit-test-project",
+        "identity_source": "resource.labels",
+    }
+    payload = {
+        "data_classification": PROVIDER_OBSERVED,
+        "query_organization": ORG,
+        "event_type": "CUDA_DRIVER_INCOMPATIBLE",
+        "alert_id": "cuda-alert-01",
+        "event_time_utc": NOW,
+        "resource_type": "salad.container_group_instance",
+        "identity": identity,
+        "event_source": "text_log",
+        "event_fields": {
+            "reason": "CUDA_DRIVER_VERSION_INSUFFICIENT",
+            "gpu_initialized": False,
+            "miner_exit_status": "UNKNOWN",
+            "exit_status_confirmed": False,
+            "exit_status_event_time_utc": None,
+            "exit_evidence_sha256": None,
+            "recommendation": "REALLOCATE",
+            "actions_performed": False,
+        },
+        "source_evidence_sha256": "e" * 64,
+        "source_log_reference": "cuda-log-record-01",
+        "actions_performed": False,
+    }
+    from log_alerts.engine import _render_message
+
+    item = {
+        "dedupe_key": "d" * 64,
+        "event_type": "CUDA_DRIVER_INCOMPATIBLE",
+        "event_time_utc": NOW,
+        "identity_key": "c" * 64,
+        "identity_status": "UNKNOWN",
+        "machine_id": None,
+        "instance_id": identity["instance_id"],
+        "container_group_name": identity["container_group_name"],
+        "alert_id": payload["alert_id"],
+        "source_evidence_sha256": payload["source_evidence_sha256"],
+        "source_log_ref": payload["source_log_reference"],
+        "payload": payload,
+        "message_text": _render_message(payload),
+    }
+    committed = ledger.commit_cycle(
+        [item],
+        cursor_time_utc=NOW,
+        committed_at_utc=NOW,
+        data_classification=PROVIDER_OBSERVED,
+        live_scope={
+            "organization_name": ORG,
+            "operation": "READ_LOG_QUERY",
+            "query_sha256": QUERY_HASH,
+            "data_classification": PROVIDER_OBSERVED,
+        },
+        allow_provider_delivery=True,
+        provider_response_evidence=_internal_test_response_evidence(),
+    )
+    return committed[0]["dedupe_key"]
+
+
+def _resolved_identity_enrichment(ledger: SQLiteAlertLedger, key: str) -> None:
+    row = next(item for item in ledger.list_outbox() if item["dedupe_key"] == key)
+    payload = row["payload"]
+    identity = dict(payload["identity"])
+    identity.update({
+        "identity_status": PROVIDER_OBSERVED,
+        "machine_id": "unit-test-machine",
+        "identity_source": "list_container_group_instances",
+    })
+    payload["identity"] = identity
+    item = {
+        "dedupe_key": key,
+        "event_type": payload["event_type"],
+        "event_time_utc": payload["event_time_utc"],
+        "identity_key": "c" * 64,
+        "identity_status": PROVIDER_OBSERVED,
+        "machine_id": "unit-test-machine",
+        "instance_id": identity["instance_id"],
+        "container_group_name": identity["container_group_name"],
+        "alert_id": None,
+        "source_evidence_sha256": payload["source_evidence_sha256"],
+        "source_log_ref": None,
+        "payload": payload,
+        "message_text": (
+            "Organization: adrianfiverr\nProject: unit-test-project\n"
+            "Container Group: unit-test-group\nMachine ID: unit-test-machine\n"
+            "Instance ID: unit-test-instance\nIdentity source: list_container_group_instances\n"
+            "ALERT: POOL_CONNECTION_FAILED"
+        ),
+    }
+    ledger.commit_cycle(
+        [item],
+        cursor_time_utc=NOW,
+        committed_at_utc=NOW,
+        data_classification=PROVIDER_OBSERVED,
+        live_scope={
+            "organization_name": ORG,
+            "operation": "READ_LOG_QUERY",
+            "query_sha256": QUERY_HASH,
+            "data_classification": PROVIDER_OBSERVED,
+        },
+        allow_provider_delivery=True,
+        provider_response_evidence=_internal_test_response_evidence(),
+    )
 
 
 def _internal_test_response_evidence():
@@ -216,6 +333,96 @@ class DeliveryLedgerTests(unittest.TestCase):
             self.assertEqual(calls, [])
             self.assertEqual(reopened.list_deliveries()[0]["attempt_count"], 1)
             reopened.close()
+
+    def test_delivery_unknown_stays_terminal_when_machine_identity_is_enriched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "unknown-enriched.sqlite3"
+            ledger = SQLiteAlertLedger(db_path)
+            key = _post_boundary_test_seed(ledger, machine_id=None)
+            calls = []
+            sender = self._sender(
+                lambda *_args: (calls.append("send") or (_ for _ in ()).throw(RuntimeError("ambiguous")))
+            )
+            first = DeliveryCoordinator(ledger, sender).dispatch_new([key], now_utc=NOW)
+            self.assertEqual(first[0].state, "DELIVERY_UNKNOWN")
+            self.assertEqual(calls, ["send"])
+            ledger.close()
+
+            reopened = SQLiteAlertLedger(db_path)
+            _resolved_identity_enrichment(reopened, key)
+            self.assertEqual(reopened.list_outbox()[0]["payload"]["identity"]["machine_id"], "unit-test-machine")
+            self.assertEqual(reopened.list_deliveries()[0]["state"], "DELIVERY_UNKNOWN")
+            self.assertEqual(reopened.list_deliveries()[0]["attempt_count"], 1)
+            second = DeliveryCoordinator(reopened, sender).dispatch_new([key], now_utc=NOW)
+            self.assertEqual(second, ())
+            self.assertEqual(calls, ["send"])
+            self.assertEqual(reopened.list_deliveries()[0]["state"], "DELIVERY_UNKNOWN")
+            reopened.close()
+
+    def test_cuda_identity_enrichment_preserves_canonical_audit_and_terminal_delivery(self):
+        for terminal_state in ("SENT", "DELIVERY_UNKNOWN"):
+            with self.subTest(state=terminal_state), tempfile.TemporaryDirectory() as directory:
+                db_path = Path(directory) / "cuda-identity-enriched.sqlite3"
+                ledger = SQLiteAlertLedger(db_path)
+                key = _post_boundary_cuda_test_seed(ledger)
+                calls = []
+
+                def responder(*_args):
+                    calls.append("send")
+                    if terminal_state == "DELIVERY_UNKNOWN":
+                        raise RuntimeError("ambiguous response")
+                    return 200, b'{"ok":true,"result":{"message_id":8}}'
+
+                sender = self._sender(responder)
+                first = DeliveryCoordinator(ledger, sender).dispatch_new([key], now_utc=NOW)
+                self.assertEqual(first[0].state, terminal_state)
+                self.assertEqual(calls, ["send"])
+                original = ledger.list_outbox()[0]["message_text"]
+                for audit in (
+                    f"Event time: {NOW}",
+                    "Alert ID: cuda-alert-01",
+                    "Evidence: PROVIDER_OBSERVED",
+                ):
+                    self.assertIn(audit, original)
+                ledger.close()
+
+                reopened = SQLiteAlertLedger(db_path)
+                _resolved_identity_enrichment(reopened, key)
+                enriched = reopened.list_outbox()[0]
+                self.assertEqual(enriched["payload"]["identity"]["machine_id"], "unit-test-machine")
+                self.assertEqual(enriched["message_text"].splitlines()[:6], [
+                    f"Organization: {ORG}",
+                    "Project: unit-test-project",
+                    "Container Group: unit-test-group",
+                    "Machine ID: unit-test-machine",
+                    "Instance ID: unit-test-instance",
+                    "Identity source: list_container_group_instances",
+                ])
+                for audit in (
+                    f"Event time: {NOW}",
+                    "Alert ID: cuda-alert-01",
+                    "Evidence: PROVIDER_OBSERVED",
+                ):
+                    self.assertIn(audit, enriched["message_text"])
+                self.assertEqual(reopened.list_deliveries()[0]["state"], terminal_state)
+                self.assertEqual(reopened.list_deliveries()[0]["attempt_count"], 1)
+                reopened.close()
+
+                persisted = SQLiteAlertLedger(db_path)
+                final_row = persisted.list_outbox()[0]
+                self.assertEqual(final_row["message_text"], enriched["message_text"])
+                for audit in (
+                    f"Event time: {NOW}",
+                    "Alert ID: cuda-alert-01",
+                    "Evidence: PROVIDER_OBSERVED",
+                ):
+                    self.assertIn(audit, final_row["message_text"])
+                self.assertEqual(persisted.list_deliveries()[0]["state"], terminal_state)
+                second = DeliveryCoordinator(persisted, sender).dispatch_new([key], now_utc=NOW)
+                self.assertEqual(second, ())
+                self.assertEqual(calls, ["send"])
+                self.assertEqual(persisted.list_deliveries()[0]["attempt_count"], 1)
+                persisted.close()
 
     def test_pending_alert_is_not_scanned_or_sent_after_restart(self):
         with tempfile.TemporaryDirectory() as directory:

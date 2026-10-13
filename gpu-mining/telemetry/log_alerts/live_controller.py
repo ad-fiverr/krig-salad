@@ -99,8 +99,8 @@ class LiveLogAlertController:
     ) -> ContractProbeSummary:
         if enable_live_read is not True:
             raise LiveControllerBlocked("explicit live-read gate is required")
-        if self.enricher.transport._offline_exchange is None and PRODUCTION_NETWORK_ALLOWED is not True:
-            raise LiveControllerBlocked("production Salad probe is hard-disabled")
+        if self.enricher.transport._offline_exchange is None and not self.enricher.transport._live_read_enabled():
+            raise LiveControllerBlocked("production Salad probe requires explicit live capability")
         result = self.enricher.live_adapter.probe_single_request(
             start_time_utc=start_time_utc,
             end_time_utc=end_time_utc,
@@ -127,10 +127,12 @@ class LiveLogAlertController:
             raise LiveControllerBlocked("central Telegram sender is unavailable")
         if self.enricher.transport._offline_exchange is not None:
             raise LiveControllerBlocked("synthetic offline transport is never eligible for Telegram delivery")
-        if self.enricher.transport._offline_exchange is None and PRODUCTION_NETWORK_ALLOWED is not True:
-            raise LiveControllerBlocked("production Salad reads are hard-disabled")
-        if self.sender._offline_responder is None and PRODUCTION_TELEGRAM_ALLOWED is not True:
-            raise LiveControllerBlocked("production Telegram delivery is hard-disabled")
+        if self.enricher.transport._offline_exchange is None and not self.enricher.transport._live_read_enabled():
+            raise LiveControllerBlocked("production Salad reads require explicit live capability")
+        if self.sender._offline_responder is None:
+            from .live_capability import capability_allows
+            if PRODUCTION_TELEGRAM_ALLOWED is not True and not capability_allows(self.sender._capability, "central_telegram"):
+                raise LiveControllerBlocked("production Telegram delivery requires explicit live capability")
         cycle = self.enricher.run_once(
             end_time_utc=end_time_utc,
             query=query,
