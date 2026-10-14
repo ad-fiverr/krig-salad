@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.util
@@ -32,6 +33,7 @@ from log_alerts.fleet_targets import (  # noqa: E402
 )
 from log_alerts.fleet_watcher import CentralFleetWatcher  # noqa: E402
 from log_alerts.live_capability import authorize_live_invocation  # noqa: E402
+from log_alerts.live_adapter import LiveAdapterError  # noqa: E402
 from log_alerts import live_cli as live_cli_module  # noqa: E402
 from log_alerts.live_cli import (  # noqa: E402
     WatcherAlreadyRunning,
@@ -435,9 +437,17 @@ class CentralFleetWatcherTests(unittest.TestCase):
     def test_one_organization_failure_does_not_retry_or_block_the_other(self):
         items = {org: [] for org in ORGANIZATIONS}
         rows = {}
+        clock = iter(("2026-10-13T12:01:00.123456Z", "2026-10-13T12:01:30.123456Z"))
+        queries = []
+
+        def responder(organization, body, _items):
+            queries.append((organization, json.loads(body)))
+            return _json_response(_page([]))
+
         with tempfile.TemporaryDirectory() as temp:
             watcher, exchanges, telegram_calls, _provider = self.make_watcher(
                 temp, items, rows, failing={"fleet-alpha": 403},
+                clock=clock.__next__, query_responder=responder,
             )
             waits = []
             try:
@@ -451,17 +461,122 @@ class CentralFleetWatcherTests(unittest.TestCase):
                 ])
                 self.assertEqual(waits, [30])
                 self.assertEqual(len(exchanges["fleet-alpha"].calls), 2)
-                self.assertEqual(len(exchanges["fleet-bravo"].calls), 2)
+                self.assertEqual(len(exchanges["fleet-bravo"].calls), 3)
+                # Two adjacent capped slices cover the first fractional-hour
+                # window; the third query is the next cycle, never a retry.
+                self.assertEqual([organization for organization, _ in queries], ["fleet-bravo"] * 3)
+                self.assertEqual([(query["start_time"], query["end_time"]) for _, query in queries], [
+                    ("2026-10-13T11:01:00.123Z", "2026-10-13T12:01:00.123Z"),
+                    ("2026-10-13T12:01:00.123Z", "2026-10-13T12:01:00.124Z"),
+                    ("2026-10-13T11:59:00.123Z", "2026-10-13T12:01:30.124Z"),
+                ])
                 self.assertTrue(all(call["method"] == "POST" for group in exchanges.values() for call in group.calls))
+                self.assertEqual(telegram_calls, [])
+            finally:
+                watcher.close()
+
+    def test_nonempty_failure_has_fixed_code_without_disclosing_provider_data(self):
+        private_markers = ("synthetic-private-body", "synthetic-private-label", "synthetic-private-machine", "synthetic-private-instance")
+        timestamp = "2026-10-13T12:00:30Z"
+        bad = _log_item(ORGANIZATIONS[0], GROUPS[0], COMMON_INSTANCE, timestamp, private_markers[0] + "\nsecond line")
+        bad["resource"]["labels"].update({"machine_id": private_markers[2], "instance_id": private_markers[3], "opaque": private_markers[1]})
+        good = _log_item(ORGANIZATIONS[1], GROUPS[0], COMMON_INSTANCE, timestamp, "Device [1] hashRate: 150.0 TH/s")
+        items = {ORGANIZATIONS[0]: [bad], ORGANIZATIONS[1]: [good]}
+        with tempfile.TemporaryDirectory() as temp:
+            watcher, exchanges, telegram_calls, _ = self.make_watcher(temp, items, {})
+            try:
+                with patch("log_alerts.live_transport.http.client.HTTPSConnection", side_effect=AssertionError("network forbidden")):
+                    results = watcher.run_cycle(end_time_utc="2026-10-13T12:01:00Z")
+                self.assertEqual(results[0].status, "QUERY_FAILED")
+                self.assertEqual(results[0].query_failure_code, "ENTRY_NORMALIZATION_REJECTED")
+                self.assertEqual(results[0].records_seen, 0)
+                self.assertIsNone(watcher._ledgers[ORGANIZATIONS[0]].get_cursor())
+                self.assertEqual(results[1].status, "SYNTHETIC_ONLY")
+                self.assertIsNone(results[1].query_failure_code)
+                self.assertEqual(results[1].records_seen, 1)
+                self.assertEqual(watcher._ledgers[ORGANIZATIONS[1]].get_cursor(), "2026-10-13T12:01:00.000000Z")
+                self.assertEqual([len(exchanges[org].calls) for org in ORGANIZATIONS], [1, 2])
+                # The healthy progress record keeps the existing identity GET;
+                # neither organization's log POST is retried.
+                self.assertEqual([call["method"] for call in exchanges[ORGANIZATIONS[1]].calls], ["POST", "GET"])
+                rendered = json.dumps([asdict(result) for result in results])
+                for value in private_markers:
+                    self.assertNotIn(value, rendered)
+                self.assertEqual(telegram_calls, [])
+            finally:
+                watcher.close()
+
+    def test_empty_and_unrecognized_nonempty_responses_have_no_failure_code(self):
+        for nonempty in (False, True):
+            with self.subTest(nonempty=nonempty), tempfile.TemporaryDirectory() as temp:
+                items = {
+                    org: [_log_item(org, GROUPS[0], COMMON_INSTANCE, "2026-10-13T12:00:30Z", "unrecognized ordinary output")] if nonempty else []
+                    for org in ORGANIZATIONS
+                }
+                watcher, _, telegram_calls, _ = self.make_watcher(temp, items, {})
+                try:
+                    results = watcher.run_cycle(end_time_utc="2026-10-13T12:01:00Z")
+                    self.assertTrue(all(result.status == "SYNTHETIC_ONLY" for result in results))
+                    self.assertTrue(all(result.query_failure_code is None for result in results))
+                    self.assertEqual([result.records_seen for result in results], [int(nonempty)] * 2)
+                    self.assertEqual(telegram_calls, [])
+                finally:
+                    watcher.close()
+
+    def test_unknown_exceptions_and_forged_codes_do_not_escape_through_diagnostics(self):
+        marker = "synthetic-private-exception-must-not-be-emitted"
+        forged = LiveAdapterError(marker, code=marker)
+        tampered = LiveAdapterError(marker, code="PAGE_BOUNDS_INVALID")
+        tampered.failure_code = [marker]
+        for exception in (RuntimeError(marker), forged, tampered):
+            with self.subTest(kind=type(exception).__name__), tempfile.TemporaryDirectory() as temp:
+                watcher, _, telegram_calls, _ = self.make_watcher(temp, {}, {})
+                try:
+                    with patch.object(watcher, "_ledger_for", side_effect=exception):
+                        results = watcher.run_cycle(end_time_utc="2026-10-13T12:01:00Z")
+                    self.assertTrue(all(result.status == "QUERY_FAILED" and result.query_failure_code == "UNKNOWN" for result in results))
+                    self.assertNotIn(marker, json.dumps([asdict(result) for result in results]))
+                    self.assertEqual(telegram_calls, [])
+                finally:
+                    watcher.close()
+
+    def test_saturated_minimum_slice_is_incomplete_with_a_precise_diagnostic(self):
+        items = {
+            org: [_log_item(org, GROUPS[0], COMMON_INSTANCE, "2026-10-13T12:00:30Z", "ordinary output") for _ in range(100)]
+            for org in ORGANIZATIONS
+        }
+
+        def responder(_organization, body, rows):
+            query = json.loads(body)
+            def moment(value):
+                return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            selected = [row for row in rows if moment(query["start_time"]) <= moment(row["time"]) <= moment(query["end_time"])]
+            return _json_response(_page(selected[:query["page_size"]]))
+
+        with tempfile.TemporaryDirectory() as temp:
+            watcher, exchanges, telegram_calls, _ = self.make_watcher(temp, items, {}, query_responder=responder)
+            try:
+                results = watcher.run_cycle(end_time_utc="2026-10-13T12:01:00Z")
+                self.assertTrue(all(result.status == "INCOMPLETE_RESPONSE" and result.query_failure_code == "TIME_SLICE_LIMIT" for result in results))
+                self.assertTrue(all(ledger.get_cursor() is None for ledger in watcher._ledgers.values()))
+                self.assertTrue(all(len(exchange.calls) <= 64 for exchange in exchanges.values()))
                 self.assertEqual(telegram_calls, [])
             finally:
                 watcher.close()
 
     def test_one_organization_timeout_waits_for_next_cycle_and_other_org_continues(self):
         items = {org: [] for org in ORGANIZATIONS}
+        clock = iter(("2026-10-13T12:01:00.123456Z", "2026-10-13T12:01:30.123456Z"))
+        queries = []
+
+        def responder(organization, body, _items):
+            queries.append((organization, json.loads(body)))
+            return _json_response(_page([]))
+
         with tempfile.TemporaryDirectory() as temp:
             watcher, exchanges, telegram_calls, _provider = self.make_watcher(
                 temp, items, {}, failing={"fleet-alpha": "TIMEOUT"},
+                clock=clock.__next__, query_responder=responder,
             )
             waits = []
             try:
@@ -471,7 +586,13 @@ class CentralFleetWatcherTests(unittest.TestCase):
                     ("fleet-bravo", "SYNTHETIC_ONLY"),
                 ])
                 self.assertEqual(len(exchanges["fleet-alpha"].calls), 2)
-                self.assertEqual(len(exchanges["fleet-bravo"].calls), 2)
+                self.assertEqual(len(exchanges["fleet-bravo"].calls), 3)
+                self.assertEqual([organization for organization, _ in queries], ["fleet-bravo"] * 3)
+                self.assertEqual([(query["start_time"], query["end_time"]) for _, query in queries], [
+                    ("2026-10-13T11:01:00.123Z", "2026-10-13T12:01:00.123Z"),
+                    ("2026-10-13T12:01:00.123Z", "2026-10-13T12:01:00.124Z"),
+                    ("2026-10-13T11:59:00.123Z", "2026-10-13T12:01:30.124Z"),
+                ])
                 self.assertEqual(waits, [30])
                 self.assertTrue(all(call["method"] == "POST" for group in exchanges.values() for call in group.calls))
                 self.assertEqual(telegram_calls, [])

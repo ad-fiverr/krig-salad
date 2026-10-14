@@ -37,8 +37,12 @@ DEVICE_RATE_RE = re.compile(
     r"(?:\s*,\s*warm:\s*(?P<warm>[0-9]+))?\b",
     re.IGNORECASE,
 )
-GPU_KEY_RE = re.compile(
-    r"RTX_[0-9]{4}(?:_[A-Z0-9]{1,16})*(?:_(?:LAPTOP|DESKTOP))?"
+MAX_GPU_KEY_CHARS = 128
+MAX_GPU_NAME_CHARS = 256
+GPU_KEY_RE = re.compile(r"[A-Z0-9]+(?:_[A-Z0-9]+)*")
+NVIDIA_GPU_NAME_RE = re.compile(
+    r"NVIDIA +(?P<geforce>GeForce +)?"
+    r"(?P<name>[A-Za-z0-9]+(?:[ _-]+[A-Za-z0-9]+)*)", re.IGNORECASE,
 )
 GPU_INITIALIZED_RE = re.compile(
     r"Device\s*\[(?P<device>[0-9]{1,3})\]\s+"
@@ -53,7 +57,7 @@ PEARL_GPU_RE = re.compile(
 )
 SOLUTIONS_GPU_RE = re.compile(
     r"Solutions\s+accepted:.*?(?P<device>[0-9]{1,3})-"
-    r"(?P<gpu>NVIDIA\s+GeForce\s+RTX\s+[^,;\r\n]{1,192})",
+    r"(?P<gpu>NVIDIA\s+[^,;\r\n]{1,249})",
     re.IGNORECASE,
 )
 MAX_PARSE_LINE_BYTES = 64 * 1024
@@ -94,8 +98,8 @@ POOL_UNSTABLE_RENOTIFY_SECONDS = 900
 POOL_RECENT_FAILURES_MAX = 64
 POOL_FAILURE_COUNT_MAX = 1_000_000
 SOLUTIONS_ACCEPTED_RECOVERY_RE = re.compile(
-    r"Solutions accepted:\s+[0-9]{1,10}-NVIDIA GeForce RTX "
-    r"[A-Za-z0-9 .+()/_-]{1,192}"
+    r"Solutions accepted:\s+[0-9]{1,10}-"
+    r"(?P<gpu>NVIDIA [A-Za-z0-9 _-]{1,249})"
     r"(?:,\s*(?:[0-9]{1,10} stale|stale=[0-9]{1,10}|[0-9]{1,10} accepted))?",
     re.IGNORECASE,
 )
@@ -306,7 +310,7 @@ class MonitorConfig:
 
 
 def _is_canonical_gpu_key(key: str) -> bool:
-    return bool(GPU_KEY_RE.fullmatch(key))
+    return isinstance(key, str) and len(key) <= MAX_GPU_KEY_CHARS and bool(GPU_KEY_RE.fullmatch(key))
 
 
 def _parse_floor(value: Any, name: str) -> float:
@@ -370,40 +374,40 @@ class GpuIdentityObservation:
 
 
 def normalize_gpu_identity(raw_name: str) -> str | None:
-    """Normalize Fl4shMiner names, retaining neutral keys when form is absent."""
-    match = re.fullmatch(
-        r"NVIDIA\s+GeForce\s+RTX\s+(?P<model>[0-9]{4})(?P<tail>.*)",
-        raw_name.strip(),
-        re.IGNORECASE,
-    )
+    """Normalize bounded NVIDIA names without guessing a model or form factor."""
+    if (
+        not isinstance(raw_name, str) or len(raw_name) > MAX_GPU_NAME_CHARS
+        or any(ord(char) < 32 or ord(char) > 126 for char in raw_name)
+    ):
+        return None
+    match = NVIDIA_GPU_NAME_RE.fullmatch(raw_name.strip())
     if match is None:
         return None
-    model = match.group("model")
-    tokens = re.findall(r"[A-Za-z0-9]+", match.group("tail"))
-    tokens = [token.upper() for token in tokens if token.upper() != "GPU"]
+    name = match.group("name").upper()
+    tokens = re.split(r"[ _-]+", name)
+    if tokens[-1] == "GPU":
+        tokens.pop()
+    if not tokens or any(token in {"NVIDIA", "GEFORCE", "GPU", "UNKNOWN", "SERIES", "FAMILY"} for token in tokens):
+        return None
+    # Separate whitespace-delimited model identifiers are ambiguous. Hyphenated
+    # package identifiers such as A100-SXM4-80GB remain one explicit name.
+    if sum(bool(re.search(r"[0-9]", word)) for word in name.split()) != 1:
+        return None
+    if tokens.count("RTX") > 1:
+        return None
     laptop_tags = {"LAPTOP", "NOTEBOOK", "MOBILE"}
-    forms = {token for token in tokens if token in laptop_tags | {"DESKTOP"}}
+    forms = [token for token in tokens if token in laptop_tags | {"DESKTOP"}]
     if len(forms) > 1:
         return None
     if forms:
-        form = "LAPTOP" if next(iter(forms)) in laptop_tags else "DESKTOP"
-        variants = [token for token in tokens if token not in laptop_tags | {"DESKTOP"}]
-    elif not tokens and model in {"5080", "5090"}:
-        # Preserve the existing exact 5080/5090 mappings used by the operator.
-        # Other models without a form factor remain neutral below.
+        form = "LAPTOP" if forms[0] in laptop_tags else "DESKTOP"
+        tokens = [token for token in tokens if token not in laptop_tags | {"DESKTOP"}]
+    elif match.group("geforce") and tokens in (["RTX", "5080"], ["RTX", "5090"]):
+        # Preserve only the deployed bare GeForce RTX 5080/5090 exceptions.
         form = "DESKTOP"
-        variants = []
     else:
-        # Preserve the missing form factor as a neutral identity. This can only
-        # match an equally neutral registry key; it never inherits a Laptop or
-        # Desktop floor.
         form = None
-        variants = tokens
-    if len(variants) > 3:
-        return None
-    variant_suffix = "".join(f"_{token}" for token in variants)
-    form_suffix = f"_{form}" if form is not None else ""
-    key = f"RTX_{model}{variant_suffix}{form_suffix}"
+    key = "_".join(tokens + ([form] if form is not None else []))
     return key if _is_canonical_gpu_key(key) else None
 
 
@@ -1841,9 +1845,10 @@ def _parse_pool_failure_observation(line: str) -> tuple[int, str] | None:
 
 def _is_solutions_accepted_recovery_line(line: str) -> bool:
     """Accept only one bounded Fl4shMiner accepted-solutions record."""
-    return isinstance(line, str) and len(line) <= 256 and bool(
-        SOLUTIONS_ACCEPTED_RECOVERY_RE.fullmatch(line)
-    )
+    if not isinstance(line, str) or len(line) > 256:
+        return False
+    match = SOLUTIONS_ACCEPTED_RECOVERY_RE.fullmatch(line)
+    return match is not None and normalize_gpu_identity(match.group("gpu")) is not None
 
 
 def _utc_timestamp(value: datetime) -> str:

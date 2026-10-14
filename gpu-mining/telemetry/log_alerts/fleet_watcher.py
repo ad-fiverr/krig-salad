@@ -17,7 +17,7 @@ from .delivery import DeliveryCoordinator
 from .engine import LogAlertEnricher
 from .fleet_targets import FleetTarget, targets_by_organization, validate_targets
 from .ledger import SQLiteAlertLedger
-from .live_adapter import LiveQueryLimits
+from .live_adapter import QUERY_FAILURE_CODES, LiveAdapterError, LiveQueryLimits
 from .live_capability import LiveRuntimeCapability
 from .live_transport import LiveSaladReadTransport, LiveTransportBlocked
 from .list_instances_lookup import ListInstancesLookup
@@ -44,6 +44,7 @@ class OrganizationCycleResult:
     identity_lookup_status: str = "NOT_NEEDED"
     identity_lookup_http_status: int | None = None
     delivery_states: tuple[str, ...] = ()
+    query_failure_code: str | None = None
 
 
 class CentralFleetWatcher:
@@ -207,6 +208,7 @@ class CentralFleetWatcher:
                 lookup_failures=0 if lookup is None else lookup.lookup_failures,
                 identity_lookup_status="ACCESS_DENIED" if lookup_denied else "NOT_AVAILABLE",
                 identity_lookup_http_status=lookup.access_denied_status if lookup_denied else None,
+                query_failure_code=_safe_query_failure_code(exc),
             )
 
     def _ledger_for(self, organization: str) -> SQLiteAlertLedger:
@@ -278,6 +280,16 @@ class CentralFleetWatcher:
 
     def __exit__(self, *_exc: Any) -> None:
         self.close()
+
+
+def _safe_query_failure_code(exc: Exception) -> str:
+    if type(exc) is LiveAdapterError:
+        code = exc.failure_code
+        if isinstance(code, str) and code in QUERY_FAILURE_CODES:
+            return code
+    if isinstance(exc, LiveTransportBlocked):
+        return "TRANSPORT_FAILED"
+    return "UNKNOWN"
 
 
 def _safe_failure_state(exc: Exception) -> str:

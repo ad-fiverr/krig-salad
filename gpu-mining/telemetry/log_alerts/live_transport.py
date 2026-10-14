@@ -8,6 +8,7 @@ GET. Offline tests use an in-memory exchange with no socket or DNS behavior.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 import http.client
 import importlib.util
 import json
@@ -360,10 +361,31 @@ class LiveSaladReadTransport:
                 conn.close()
 
 
+def _salad_query_timestamp(value: str | datetime) -> str:
+    """Truncate only the Salad HTTP timestamp to UTC milliseconds."""
+    try:
+        parsed = datetime.fromisoformat(canonical_utc(value).replace("Z", "+00:00"))
+    except ValueError:
+        raise LiveQueryPolicyError("Salad query timestamp is invalid") from None
+    return parsed.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _validate_salad_query_window(start: str, end: str) -> None:
+    """Validate the serialized HTTP bounds without the internal cursor format."""
+    if start != _salad_query_timestamp(start) or end != _salad_query_timestamp(end):
+        raise LiveQueryPolicyError("Salad query timestamps must be UTC milliseconds")
+    # Both values now have the same canonical UTC millisecond format.
+    if start >= end:
+        raise LiveQueryPolicyError("Salad query window must remain positive at millisecond precision")
+
+
 def _encode_request_body(request: LiveReadLogQueryRequest) -> bytes:
+    start = _salad_query_timestamp(request.start_time_utc)
+    end = _salad_query_timestamp(request.end_time_utc)
+    _validate_salad_query_window(start, end)
     payload = {
-        "start_time": request.start_time_utc,
-        "end_time": request.end_time_utc,
+        "start_time": start,
+        "end_time": end,
         "query": request.query,
         "page_size": request.page_size,
         "sort_order": request.sort_order,

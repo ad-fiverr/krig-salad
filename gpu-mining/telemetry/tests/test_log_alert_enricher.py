@@ -298,6 +298,123 @@ def run_startup_guard(entries, *, end_time_utc, prior_states=None):
     )
 
 
+def load_generic_runtime_monitor():
+    path = TELEMETRY_ROOT.parent / "runtime" / "fl4shminer" / "fl4sh-runtime-monitor.py"
+    spec = importlib.util.spec_from_file_location("fl4sh_generic_contract_monitor", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class GenericGpuCentralContractTests(unittest.TestCase):
+    def test_18_generic_runtime_recommendations_round_trip_without_provider_inference(self):
+        runtime = load_generic_runtime_monitor()
+        for raw_name, key in (("NVIDIA RTX A4000", "RTX_A4000"), ("NVIDIA GeForce RTX 3060", "RTX_3060"),
+                              ("NVIDIA A100-SXM4-80GB", "A100_SXM4_80GB"), ("NVIDIA L40S", "L40S"),
+                              ("NVIDIA A10", "A10"), ("NVIDIA T4", "T4")):
+            with self.subTest(key=key):
+                config = runtime.MonitorConfig.from_env({
+                    "FL4SH_MONITOR_ENABLED":"1", "FL4SH_MONITOR_GPU_FLOORS_JSON":runtime.json.dumps({key:45}),
+                    "SALAD_G5_WARMUP_SECONDS":"0", "SALAD_G5_HASH_WINDOW_SECONDS":"20",
+                    "SALAD_G5_EXPECTED_SAMPLE_INTERVAL_SECONDS":"10", "SALAD_G5_REEVALUATION_INTERVAL_SECONDS":"5",
+                    "SALAD_G5_MINIMUM_SAMPLES_PER_WINDOW":"2", "SALAD_G5_MAXIMUM_SAMPLE_GAP_SECONDS":"10",
+                    "SALAD_G5_CONSECUTIVE_BAD_WINDOWS":"1",
+                })
+                monitor = runtime.Fl4shMonitor(config, start_monotonic=0)
+                monitor.observe_line(f"Device [1] {raw_name}: Initialized", now=0)
+                events = []
+                for instant in (0, 10, 20):
+                    events.extend(monitor.observe_line("Device [1] hashRate: 20.00 TH/s", now=instant))
+                    events.extend(monitor.tick(now=instant))
+                alert = next(event for event in events if event["state"] == "REALLOCATE_RECOMMENDED")
+                alert["timestamp_utc"] = EVENT_TIME
+                record = runtime.format_event(alert)
+                parsed = normalize_log_entry(log_entry(text_log=record))
+                self.assertEqual(parsed.alert.fields["gpu_key"], key)
+                self.assertEqual(parsed.identity.machine_id, "machine-1")
+                self.assertFalse(parsed.alert.fields["actions_performed"])
+                self.assertNotIn("machine_id", record)
+                missing = normalize_log_entry(log_entry(text_log=record, labels={"project_name":PROJECT}))
+                self.assertEqual(missing.identity.status, "UNKNOWN")
+                self.assertIsNone(missing.identity.machine_id)
+
+    def test_runtime_and_central_gpu_key_domains_and_length_limits_agree(self):
+        from log_alerts.normalize import _GPU_KEY_RE
+        runtime = load_generic_runtime_monitor()
+        keys = ("RTX_A5000", "H100_SXM", "GPU_5080", "A" + "1" * 127,
+                "A" + "1" * 128, "rtx_a4000", "RTX__3060", "RTX_3060_", "A10/T4", "A10\n")
+        for key in keys:
+            with self.subTest(key=key):
+                expected = runtime._is_canonical_gpu_key(key)
+                self.assertEqual(_GPU_KEY_RE.fullmatch(key) is not None, expected)
+                record = reallocation_line().replace("gpu_key=RTX_5080_LAPTOP", f"gpu_key={key}")
+                if expected:
+                    self.assertEqual(normalize_log_entry(log_entry(text_log=record)).alert.fields["gpu_key"], key)
+                else:
+                    with self.assertRaises(LogRecordError):
+                        normalize_log_entry(log_entry(text_log=record))
+
+    def test_generic_accepted_solutions_text_and_structured_match_runtime_grammar(self):
+        runtime = load_generic_runtime_monitor()
+        names = ("NVIDIA RTX A4000", "NVIDIA RTX A5000", "NVIDIA A100-SXM4-80GB", "NVIDIA L40S",
+                 "NVIDIA A10", "NVIDIA T4", "NVIDIA RTX 4000 Ada Generation", "NVIDIA GeForce RTX 5080",
+                 "NVIDIA RTX A4000 A5000", "NVIDIA A10 T4", "NVIDIA RTX A4000 Laptop Desktop GPU",
+                 "NVIDIA unknown", "NVIDIA RTX A4000/A5000", "NVIDIA RTX A4000; extra")
+        for raw in names:
+            text = f"Solutions accepted: 1-{raw}, 0 stale"
+            expected = runtime._is_solutions_accepted_recovery_line(text)
+            for structured in (False, True):
+                with self.subTest(raw=raw, structured=structured):
+                    entry = log_entry(text_log=None, structured_message={"message":text}) if structured else log_entry(text_log=text)
+                    parsed = normalize_log_entry(entry)
+                    self.assertEqual(parsed.pool_recovery_signal, expected)
+                    expected_hash = hashlib.sha256(text.encode()).hexdigest() if expected else None
+                    self.assertEqual(parsed.pool_recovery_signal_sha256, expected_hash)
+
+    def test_professional_pool_recovery_requires_exact_marker_hash_and_provider_resource(self):
+        accepted_text = "Solutions accepted: 1-NVIDIA RTX A4000, 0 stale"
+        evidence_hash = hashlib.sha256(accepted_text.encode()).hexdigest()
+        labels = provider_labels("synthetic-pro-machine", "synthetic-pro-instance", "fl4shminer")
+        failed = log_entry(text_log=pool_monitor_line("POOL_CONNECTION_FAILED"), labels=labels, log_id="pro-failed")
+        recovered = log_entry(text_log=pool_monitor_line("POOL_CONNECTION_RECOVERED", recovered_at="2026-10-13T12:00:30Z",
+                               solutions_evidence_sha256=evidence_hash).replace("gpu_key=RTX_5080_LAPTOP", "gpu_key=RTX_A4000"),
+                               labels=labels, log_id="pro-recovered", event_time="2026-10-13T12:00:31Z")
+        accepted = log_entry(text_log=accepted_text, labels=labels, log_id="pro-accepted", event_time="2026-10-13T12:00:32Z")
+        marker = log_entry(text_log=pool_recovery_evidence_line(timestamp="2026-10-13T12:00:30Z", evidence_sha256=evidence_hash),
+                           labels=labels, log_id="pro-marker", event_time="2026-10-13T12:00:30.500000Z")
+        for variant in ("valid", "missing", "wrong-hash", "wrong-resource", "wrong-session", "wrong-episode", "wrong-sequence", "wrong-time"):
+            with self.subTest(variant=variant):
+                entries = [failed, recovered, accepted]
+                if variant != "missing":
+                    candidate = dict(marker)
+                    if variant == "wrong-hash":
+                        candidate["text_log"] = marker["text_log"].replace(evidence_hash, "b" * 64)
+                    elif variant == "wrong-resource":
+                        candidate["resource"] = {"type":"salad.container_group_instance", "labels":provider_labels("other-machine", "other-instance")}
+                    elif variant == "wrong-session":
+                        candidate["text_log"] = marker["text_log"].replace(POOL_SESSION_ID, "99999999-9999-4999-8999-999999999999")
+                    elif variant == "wrong-episode":
+                        candidate["text_log"] = marker["text_log"].replace(POOL_EPISODE_ID, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+                    elif variant == "wrong-sequence":
+                        candidate["text_log"] = marker["text_log"].replace("pool_alert_sequence=2", "pool_alert_sequence=3")
+                    elif variant == "wrong-time":
+                        candidate["text_log"] = marker["text_log"].replace("12:00:30Z", "12:00:10Z")
+                    entries.append(candidate)
+                enricher, _, ledger = make_enricher(entries)
+                try:
+                    enricher.run_once(end_time_utc=END_TIME)
+                    rows = ledger.list_outbox()
+                    self.assertCountEqual([row["payload"]["event_type"] for row in rows],
+                                          ["POOL_CONNECTION_FAILED", "POOL_CONNECTION_RECOVERED"] if variant == "valid" else ["POOL_CONNECTION_FAILED"])
+                    if variant == "valid":
+                        recovery = next(row for row in rows if row["payload"]["event_type"] == "POOL_CONNECTION_RECOVERED")
+                        self.assertIn("Machine ID: synthetic-pro-machine", recovery["message_text"])
+                        self.assertNotIn(accepted_text, recovery["message_text"])
+                finally:
+                    ledger.close()
+
+
 class LogAlertNormalizerTests(unittest.TestCase):
     def test_fixture_cannot_claim_provider_observed_classification(self):
         raw = log_entry(text_log="ordinary synthetic log")

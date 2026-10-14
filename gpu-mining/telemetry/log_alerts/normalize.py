@@ -33,7 +33,12 @@ CUDA_FATAL_LINE = (
 )
 CUDA_EXIT_STATUS_LINE = "Fl4shMiner stopped: exit status 1"
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-_GPU_KEY_RE = re.compile(r"^RTX_[A-Z0-9]+(?:_[A-Z0-9]+)*$")
+MAX_GPU_KEY_CHARS = 128
+_GPU_KEY_RE = re.compile(r"(?=[A-Z0-9_]{1,128}\Z)[A-Z0-9]+(?:_[A-Z0-9]+)*")
+_NVIDIA_GPU_NAME_RE = re.compile(
+    r"NVIDIA +(?P<geforce>GeForce +)?"
+    r"(?P<name>[A-Za-z0-9]+(?:[ _-]+[A-Za-z0-9]+)*)", re.IGNORECASE,
+)
 _DEVICE_RE = re.compile(r"^fl4shminer_device:[0-9]{1,4}$")
 _POLICY_HASH_RE = re.compile(r"^[a-f0-9]{64}$")
 _UUID_RE = re.compile(
@@ -47,9 +52,9 @@ _POOL_LINE_RE = re.compile(
 )
 _POOL_RECOVERY_EVIDENCE_HASH_RE = re.compile(r"^[a-f0-9]{64}$")
 _SOLUTIONS_ACCEPTED_RE = re.compile(
-    r"^Solutions accepted:\s+[0-9]{1,10}-NVIDIA GeForce RTX "
-    r"[A-Za-z0-9 .+()/_-]{1,192}"
-    r"(?:,\s*(?:[0-9]{1,10} stale|stale=[0-9]{1,10}|[0-9]{1,10} accepted))?$",
+    r"Solutions accepted:\s+[0-9]{1,10}-"
+    r"(?P<gpu>NVIDIA [A-Za-z0-9 _-]{1,249})"
+    r"(?:,\s*(?:[0-9]{1,10} stale|stale=[0-9]{1,10}|[0-9]{1,10} accepted))?",
     re.IGNORECASE,
 )
 _CONFIG_INVALID_RE = re.compile(
@@ -1012,27 +1017,66 @@ def _startup_signal_from_structured(value: Any) -> str | None:
     return None
 
 
+def _is_solutions_accepted_line(text: str) -> bool:
+    """Keep the standalone runtime's bounded NVIDIA evidence grammar.
+
+    This checks syntax only. Resource/session/episode/hash correlation still
+    decides recovery; a miner name never proves provider identity.
+    """
+    if not isinstance(text, str) or len(text) > 256:
+        return False
+    solution = _SOLUTIONS_ACCEPTED_RE.fullmatch(text)
+    if solution is None:
+        return False
+    raw_name = solution.group("gpu")
+    if len(raw_name) > 256 or any(ord(char) < 32 or ord(char) > 126 for char in raw_name):
+        return False
+    match = _NVIDIA_GPU_NAME_RE.fullmatch(raw_name.strip())
+    if match is None:
+        return False
+    name = match.group("name").upper()
+    tokens = re.split(r"[ _-]+", name)
+    if tokens[-1] == "GPU":
+        tokens.pop()
+    if not tokens or any(token in {"NVIDIA", "GEFORCE", "GPU", "UNKNOWN", "SERIES", "FAMILY"} for token in tokens):
+        return False
+    if sum(bool(re.search(r"[0-9]", word)) for word in name.split()) != 1 or tokens.count("RTX") > 1:
+        return False
+    laptop_tags = {"LAPTOP", "NOTEBOOK", "MOBILE"}
+    forms = [token for token in tokens if token in laptop_tags | {"DESKTOP"}]
+    if len(forms) > 1:
+        return False
+    if forms:
+        form = "LAPTOP" if forms[0] in laptop_tags else "DESKTOP"
+        tokens = [token for token in tokens if token not in laptop_tags | {"DESKTOP"}]
+    elif match.group("geforce") and tokens in (["RTX", "5080"], ["RTX", "5090"]):
+        form = "DESKTOP"
+    else:
+        form = None
+    return _GPU_KEY_RE.fullmatch("_".join(tokens + ([form] if form else []))) is not None
+
+
 def _pool_recovery_signal_from_structured(value: Any) -> bool:
     if isinstance(value, str):
-        return _SOLUTIONS_ACCEPTED_RE.fullmatch(value) is not None
+        return _is_solutions_accepted_line(value)
     if not isinstance(value, Mapping):
         return False
     for key in ("message", "text"):
         message = value.get(key)
-        if isinstance(message, str) and _SOLUTIONS_ACCEPTED_RE.fullmatch(message):
+        if isinstance(message, str) and _is_solutions_accepted_line(message):
             return True
     return False
 
 
 def _recovery_signal_text(value: Any) -> str | None:
     if isinstance(value, str):
-        return value if _SOLUTIONS_ACCEPTED_RE.fullmatch(value) else None
+        return value if _is_solutions_accepted_line(value) else None
     if not isinstance(value, Mapping):
         return None
     candidates = [
         message for key in ("message", "text")
         if isinstance((message := value.get(key)), str)
-        and _SOLUTIONS_ACCEPTED_RE.fullmatch(message)
+        and _is_solutions_accepted_line(message)
     ]
     if len(set(candidates)) > 1:
         raise LogRecordError("structured pool recovery evidence conflicts")
@@ -1238,7 +1282,7 @@ def _normalize_log_entry(
         alert, marker = None, None
         alert_source = None
     text_recovery = (
-        text_log if isinstance(text_log, str) and _SOLUTIONS_ACCEPTED_RE.fullmatch(text_log) else None
+        text_log if isinstance(text_log, str) and _is_solutions_accepted_line(text_log) else None
     )
     structured_recovery = _recovery_signal_text(structured_copy)
     if text_recovery is not None and structured_recovery is not None and text_recovery != structured_recovery:

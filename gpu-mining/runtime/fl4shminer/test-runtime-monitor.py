@@ -116,7 +116,7 @@ class MonitorConfigTests(unittest.TestCase):
                 )
         with self.assertRaises(MONITOR.MonitorConfigError):
             MONITOR.MonitorConfig.from_env(
-                {"FL4SH_MONITOR_ENABLED": "1", "FL4SH_MONITOR_PROFILE": "GPU_5090"},
+                {"FL4SH_MONITOR_ENABLED": "1", "FL4SH_MONITOR_PROFILE": "GPU__5090"},
                 require_enabled=True,
             )
 
@@ -255,7 +255,7 @@ class MonitorConfigTests(unittest.TestCase):
             '{"RTX_5080_LAPTOP":10001}',
             '{"RTX_5080_LAPTOP":NaN}',
             '{"RTX_5080_LAPTOP":Infinity}',
-            '{"GPU_5080":110}',
+            '{"GPU__5080":110}',
             '{"rtx_5080_laptop":110}',
             '{"RTX_5080_LAPTOP":110,"RTX_5080_LAPTOP":111}',
             '{"RTX_5080_LAPTOP":110,"rtx_5080_laptop":111}',
@@ -293,6 +293,200 @@ class MonitorConfigTests(unittest.TestCase):
         self.assertEqual(config.profile, "RTX_5080_LAPTOP")
         self.assertEqual(config.floor_ths, 110)
         self.assertEqual(config.floor_source, "ENV_REGISTRY")
+
+
+class GenericGpuContractTests(unittest.TestCase):
+    """Operator registry numbers below are SYNTHETIC TEST ONLY."""
+
+    def assert_registry_key(self, key: str) -> None:
+        config = make_auto_config(FL4SH_MONITOR_GPU_FLOORS_JSON=MONITOR.json.dumps({key: 45}))
+        self.assertEqual(dict(config.floor_registry)[key], 45)
+
+    def test_01_rtx_3060_registry_key(self) -> None:
+        self.assert_registry_key("RTX_3060")
+
+    def test_02_rtx_a4000_registry_key(self) -> None:
+        self.assert_registry_key("RTX_A4000")
+
+    def test_03_rtx_a5000_registry_key(self) -> None:
+        self.assert_registry_key("RTX_A5000")
+
+    def test_04_a100_registry_key(self) -> None:
+        self.assert_registry_key("A100_SXM4_80GB")
+
+    def test_05_accelerator_registry_keys_independently(self) -> None:
+        for key in ("L40S", "A10", "T4", "H100_SXM"):
+            with self.subTest(key=key):
+                self.assert_registry_key(key)
+
+    def test_06_lowercase_keys_fail_closed(self) -> None:
+        for key in ("rtx_a4000", "Rtx_A4000", "l40s", "A100_sxm4_80gb"):
+            with self.subTest(key=key), self.assertRaises(MONITOR.MonitorConfigError):
+                make_auto_config(FL4SH_MONITOR_GPU_FLOORS_JSON=MONITOR.json.dumps({key: 45}))
+
+    def test_07_duplicates_and_case_aliases_fail_closed(self) -> None:
+        for raw in ('{"RTX_A4000":45,"RTX_A4000":46}', '{"RTX_A4000":45,"rtx_a4000":46}'):
+            with self.subTest(raw=raw), self.assertRaises(MONITOR.MonitorConfigError) as caught:
+                make_auto_config(FL4SH_MONITOR_GPU_FLOORS_JSON=raw)
+            self.assertNotIn(raw, str(caught.exception))
+
+    def test_08_malformed_keys_and_raw_names_fail_closed(self) -> None:
+        for key in ("A__10", "_A10", "A10_", "A10.T4", "A10/T4", "A10\n", "A10\x00"):
+            with self.subTest(key=key), self.assertRaises(MONITOR.MonitorConfigError):
+                self.assert_registry_key(key)
+        for raw in ("NVIDIA RTX A4000/A5000", "NVIDIA A10\x00", "NVIDIA RTX A4000 + A5000",
+                    "NVIDIA RTX A4000 A5000", "NVIDIA A10 T4", "NVIDIA RTX A4000 RTX A5000",
+                    "NVIDIA A10 NVIDIA T4", "NVIDIA GeForce RTX 3060 Series", "RTX A4000"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(MONITOR.normalize_gpu_identity(raw))
+
+    def test_09_key_length_is_bounded_before_conversion(self) -> None:
+        key = "A" + "1" * 127
+        self.assert_registry_key(key)
+        self.assertEqual(MONITOR.normalize_gpu_identity("NVIDIA " + key), key)
+        for invalid in (key + "1", "RTX_3060_" + "TI_" * 40 + "TI"):
+            with self.subTest(key=invalid), self.assertRaises(MONITOR.MonitorConfigError):
+                self.assert_registry_key(invalid)
+            self.assertIsNone(MONITOR.normalize_gpu_identity("NVIDIA " + invalid))
+
+    def test_10_nvidia_professional_names(self) -> None:
+        cases = {
+            "NVIDIA RTX A4000": "RTX_A4000", "NVIDIA RTX A5000": "RTX_A5000",
+            "NVIDIA RTX 4000 Ada Generation": "RTX_4000_ADA_GENERATION",
+            "NVIDIA A100-SXM4-80GB": "A100_SXM4_80GB", "NVIDIA L40S": "L40S",
+            "NVIDIA A10": "A10", "NVIDIA T4": "T4", "NVIDIA H100-SXM": "H100_SXM",
+        }
+        for raw, key in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(MONITOR.normalize_gpu_identity(raw), key)
+
+    def test_11_geforce_3060_normalizes_without_desktop_inference(self) -> None:
+        self.assertEqual(MONITOR.normalize_gpu_identity("NVIDIA GeForce RTX 3060"), "RTX_3060")
+
+    def test_12_explicit_form_factors(self) -> None:
+        for marker, suffix in (("Laptop", "LAPTOP"), ("Notebook", "LAPTOP"), ("Mobile", "LAPTOP"), ("Desktop", "DESKTOP")):
+            with self.subTest(marker=marker):
+                self.assertEqual(MONITOR.normalize_gpu_identity(f"NVIDIA RTX A4000 {marker} GPU"), f"RTX_A4000_{suffix}")
+
+    def test_13_no_variant_or_model_floor_fallback(self) -> None:
+        config = make_auto_config(FL4SH_MONITOR_GPU_FLOORS_JSON='{"RTX_3060_LAPTOP":45,"RTX_3060_DESKTOP":50,"RTX_A5000":55}')
+        for raw, key in (("NVIDIA GeForce RTX 3060", "RTX_3060"), ("NVIDIA RTX A4000", "RTX_A4000")):
+            with self.subTest(key=key):
+                monitor = MONITOR.Fl4shMonitor(config, start_monotonic=0)
+                event = monitor.observe_line(f"Device [1] {raw}: Initialized", now=0)[0]
+                self.assertEqual(event["gpu_key"], key)
+                self.assertIsNone(event["floor_ths"])
+        neutral_only = make_auto_config(FL4SH_MONITOR_GPU_FLOORS_JSON='{"RTX_A4000":45}')
+        for form in ("Laptop", "Desktop"):
+            monitor = MONITOR.Fl4shMonitor(neutral_only, start_monotonic=0)
+            self.assertIsNone(monitor.observe_line(f"Device [1] NVIDIA RTX A4000 {form} GPU: Initialized", now=0)[0]["floor_ths"])
+
+    def test_14_contradictory_form_factors_are_unknown(self) -> None:
+        for markers in ("Laptop Desktop", "Notebook Mobile", "Desktop Laptop", "Laptop Laptop"):
+            with self.subTest(markers=markers):
+                self.assertIsNone(MONITOR.normalize_gpu_identity(f"NVIDIA RTX A4000 {markers} GPU"))
+
+    def test_15_exact_5080_5090_exceptions_only(self) -> None:
+        for model in ("5080", "5090"):
+            self.assertEqual(MONITOR.normalize_gpu_identity(f"NVIDIA GeForce RTX {model}"), f"RTX_{model}_DESKTOP")
+            self.assertEqual(MONITOR.normalize_gpu_identity(f"NVIDIA GeForce RTX {model} Laptop GPU"), f"RTX_{model}_LAPTOP")
+            self.assertEqual(MONITOR.normalize_gpu_identity(f"NVIDIA RTX {model}"), f"RTX_{model}")
+        self.assertEqual(MONITOR.normalize_gpu_identity("NVIDIA GeForce RTX 3060 GPU"), "RTX_3060")
+
+    def test_16_all_generic_sources_corroborate_without_promoting_secondary(self) -> None:
+        config = make_auto_config(FL4SH_MONITOR_GPU_FLOORS_JSON='{"RTX_A4000":45}')
+        monitor = MONITOR.Fl4shMonitor(config, start_monotonic=0)
+        pearl = "GPU=NVIDIA RTX A4000 Pearl autotune hashrate = 9999 TH/s"
+        solutions = "Solutions accepted: 1-NVIDIA RTX A4000, 0 stale"
+        monitor.observe_line(solutions, now=0)
+        monitor.observe_line(pearl, now=1)
+        state = monitor.devices[1]
+        self.assertFalse(state.identity_primary_seen)
+        self.assertIsNone(state.gpu_key)
+        self.assertIsNone(monitor._effective_floor(state)[0])
+        self.assertEqual(len(state.samples), 0)
+        detected = monitor.observe_line("Device [1] NVIDIA RTX A4000: Initialized", now=2)[0]
+        self.assertEqual((detected["gpu_key"], detected["floor_ths"]), ("RTX_A4000", 45))
+        monitor.observe_line(pearl, now=3)
+        monitor.observe_line(solutions, now=4)
+        self.assertEqual(state.identity_sources, {"device_initialized", "pearl_autotune_model", "solutions_accepted_model"})
+        self.assertEqual(len(state.samples), 0)
+        conflict = monitor.observe_line("Solutions accepted: 1-NVIDIA RTX A5000, 0 stale", now=5)[0]
+        self.assertEqual(conflict["state"], "GPU_IDENTITY_CONFLICT")
+        self.assertIsNone(conflict["floor_ths"])
+        self.assertFalse(conflict["actions_performed"])
+
+    def test_17_professional_solution_recovers_pool_once_with_evidence_hash(self) -> None:
+        emitted: list[tuple[str, dict]] = []
+        audit: list[str] = []
+        notifier = SimpleNamespace(audit=audit.append, submit=lambda name, event, **_kwargs: emitted.append((name, event)))
+        now = [0.0]
+        coordinator = MONITOR.TelegramAlertCoordinator(notifier, make_telegram_config(), monotonic=lambda: now[0],
+                                                     monitor_session_id="44444444-4444-4444-8444-444444444444")
+        monitor = MONITOR.Fl4shMonitor(make_auto_config(), start_monotonic=0)
+        coordinator.stdout_line(POOL_CONNECTION_FAILED_WITHOUT_TIMESTAMP, monitor)
+        now[0] = 10.0
+        accepted = "Solutions accepted: 1-NVIDIA RTX A4000, 0 stale"
+        coordinator.stdout_line(accepted, monitor)
+        coordinator.stdout_line(accepted, monitor)
+        self.assertEqual([name for name, _ in emitted], ["POOL_CONNECTION_FAILED", "POOL_CONNECTION_RECOVERED"])
+        recovered = emitted[-1][1]
+        self.assertEqual(recovered["solutions_evidence_sha256"], MONITOR.hashlib.sha256(accepted.encode()).hexdigest())
+        self.assertEqual(recovered["pool_alert_sequence"], 2)
+        self.assertFalse(recovered["actions_performed"])
+        self.assertEqual(sum("state=POOL_RECOVERY_EVIDENCE" in entry for entry in audit), 1)
+        for invalid in ("Solutions accepted: 1-NVIDIA arbitrary", "Solutions accepted: 1-NVIDIA RTX A4000 A5000",
+                        "Solutions accepted: 1-NVIDIA RTX A4000 Laptop Desktop GPU", "Solutions accepted: 1-NVIDIA RTX A4000; extra"):
+            with self.subTest(line=invalid):
+                self.assertFalse(MONITOR._is_solutions_accepted_recovery_line(invalid))
+
+    def test_19_generic_identity_without_floor_never_recommends(self) -> None:
+        config = make_auto_config()
+        self.assertNotIn("RTX_A4000", dict(config.floor_registry))
+        monitor = MONITOR.Fl4shMonitor(config, start_monotonic=0)
+        monitor.observe_line("Device [1] NVIDIA RTX A4000: Initialized", now=0)
+        events = []
+        for instant in (0, 10, 20, 30):
+            events.extend(monitor.observe_line(line(1), now=instant))
+        self.assertTrue(any(event["state"] == "NO_FLOOR_CONFIGURED" for event in events))
+        self.assertFalse(any(event["state"] == "REALLOCATE_RECOMMENDED" for event in events))
+
+    def test_20_generic_floor_changes_policy_hash(self) -> None:
+        one = make_auto_config(FL4SH_MONITOR_GPU_FLOORS_JSON='{"RTX_A4000":45}')
+        two = make_auto_config(FL4SH_MONITOR_GPU_FLOORS_JSON='{"RTX_A4000":46}')
+        self.assertNotEqual(one.policy_hash, two.policy_hash)
+
+    def test_synthetic_operator_ten_key_registry_and_existing_limits(self) -> None:
+        registry = {"RTX_3060":25, "RTX_A4000":45, "RTX_3090":110, "RTX_3090_TI":110,
+                    "RTX_5070":120, "RTX_5070_TI":165, "RTX_5080_LAPTOP":105, "RTX_5090_LAPTOP":110,
+                    "RTX_5080_DESKTOP":209, "RTX_5090_DESKTOP":350}
+        config = make_auto_config(FL4SH_MONITOR_GPU_FLOORS_JSON=MONITOR.json.dumps(registry))
+        self.assertEqual(dict(config.floor_registry), registry)
+        for raw in (MONITOR.json.dumps({f"GPU_{index}":45 for index in range(65)}),
+                    " " * (16 * 1024 + 1), '{"RTX_A4000":true}', '{"RTX_A4000":10001}'):
+            with self.subTest(size=len(raw)), self.assertRaises(MONITOR.MonitorConfigError):
+                make_auto_config(FL4SH_MONITOR_GPU_FLOORS_JSON=raw)
+
+    def test_generic_supervisor_preserves_original_stdout(self) -> None:
+        raw_lines = ["Device [1] NVIDIA RTX A4000: Initialized",
+                     "GPU=NVIDIA RTX A4000 Pearl autotune hashrate = 9999 TH/s",
+                     "Solutions accepted: 1-NVIDIA RTX A4000, 0 stale",
+                     "Device [1] hashRate: 46.00 TH/s"]
+        environment = {
+            "SystemRoot": os.environ.get("SystemRoot", r"C:\Windows"),
+            "FL4SH_MONITOR_ENABLED":"1", "FL4SH_MONITOR_GPU_FLOORS_JSON":'{"RTX_A4000":45}',
+        }
+        child = "\n".join(f"print({raw!r}, flush=True)" for raw in raw_lines)
+        completed = subprocess.run([sys.executable, str(ROOT / "fl4sh-runtime-monitor.py"), "--",
+                                    sys.executable, "-c", child], env=environment, capture_output=True, timeout=10)
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", "replace"))
+        output = completed.stdout.decode("utf-8", "replace")
+        for raw in raw_lines:
+            self.assertEqual(output.splitlines().count(raw), 1)
+        self.assertIn("gpu_key=RTX_A4000", output)
+        self.assertIn("floor_ths=45", output)
+        self.assertNotIn("machine_id=", output)
+        self.assertNotIn("REALLOCATE_RECOMMENDED", output)
 
 
 class TelegramAuditTests(unittest.TestCase):
