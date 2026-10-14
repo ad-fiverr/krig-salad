@@ -2,12 +2,16 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/../../.." && pwd)"
 ENTRYPOINT="$SCRIPT_DIR/fl4sh-entrypoint.sh"
 HEALTHCHECK="$SCRIPT_DIR/fl4sh-healthcheck.sh"
 VERIFIER="$SCRIPT_DIR/verify-artifact.sh"
 LOCK="$SCRIPT_DIR/fl4sh-release.lock"
 MONITOR="$SCRIPT_DIR/fl4sh-runtime-monitor.py"
 MONITOR_TESTS="$SCRIPT_DIR/test-runtime-monitor.py"
+FLEET_SMOKE="$SCRIPT_DIR/ci-fleet-image-smoke.py"
+DOCKERFILE="$SCRIPT_DIR/Dockerfile"
+DOCKER_CONTEXT_IGNORE="$SCRIPT_DIR/Dockerfile.dockerignore"
 
 fail() {
   printf 'ci-smoke-test: %s\n' "$*" >&2
@@ -20,7 +24,9 @@ mode="${1:-}"
 
 # Keep developer or CI notifier credentials out of this isolated smoke process.
 unset FL4SH_TELEGRAM_ENABLED FL4SH_TELEGRAM_BOT_TOKEN FL4SH_TELEGRAM_CHAT_ID \
-  FL4SH_TELEGRAM_POOL_ERROR_COOLDOWN_SECONDS FL4SH_MONITOR_LABEL || true
+  FL4SH_TELEGRAM_POOL_ERROR_COOLDOWN_SECONDS FL4SH_MONITOR_LABEL \
+  SALAD_API_KEY SALAD_API_TOKEN TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID \
+  GOOGLE_APPLICATION_CREDENTIALS FIREBASE_CONFIG || true
 
 if [[ "$mode" == --source ]]; then
   for script in "$ENTRYPOINT" "$HEALTHCHECK" "$VERIFIER" "$SCRIPT_DIR/ci-smoke-test.sh"; do
@@ -29,18 +35,20 @@ if [[ "$mode" == --source ]]; then
   bash "$VERIFIER" --lock-only
 
   cuda_base='nvidia/cuda:12.8.2-runtime-ubuntu22.04@sha256:f442e45b864e8e3fcb53764f69a011d494d402812ef4abec104621b508264a91'
-  [[ "$(grep -Fc "$cuda_base" "$SCRIPT_DIR/Dockerfile")" -eq 2 ]] ||
+  [[ "$(grep -Fc "$cuda_base" "$DOCKERFILE")" -eq 2 ]] ||
     fail "both Docker stages must use the pinned CUDA base"
-  ! grep -Eq '^[[:space:]]*EXPOSE[[:space:]]' "$SCRIPT_DIR/Dockerfile" ||
+  ! grep -Eq '^[[:space:]]*EXPOSE[[:space:]]' "$DOCKERFILE" ||
     fail "Dockerfile must not expose a port"
-  grep -Fq 'apt-get install -y --no-install-recommends python3' "$SCRIPT_DIR/Dockerfile" ||
+  grep -Fq 'apt-get install -y --no-install-recommends python3' "$DOCKERFILE" ||
     fail "final image must install the Python standard library needed by the opt-in monitor"
-  ! grep -Fq 'python3-minimal' "$SCRIPT_DIR/Dockerfile" ||
+  ! grep -Fq 'python3-minimal' "$DOCKERFILE" ||
     fail "final image must not substitute the incomplete minimal Python runtime"
-  grep -Fq 'COPY --chmod=0555 fl4sh-runtime-monitor.py /opt/fl4shminer/fl4sh-runtime-monitor.py' "$SCRIPT_DIR/Dockerfile" ||
+  grep -Fq 'COPY --chmod=0555 gpu-mining/runtime/fl4shminer/fl4sh-runtime-monitor.py /opt/fl4shminer/fl4sh-runtime-monitor.py' "$DOCKERFILE" ||
     fail "final image does not contain the runtime monitor"
-  grep -Fxq '!fl4sh-runtime-monitor.py' "$SCRIPT_DIR/.dockerignore" ||
-    fail "Docker context does not allow the runtime monitor source"
+  grep -Fxq '!gpu-mining/runtime/fl4shminer/fl4sh-runtime-monitor.py' "$DOCKER_CONTEXT_IGNORE" ||
+    fail "root Docker context does not allow the runtime monitor source"
+  grep -Fxq '!gpu-mining/telemetry/collector/g4a_salad_get.py' "$DOCKER_CONTEXT_IGNORE" ||
+    fail "root Docker context does not allow the exact G4A resolver source"
   if grep -Eq 'FL4SH_MINING_ID=.*(PASSWORD|TOKEN|SECRET)|FL4SH_POOL_URL=.*(@|password=)' "$ENTRYPOINT"; then
     fail "entrypoint contains an unsafe credential pattern"
   fi
@@ -49,6 +57,9 @@ if [[ "$mode" == --source ]]; then
     python_bin=python
   fi
   command -v "$python_bin" >/dev/null 2>&1 || fail "Python is required for isolated smoke checks"
+  [[ -f "$FLEET_SMOKE" ]] || fail "central watcher smoke source is required"
+  "$python_bin" -B "$FLEET_SMOKE" --source --repo-root "$REPO_ROOT" ||
+    fail "central watcher source/package boundary smoke failed"
   temporary="$(mktemp -d)"
   trap 'rm -rf -- "$temporary"' EXIT
   [[ -f "$MONITOR" && -f "$MONITOR_TESTS" ]] || fail "runtime monitor source and tests are required"
@@ -281,7 +292,7 @@ PY
     [[ "${monitor_args[$index]}" == "${expected_monitor_args[$index]}" ]] ||
       fail "opt-in monitor miner argument mismatch at index $index"
   done
-  printf 'source smoke passed: lock, scripts, workflow YAML, monitor tests, config redaction, and opt-in/off argv capture\n'
+  printf 'source smoke passed: lock, scripts, workflow YAML, monitor tests, central watcher boundary, config redaction, and opt-in/off argv capture\n'
   exit 0
 fi
 
@@ -349,4 +360,5 @@ grep -Fq 'miner was not started; CUDA compatibility was not tested' /tmp/fl4sh-m
 if "$HEALTHCHECK" >/dev/null 2>&1; then
   fail "liveness healthcheck unexpectedly passed outside a running miner container"
 fi
-printf 'image smoke passed: installed hash/ELF/config/monitor/liveness checks; miner and network were not used\n'
+python3 -B "$FLEET_SMOKE" --image || fail "central watcher image boundary smoke failed"
+printf 'image smoke passed: installed hash/ELF/config/monitor/liveness and central watcher checks; miner and network were not used\n'

@@ -85,6 +85,14 @@ It verifies the required Python standard-library imports, installed binary hash 
 
 The independent GitHub Actions workflow builds and smoke-tests a local linux/amd64 image before Docker Hub login. On main only, it publishes the same image as 1.5.2, sha-<12-character-commit>, and latest, then checks that all tags resolve to the published digest. Required repository secrets are DOCKERHUB_USERNAME and DOCKERHUB_TOKEN. The destination is fixed to docker.io/myblockchaincompany/fl4shminer-salad.
 
+### Unified miner and central watcher image
+
+The image packages the miner runtime with the current `log_alerts` central fleet watcher and only its two required repository dependencies: `collector/g4a_salad_get.py` and `g4c-live/live_secret_boundary.py`. The Dockerfile-specific ignore file starts from a deny-all repository-root context and allows exact required files. It does not copy the rest of the repository, all of `collector/`, tests, credentials, SQLite state, logs, CSV evidence, or unrelated telemetry. The offline fleet image smoke verifies the exact source allowlist and, inside CI, the installed image inventory and imports.
+
+The default entrypoint continues to start Fl4shMiner, including its existing optional local monitor behavior. The central watcher is a separate CLI capability and never starts automatically in miner replicas. A dedicated, separately authorized watcher process can invoke `python3 -m log_alerts.live_cli`; the image sets `PYTHONPATH=/opt/fl4shminer/gpu-mining/telemetry`. The watcher smoke blocks network, DNS, credential prompts, and delivery, and verifies that live reads remain disabled by default. Packaging the watcher does not enable live operations.
+
+The workflow rebuilds for changes under `gpu-mining/runtime/fl4shminer/**`, any source under `gpu-mining/telemetry/log_alerts/**`, the exact `gpu-mining/telemetry/collector/g4a_salad_get.py` resolver, the exact `gpu-mining/g4c-live/live_secret_boundary.py` secret boundary, and the workflow itself. Both CI and publication builds use the repository root as context and the explicit Fl4sh Dockerfile. OCI `source` identifies this repository, `revision` is the full integration commit SHA, and `version` remains Fl4shMiner `1.5.2`; the immutable digest identifies a concrete image build.
+
 Use the immutable docker.io/myblockchaincompany/fl4shminer-salad@sha256:<digest> reference reported by the successful workflow for a later Salad test. The digest is created by the publish run and must be copied from that run; a mutable tag is not deployment evidence.
 
 ## Salad test boundary

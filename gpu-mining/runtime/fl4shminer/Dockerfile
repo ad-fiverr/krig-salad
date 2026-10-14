@@ -1,4 +1,5 @@
-# Fl4shMiner v1.5.2 PRL runtime. Keep this image isolated from KRig.
+# Fl4shMiner v1.5.2 PRL runtime plus the separately invoked central watcher.
+# Both build stages use the repository root as their context.
 FROM --platform=linux/amd64 nvidia/cuda:12.8.2-runtime-ubuntu22.04@sha256:f442e45b864e8e3fcb53764f69a011d494d402812ef4abec104621b508264a91 AS artifact
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -7,28 +8,38 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build/fl4shminer
-COPY fl4sh-release.lock verify-artifact.sh ./
+COPY gpu-mining/runtime/fl4shminer/fl4sh-release.lock gpu-mining/runtime/fl4shminer/verify-artifact.sh ./
 RUN chmod 0555 verify-artifact.sh \
     && ./verify-artifact.sh --download-and-verify /opt/fl4shminer
 
 FROM --platform=linux/amd64 nvidia/cuda:12.8.2-runtime-ubuntu22.04@sha256:f442e45b864e8e3fcb53764f69a011d494d402812ef4abec104621b508264a91
 
-# The opt-in log supervisor needs Python's standard library. Keep the final
-# stage free of pip, compilers, downloaders, and build tooling.
+# The opt-in miner supervisor and central CLI need Python's standard library.
+# Keep the final stage free of pip, compilers, downloaders, and build tooling.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 \
     && rm -rf /var/lib/apt/lists/*
 
-LABEL org.opencontainers.image.title="Fl4shMiner Salad runtime" \
-      org.opencontainers.image.description="Isolated Fl4shMiner v1.5.2 PRL/PearlHash runtime; Salad GPU and pool behavior require a later lab" \
+ARG IMAGE_REVISION=unknown
+LABEL org.opencontainers.image.title="Fl4shMiner Salad runtime and central watcher" \
+      org.opencontainers.image.description="Fl4shMiner v1.5.2 PRL runtime with a separately invoked, disabled-by-default central Salad log watcher" \
       org.opencontainers.image.version="1.5.2" \
-      org.opencontainers.image.source="https://github.com/Fl4sh9174/Fl4shMiner"
+      org.opencontainers.image.source="https://github.com/ad-fiverr/krig-salad" \
+      org.opencontainers.image.revision="${IMAGE_REVISION}"
 
 WORKDIR /opt/fl4shminer
+ENV PYTHONPATH=/opt/fl4shminer/gpu-mining/telemetry
 COPY --from=artifact --chmod=0555 /opt/fl4shminer/fl4shminer /opt/fl4shminer/fl4shminer
-COPY --chmod=0555 fl4sh-entrypoint.sh fl4sh-healthcheck.sh verify-artifact.sh ci-smoke-test.sh /opt/fl4shminer/
-COPY --chmod=0555 fl4sh-runtime-monitor.py /opt/fl4shminer/fl4sh-runtime-monitor.py
-COPY fl4sh-release.lock README.md /opt/fl4shminer/
+COPY --chmod=0555 gpu-mining/runtime/fl4shminer/fl4sh-entrypoint.sh gpu-mining/runtime/fl4shminer/fl4sh-healthcheck.sh gpu-mining/runtime/fl4shminer/verify-artifact.sh gpu-mining/runtime/fl4shminer/ci-smoke-test.sh /opt/fl4shminer/
+COPY --chmod=0555 gpu-mining/runtime/fl4shminer/fl4sh-runtime-monitor.py /opt/fl4shminer/fl4sh-runtime-monitor.py
+COPY --chmod=0555 gpu-mining/runtime/fl4shminer/ci-fleet-image-smoke.py /opt/fl4shminer/ci-fleet-image-smoke.py
+COPY gpu-mining/runtime/fl4shminer/fl4sh-release.lock gpu-mining/runtime/fl4shminer/README.md /opt/fl4shminer/
+
+# Explicit Python-module allowlist. collector is intentionally a namespace
+# package here: do not copy collector/__init__.py or unrelated telemetry.
+COPY gpu-mining/telemetry/log_alerts/__init__.py gpu-mining/telemetry/log_alerts/central_telegram.py gpu-mining/telemetry/log_alerts/contract.py gpu-mining/telemetry/log_alerts/cuda_guard.py gpu-mining/telemetry/log_alerts/delivery.py gpu-mining/telemetry/log_alerts/engine.py gpu-mining/telemetry/log_alerts/fleet_targets.py gpu-mining/telemetry/log_alerts/fleet_watcher.py gpu-mining/telemetry/log_alerts/ledger.py gpu-mining/telemetry/log_alerts/list_instances_lookup.py gpu-mining/telemetry/log_alerts/live_adapter.py gpu-mining/telemetry/log_alerts/live_capability.py gpu-mining/telemetry/log_alerts/live_cli.py gpu-mining/telemetry/log_alerts/live_controller.py gpu-mining/telemetry/log_alerts/live_transport.py gpu-mining/telemetry/log_alerts/normalize.py gpu-mining/telemetry/log_alerts/startup_guard.py /opt/fl4shminer/gpu-mining/telemetry/log_alerts/
+COPY gpu-mining/telemetry/collector/g4a_salad_get.py /opt/fl4shminer/gpu-mining/telemetry/collector/g4a_salad_get.py
+COPY gpu-mining/g4c-live/live_secret_boundary.py /opt/fl4shminer/gpu-mining/g4c-live/live_secret_boundary.py
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 CMD ["/opt/fl4shminer/fl4sh-healthcheck.sh"]
 ENTRYPOINT ["/opt/fl4shminer/fl4sh-entrypoint.sh"]
