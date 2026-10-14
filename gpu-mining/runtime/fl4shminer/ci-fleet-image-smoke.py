@@ -271,13 +271,14 @@ def check_workflow(root: Path) -> None:
     required_probe_parts = (
         "https://auth.docker.io/token?",
         "https://registry-1.docker.io/v2/",
-        "--request HEAD",
+        "--request GET",
         "--dump-header -",
+        "--output /dev/null",
         "--write-out",
         "--registry-manifest-response",
     )
     if any(part not in previous_body for part in required_probe_parts):
-        fail("previous digest lookup is missing its authenticated HTTPS Registry V2 probe")
+        fail("previous digest lookup is missing its authenticated HTTPS Registry V2 GET probe")
     if "imagetools inspect" in previous_body or "|| true" in previous_body:
         fail("previous digest lookup must not mask registry failures")
     if "--location" in previous_body or re.search(r"(?m)^\s+-L(?:\s|$)", previous_body):

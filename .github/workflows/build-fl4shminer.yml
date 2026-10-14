@@ -117,7 +117,7 @@ jobs:
           unset token_response
           manifest_url="https://registry-1.docker.io/v2/$repository/manifests/$VERSION"
           manifest_response="$(curl --proto '=https' --tlsv1.2 --connect-timeout 5 --max-time 15 --silent --show-error \
-            --request HEAD --dump-header - --output /dev/null \
+            --request GET --dump-header - --output /dev/null \
             --write-out '__REGISTRY_HTTP_STATUS__%{http_code}' \
             --header "Authorization: Bearer $registry_token" \
             --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
