@@ -18,7 +18,7 @@ class DeliveryAttempt:
 
 
 class DeliveryCoordinator:
-    """Dispatch only keys created by the current successful provider cycle."""
+    """Dispatch bounded durable alerts only after identity has been verified."""
 
     def __init__(self, ledger: SQLiteAlertLedger, sender: CentralTelegramSender):
         if type(ledger) is not SQLiteAlertLedger or type(sender) is not CentralTelegramSender:

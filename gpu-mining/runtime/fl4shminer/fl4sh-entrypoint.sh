@@ -23,6 +23,39 @@ if [[ "$#" -gt 0 && ( "$#" -ne 1 || ( "$1" != --validate-config && "$1" != --che
   fail "container command overrides are disabled; only --validate-config and --check-runtime are supported for smoke checks"
 fi
 
+container_role="${FL4SH_ROLE:-miner}"
+case "$container_role" in
+  miner) ;;
+  central)
+    [[ "$#" -eq 0 ]] || fail "central role does not accept command overrides"
+    [[ "${FL4SH_MONITOR_ENABLED:-0}" == 0 ]] || fail "central role cannot start with the miner monitor enabled"
+    [[ "${FL4SH_TELEGRAM_ENABLED:-0}" == 0 ]] || fail "central role requires local Telegram notifier disabled"
+    [[ -n "${FL4SH_CENTRAL_TARGETS_FILE:-}" ]] || fail "FL4SH_CENTRAL_TARGETS_FILE is required"
+    [[ -n "${FL4SH_CENTRAL_QUERY:-}" ]] || fail "FL4SH_CENTRAL_QUERY is required"
+    [[ -n "${FL4SH_CENTRAL_STATE_DIR:-}" ]] || fail "FL4SH_CENTRAL_STATE_DIR is required"
+    central_poll="${FL4SH_CENTRAL_POLL_SECONDS:-30}"
+    [[ "$central_poll" =~ ^[0-9]{1,3}$ ]] || fail "FL4SH_CENTRAL_POLL_SECONDS must be an integer"
+    central_poll_number=$((10#$central_poll))
+    (( central_poll_number >= 15 && central_poll_number <= 300 )) ||
+      fail "FL4SH_CENTRAL_POLL_SECONDS must be between 15 and 300"
+    command -v python3 >/dev/null 2>&1 || fail "Python 3 is required for central role"
+    # Miner-local Telegram credentials are never needed by the central CLI.
+    unset FL4SH_TELEGRAM_BOT_TOKEN FL4SH_TELEGRAM_CHAT_ID
+    printf 'starting central provider-identity watcher; Salad reads and Telegram remain per-invocation gated\n'
+    exec python3 -m log_alerts.live_cli \
+      --watch-live-alerts \
+      --enable-live-read \
+      --enable-central-telegram \
+      --confirm-live CENTRAL_FLEET_MONITOR \
+      --targets-file "$FL4SH_CENTRAL_TARGETS_FILE" \
+      --query "$FL4SH_CENTRAL_QUERY" \
+      --state-dir "$FL4SH_CENTRAL_STATE_DIR" \
+      --ledger-path "$FL4SH_CENTRAL_STATE_DIR/alerts.sqlite3" \
+      --poll-seconds "$central_poll_number"
+    ;;
+  *) fail "FL4SH_ROLE must be miner or central" ;;
+esac
+
 [[ -n "${FL4SH_POOL_URL:-}" ]] || fail "FL4SH_POOL_URL is required; select an explicit stratum+tcp host and port"
 [[ -n "${FL4SH_MINING_ID:-}" ]] || fail "FL4SH_MINING_ID is required"
 
@@ -53,6 +86,9 @@ telegram_enabled="${FL4SH_TELEGRAM_ENABLED:-0}"
   fail "FL4SH_TELEGRAM_ENABLED must be 0 or 1"
 if [[ "$telegram_enabled" == 1 && "$monitor_enabled" != 1 ]]; then
   fail "FL4SH_TELEGRAM_ENABLED=1 requires FL4SH_MONITOR_ENABLED=1"
+fi
+if [[ "$telegram_enabled" == 1 ]]; then
+  fail "miner-local Telegram is disabled; use the central provider-identity watcher"
 fi
 
 validate_monitor_config() {

@@ -265,7 +265,9 @@ def _render_message(payload: Mapping[str, Any]) -> str:
         body = []
         title = (
             f"🚨 {event_type}"
-            if event_type == "RUNNING_READY_BUT_MINER_NOT_STARTED"
+            if event_type in {
+                "RUNNING_READY_BUT_MINER_NOT_STARTED", "MINER_STARTUP_HASHRATE_TIMEOUT",
+            }
             else f"ALERT: {event_type}"
         )
     lines = [
@@ -393,6 +395,15 @@ def _render_message(payload: Mapping[str, Any]) -> str:
             f"Progress recovered: {_safe_field_text(fields.get('progress_signal'))}",
             f"Progress event time: {fields.get('progress_event_time_utc') or 'unknown'}",
             "Generation: local fingerprint only",
+        ])
+    elif event_type == "MINER_STARTUP_HASHRATE_TIMEOUT":
+        fields = payload["event_fields"]
+        lines.extend([
+            f"Reason: {_safe_field_text(fields.get('reason'))}",
+            f"Startup timeout: {fields.get('startup_timeout_seconds', 'unknown')}s",
+            f"Policy hash: {_safe_field_text(fields.get('policy_hash'))}",
+            "Observed positive device hashrate: false",
+            "Actions performed: false",
         ])
     elif event_type == "MONITOR_CONFIGURATION_INVALID":
         fields = payload["event_fields"]

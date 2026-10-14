@@ -20,6 +20,8 @@ CUDA_ALERT_COOLDOWN_SECONDS = 600
 MAX_CUDA_SUPPRESSED_AUDIT_ROWS_PER_SCOPE = 100
 MAX_CUDA_EXIT_AUDIT_HASHES = 100
 MAX_CUDA_FATAL_CANDIDATE_HASHES = 100
+MAX_PENDING_DELIVERY_SCAN = 2_000
+MAX_PENDING_DELIVERY_BATCH = 100
 CUDA_EXIT_EVIDENCE_FIELDS = frozenset({
     "resource_type", "organization_name", "project_name", "container_group_name",
     "machine_id", "instance_id", "event_time_utc", "evidence_sha256",
@@ -61,6 +63,26 @@ def _validate_payload(value: Any, *, depth: int = 0) -> None:
             raise ValueError("credential-like or oversized payload text is forbidden")
     elif value is not None and not isinstance(value, (int, float, bool)):
         raise ValueError("payload values must be JSON-safe")
+
+
+def _complete_delivery_identity(payload: Mapping[str, Any]) -> bool:
+    identity = payload.get("identity")
+    if not isinstance(identity, Mapping):
+        return False
+    required = (
+        "organization_name", "project_name", "container_group_name", "machine_id", "instance_id",
+    )
+    return (
+        payload.get("data_classification") == PROVIDER_OBSERVED
+        and identity.get("identity_status") == PROVIDER_OBSERVED
+        and identity.get("identity_source") in {"resource.labels", "list_container_group_instances"}
+        and identity.get("organization_name") == payload.get("query_organization")
+        and all(
+            isinstance(identity.get(name), str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", identity[name])
+            for name in required
+        )
+    )
 
 
 def _cuda_cooldown_context(
@@ -129,62 +151,59 @@ def _merge_notification_identity(
     if not isinstance(existing, Mapping) or not isinstance(incoming, Mapping):
         raise LedgerConflictError("deduplicated alert identity is malformed")
     allowed_sources = {"resource.labels", "list_container_group_instances"}
+    names = (
+        "organization_name", "project_name", "container_group_name", "machine_id", "instance_id",
+    )
     for identity in (existing, incoming):
         if identity.get("identity_status") == "CONFLICTING":
             raise LedgerConflictError("deduplicated alert identity is conflicting")
         if identity.get("identity_source") not in allowed_sources:
-            raise LedgerConflictError("deduplicated alert identity source changed")
+            raise LedgerConflictError("deduplicated alert identity source is untrusted")
+    for name in names:
+        old_value = existing.get(name)
+        new_value = incoming.get(name)
+        if old_value is not None and new_value is not None and old_value != new_value:
+            raise LedgerConflictError("deduplicated alert provider identity conflicted")
 
     merged = dict(existing)
-    fixed_fields = (
-        "project_name", "container_group_name", "instance_id",
-    )
-    for name in fixed_fields:
-        if existing.get(name) != incoming.get(name):
-            raise LedgerConflictError("deduplicated alert provider scope changed")
+    def complete_for_merge(identity: Mapping[str, Any]) -> bool:
+        return (
+            identity.get("identity_status") in {DATA_CLASSIFICATION, PROVIDER_OBSERVED}
+            and identity.get("identity_source") in allowed_sources
+            and identity.get("organization_name") == query_organization
+            and all(
+                isinstance(identity.get(name), str)
+                and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", identity[name])
+                for name in names
+            )
+        )
 
-    old_org = existing.get("organization_name")
-    new_org = incoming.get("organization_name")
-    if old_org != new_org:
-        if old_org is None and new_org == query_organization:
-            merged["organization_name"] = new_org
-        elif new_org is None and old_org == query_organization:
-            pass
-        else:
-            raise LedgerConflictError("deduplicated alert organization identity changed")
-
-    old_machine = existing.get("machine_id")
-    new_machine = incoming.get("machine_id")
-    if old_machine is not None and new_machine is not None and old_machine != new_machine:
-        raise LedgerConflictError("deduplicated alert machine identity changed")
-    if old_machine is None and new_machine is not None:
-        if not all(incoming.get(name) for name in (
-            "organization_name", "project_name", "container_group_name", "instance_id",
-        )):
-            raise LedgerConflictError("deduplicated alert enrichment is incomplete")
-        merged.update(incoming)
-    elif old_machine is not None:
-        # A failed or stale later GET may not downgrade previously proven IDs.
-        merged.update(existing)
-        if incoming.get("identity_source") == "resource.labels":
-            merged["identity_source"] = "resource.labels"
+    incoming_complete = complete_for_merge(incoming)
+    existing_complete = complete_for_merge(existing)
+    if incoming_complete and query_organization != incoming.get("organization_name"):
+        raise LedgerConflictError("deduplicated alert enrichment crossed organizations")
+    if incoming_complete and not existing_complete:
+        # A partial first observation is retained until a later exact provider
+        # lookup proves the complete scope. Then fill it atomically.
+        merged.update({name: incoming[name] for name in names})
+        merged["identity_status"] = incoming["identity_status"]
+        merged["identity_source"] = incoming["identity_source"]
+    elif existing_complete:
+        # Stale/partial later records cannot downgrade a verified binding.
+        for name in names:
+            merged[name] = existing[name]
+        merged["identity_status"] = existing["identity_status"]
+        merged["identity_source"] = (
+            "resource.labels"
+            if incoming_complete and incoming.get("identity_source") == "resource.labels"
+            else existing["identity_source"]
+        )
     else:
-        # No machine ID was proved in either observation. Preserve the first
-        # presentation and any independently known source fields.
-        if merged.get("identity_source") != existing.get("identity_source"):
-            merged["identity_source"] = existing.get("identity_source")
-
-    # If both observations are resolved, only the evidence source may improve.
-    if old_machine is not None and new_machine is not None:
-        old_status = existing.get("identity_status")
-        new_status = incoming.get("identity_status")
-        if old_status != new_status:
-            raise LedgerConflictError("deduplicated alert identity classification changed")
-    if merged.get("machine_id") is not None:
-        if merged.get("identity_status") not in {DATA_CLASSIFICATION, PROVIDER_OBSERVED}:
-            raise LedgerConflictError("deduplicated alert has an unverified resolved identity")
-    else:
+        # Until all five IDs are independently complete, this remains UNKNOWN.
+        for name in names:
+            merged[name] = existing.get(name)
         merged["identity_status"] = "UNKNOWN"
+        merged["identity_source"] = existing["identity_source"]
     return merged
 
 
@@ -465,6 +484,21 @@ class SQLiteAlertLedger:
                 updated_at_utc TEXT NOT NULL,
                 FOREIGN KEY(dedupe_key) REFERENCES log_alert_outbox(dedupe_key)
             );
+            CREATE INDEX IF NOT EXISTS idx_log_alert_delivery_pending_scan
+                ON log_alert_delivery(state,created_at_utc,dedupe_key);
+            CREATE TABLE IF NOT EXISTS log_alert_delivery_order (
+                sequence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dedupe_key TEXT NOT NULL UNIQUE,
+                FOREIGN KEY(dedupe_key) REFERENCES log_alert_delivery(dedupe_key)
+            );
+            CREATE TABLE IF NOT EXISTS log_alert_pending_scan_cursor (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                last_created_at_utc TEXT,
+                last_dedupe_key TEXT,
+                cycle_end_sequence_id INTEGER,
+                CHECK ((last_created_at_utc IS NULL) = (last_dedupe_key IS NULL)),
+                CHECK (last_created_at_utc IS NULL OR cycle_end_sequence_id IS NOT NULL)
+            );
             CREATE TABLE IF NOT EXISTS log_alert_pool_episodes (
                 identity_key TEXT NOT NULL,
                 monitor_session_id TEXT NOT NULL,
@@ -478,6 +512,15 @@ class SQLiteAlertLedger:
                 PRIMARY KEY(identity_key,monitor_session_id,pool_episode_id)
             );
             """
+        )
+        self._db.execute(
+            "INSERT OR IGNORE INTO log_alert_pending_scan_cursor"
+            "(singleton,last_created_at_utc,last_dedupe_key,cycle_end_sequence_id)"
+            " VALUES(1,NULL,NULL,NULL)"
+        )
+        self._db.execute(
+            "INSERT OR IGNORE INTO log_alert_delivery_order(dedupe_key) "
+            "SELECT dedupe_key FROM log_alert_delivery ORDER BY created_at_utc,dedupe_key"
         )
         # If a process stops after durably claiming a send, its delivery result
         # is unknowable. Never retry it after restart.
@@ -984,6 +1027,10 @@ class SQLiteAlertLedger:
                             "INSERT OR IGNORE INTO log_alert_delivery(dedupe_key,data_classification,state,attempt_count,http_status,failure_code,created_at_utc,updated_at_utc) VALUES(?,?,'PENDING',0,NULL,NULL,?,?)",
                             (newly_inserted["dedupe_key"], PROVIDER_OBSERVED, committed, committed),
                         )
+                        self._db.execute(
+                            "INSERT OR IGNORE INTO log_alert_delivery_order(dedupe_key) VALUES(?)",
+                            (newly_inserted["dedupe_key"],),
+                        )
                 for resource_key, state_json in safe_startup_states:
                     self._db.execute(
                         """INSERT INTO log_alert_startup_states(resource_key,state_json,updated_at_utc)
@@ -1023,6 +1070,9 @@ class SQLiteAlertLedger:
                 payload = json.loads(row["payload_json"])
                 if payload.get("data_classification") != PROVIDER_OBSERVED:
                     raise LedgerConflictError("only provider-observed alerts may be delivered")
+                if not _complete_delivery_identity(payload):
+                    self._db.execute("COMMIT")
+                    return None
                 self._db.execute(
                     "UPDATE log_alert_delivery SET state='DISPATCHING',attempt_count=1,updated_at_utc=? WHERE dedupe_key=? AND state='PENDING'",
                     (claimed, dedupe_key),
@@ -1062,6 +1112,113 @@ class SQLiteAlertLedger:
                 "SELECT dedupe_key,data_classification,state,attempt_count,http_status,failure_code,created_at_utc,updated_at_utc FROM log_alert_delivery ORDER BY created_at_utc,dedupe_key"
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def list_pending_delivery_keys(self) -> list[str]:
+        """Return a bounded batch of pending alerts with complete provider identity."""
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._db.execute(
+                    "SELECT last_created_at_utc,last_dedupe_key,cycle_end_sequence_id "
+                    "FROM log_alert_pending_scan_cursor WHERE singleton=1"
+                ).fetchone()
+                if cursor is None:
+                    raise LedgerConflictError("pending delivery scan cursor is missing")
+                last_created = cursor["last_created_at_utc"]
+                last_key = cursor["last_dedupe_key"]
+                cycle_end_sequence_id = cursor["cycle_end_sequence_id"]
+
+                if cycle_end_sequence_id is None:
+                    latest = self._db.execute(
+                        "SELECT s.sequence_id FROM log_alert_delivery d "
+                        "JOIN log_alert_delivery_order s USING(dedupe_key) "
+                        "WHERE d.state='PENDING' ORDER BY s.sequence_id DESC LIMIT 1"
+                    ).fetchone()
+                    if latest is None:
+                        self._db.execute("COMMIT")
+                        return []
+                    cycle_end_sequence_id = int(latest["sequence_id"])
+                    last_created = None
+                    last_key = None
+
+                rows = self._db.execute(
+                    """SELECT s.sequence_id,d.created_at_utc,d.dedupe_key,
+                              o.payload_json,o.suppressed_by
+                       FROM log_alert_delivery d
+                       JOIN log_alert_outbox o USING(dedupe_key)
+                       JOIN log_alert_delivery_order s USING(dedupe_key)
+                       WHERE d.state='PENDING'
+                         AND s.sequence_id <= ?
+                         AND (? IS NULL OR d.created_at_utc > ?
+                              OR (d.created_at_utc = ? AND d.dedupe_key > ?))
+                       ORDER BY d.created_at_utc,d.dedupe_key
+                       LIMIT ?""",
+                    (
+                        cycle_end_sequence_id,
+                        last_created,
+                        last_created,
+                        last_created,
+                        last_key,
+                        MAX_PENDING_DELIVERY_SCAN,
+                    ),
+                ).fetchall()
+
+                if not rows:
+                    self._db.execute(
+                        "UPDATE log_alert_pending_scan_cursor SET last_created_at_utc=NULL,"
+                        "last_dedupe_key=NULL,cycle_end_sequence_id=NULL WHERE singleton=1"
+                    )
+                    self._db.execute("COMMIT")
+                    return []
+
+                keys: list[str] = []
+                last_scanned: tuple[str, str] | None = None
+                for row in rows:
+                    last_scanned = (str(row["created_at_utc"]), str(row["dedupe_key"]))
+                    if row["suppressed_by"] is not None:
+                        continue
+                    try:
+                        payload = json.loads(row["payload_json"])
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    if _complete_delivery_identity(payload):
+                        keys.append(str(row["dedupe_key"]))
+                        if len(keys) >= MAX_PENDING_DELIVERY_BATCH:
+                            break
+
+                if last_scanned is None:
+                    raise LedgerConflictError("pending delivery scan did not advance")
+                more = self._db.execute(
+                    """SELECT 1 FROM log_alert_delivery d
+                       JOIN log_alert_delivery_order s USING(dedupe_key)
+                       WHERE d.state='PENDING'
+                         AND s.sequence_id <= ?
+                         AND (d.created_at_utc > ?
+                              OR (d.created_at_utc = ? AND d.dedupe_key > ?))
+                       LIMIT 1""",
+                    (
+                        cycle_end_sequence_id,
+                        last_scanned[0],
+                        last_scanned[0],
+                        last_scanned[1],
+                    ),
+                ).fetchone()
+                if more is None:
+                    self._db.execute(
+                        "UPDATE log_alert_pending_scan_cursor SET last_created_at_utc=NULL,"
+                        "last_dedupe_key=NULL,cycle_end_sequence_id=NULL WHERE singleton=1"
+                    )
+                else:
+                    self._db.execute(
+                        "UPDATE log_alert_pending_scan_cursor SET last_created_at_utc=?,"
+                        "last_dedupe_key=?,cycle_end_sequence_id=? WHERE singleton=1",
+                        (last_scanned[0], last_scanned[1], cycle_end_sequence_id),
+                    )
+                self._db.execute("COMMIT")
+                return keys
+            except Exception:
+                self._db.execute("ROLLBACK")
+                raise
 
     def _apply_late_cuda_exit_evidence(
         self,

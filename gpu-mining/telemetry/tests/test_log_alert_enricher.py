@@ -305,6 +305,25 @@ class LogAlertNormalizerTests(unittest.TestCase):
         with self.assertRaisesRegex(LogRecordError, "provenance"):
             normalize_log_entry(raw)
 
+    def test_startup_hashrate_failure_is_bounded_and_does_not_copy_raw_output(self):
+        line_text = (
+            "FL4SH_MONITOR state=STARTUP_HASHRATE_TIMEOUT "
+            "reason=NO_POSITIVE_DEVICE_HASHRATE startup_timeout_seconds=180 "
+            f"policy_hash={POLICY_HASH} actions_performed=false"
+        )
+        parsed = normalize_log_entry(log_entry(text_log=line_text))
+        self.assertEqual(parsed.alert.event_type, "MINER_STARTUP_HASHRATE_TIMEOUT")
+        self.assertEqual(parsed.alert.fields, {
+            "reason": "NO_POSITIVE_DEVICE_HASHRATE",
+            "startup_timeout_seconds": 180,
+            "policy_hash": POLICY_HASH,
+            "actions_performed": False,
+        })
+        self.assertNotIn("raw", parsed.alert.fields)
+        invalid = line_text.replace("startup_timeout_seconds=180", "startup_timeout_seconds=9999")
+        with self.assertRaises(LogRecordError):
+            normalize_log_entry(log_entry(text_log=invalid))
+
     def test_exact_reallocation_record_preserves_source_and_provider_labels(self):
         raw = log_entry(text_log=reallocation_line(), structured_message=None)
         parsed = normalize_log_entry(raw)
@@ -352,8 +371,8 @@ class LogAlertNormalizerTests(unittest.TestCase):
     def test_startup_and_progress_signals_are_exact_and_not_alert_identity(self):
         expected = {
             "running": "INSTANCE_RUNNING", "ready": "INSTANCE_READY",
-            "config": "MONITOR_CONFIG", "gpu": "GPU_DETECTED",
-            "initialized": "DEVICE_INITIALIZED", "hashrate": "DEVICE_HASHRATE",
+            "config": None, "gpu": None,
+            "initialized": None, "hashrate": "DEVICE_HASHRATE",
         }
         for name, signal in expected.items():
             parsed = normalize_log_entry(lifecycle_entry(name, event_time=EVENT_TIME))
@@ -876,6 +895,7 @@ class LogAlertEngineTests(unittest.TestCase):
         accepted_line = SOLUTION_EVIDENCE_LINE
         child_code = (
             "import time; "
+            "print('Device [1] hashRate: 217.81 TH/s, stale: 0/0 (0.0%), warm: 0', flush=True); "
             f"print({(runtime.POOL_CONNECTION_FAILED_LINE + '; reconnecting; retrying in 10s')!r}, flush=True); "
             "time.sleep(1.1); "
             f"print({accepted_line!r}, flush=True)"
@@ -1462,7 +1482,7 @@ class LogAlertEngineTests(unittest.TestCase):
             self.assertIn(f"Machine ID: {row['payload']['identity']['machine_id']}", row["message_text"])
         ledger.close()
 
-    def test_startup_guard_does_not_alert_before_deadline_or_when_progress_arrives(self):
+    def test_startup_guard_requires_positive_device_hashrate_before_deadline(self):
         base = [
             lifecycle_entry("running", event_time="2026-10-13T12:00:00Z", log_id="running"),
             lifecycle_entry("ready", event_time="2026-10-13T12:00:10Z", log_id="ready"),
@@ -1474,8 +1494,15 @@ class LogAlertEngineTests(unittest.TestCase):
                 )]
                 enricher, _, ledger = make_enricher(entries)
                 result = enricher.run_once(end_time_utc="2026-10-13T12:02:00Z")
-                self.assertEqual(result.prepared_count, 0)
-                self.assertEqual(ledger.list_outbox(), [])
+                if signal == "hashrate":
+                    self.assertEqual(result.prepared_count, 0)
+                    self.assertEqual(ledger.list_outbox(), [])
+                else:
+                    self.assertEqual(result.prepared_count, 1)
+                    self.assertEqual(
+                        ledger.list_outbox()[0]["payload"]["event_type"],
+                        "RUNNING_READY_BUT_MINER_NOT_STARTED",
+                    )
                 ledger.close()
 
         enricher, _, ledger = make_enricher(base)

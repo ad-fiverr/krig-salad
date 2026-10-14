@@ -20,7 +20,10 @@ from log_alerts.central_telegram import (  # noqa: E402
 )
 from log_alerts.contract import DATA_CLASSIFICATION, PROVIDER_OBSERVED  # noqa: E402
 from log_alerts.delivery import DeliveryCoordinator  # noqa: E402
-from log_alerts.ledger import SQLiteAlertLedger  # noqa: E402
+from log_alerts.ledger import (  # noqa: E402
+    MAX_PENDING_DELIVERY_SCAN,
+    SQLiteAlertLedger,
+)
 
 
 NOW = "2026-10-13T12:01:00Z"
@@ -29,15 +32,10 @@ QUERY_HASH = "f" * 64
 ALERT_KEY = "a" * 64
 
 
-def _post_boundary_test_seed(
-    ledger: SQLiteAlertLedger, *, allow_delivery: bool = True,
-    machine_id: str | None = "unit-test-machine",
-) -> str:
-    """Seed a post-validation ledger row, not a synthetic Salad response.
-
-    The fixture is only for exercising delivery persistence after the trusted
-    transport boundary. Tests use the offline sender and never issue HTTP.
-    """
+def _post_boundary_test_item(
+    *, dedupe_key: str = ALERT_KEY, machine_id: str | None = "unit-test-machine",
+    evidence_sha256: str = "b" * 64,
+) -> dict[str, object]:
     identity = {
         "identity_status": PROVIDER_OBSERVED if machine_id is not None else "UNKNOWN",
         "machine_id": machine_id,
@@ -57,12 +55,12 @@ def _post_boundary_test_seed(
         "identity": identity,
         "event_source": "text_log",
         "event_fields": {"reason": "MINING_AUTHORIZE_RESPONSE_TIMEOUT", "retry_seconds": 10},
-        "source_evidence_sha256": "b" * 64,
+        "source_evidence_sha256": evidence_sha256,
         "source_log_reference": None,
         "actions_performed": False,
     }
     item = {
-        "dedupe_key": ALERT_KEY,
+        "dedupe_key": dedupe_key,
         "event_type": "POOL_CONNECTION_FAILED",
         "event_time_utc": NOW,
         "identity_key": "c" * 64,
@@ -71,17 +69,44 @@ def _post_boundary_test_seed(
         "instance_id": identity["instance_id"],
         "container_group_name": identity["container_group_name"],
         "alert_id": None,
-        "source_evidence_sha256": "b" * 64,
+        "source_evidence_sha256": evidence_sha256,
         "source_log_ref": None,
         "payload": payload,
         "message_text": (
+            f"Organization: {ORG}\n"
+            "Project: unit-test-project\n"
+            "Container Group: unit-test-group\n"
+            f"Machine ID: {machine_id or 'UNKNOWN'}\n"
+            "Instance ID: unit-test-instance\n"
+            "Identity source: resource.labels\n"
             "ALERT: POOL_CONNECTION_FAILED\n"
             "Reason: MINING_AUTHORIZE_RESPONSE_TIMEOUT\n"
             "Retry: 10s\nEvidence: PROVIDER_OBSERVED\nActions performed: false"
         ),
     }
-    return_item = ledger.commit_cycle(
-        [item],
+    return item
+
+
+def _post_boundary_test_seed(
+    ledger: SQLiteAlertLedger, *, allow_delivery: bool = True,
+    machine_id: str | None = "unit-test-machine",
+) -> str:
+    """Seed a post-validation ledger row, not a synthetic Salad response.
+
+    The fixture is only for exercising delivery persistence after the trusted
+    transport boundary. Tests use the offline sender and never issue HTTP.
+    """
+    item = _post_boundary_test_item(machine_id=machine_id)
+    return _commit_post_boundary_test_items(
+        ledger, [item], allow_delivery=allow_delivery,
+    )[0]["dedupe_key"]
+
+
+def _commit_post_boundary_test_items(
+    ledger: SQLiteAlertLedger, items: list[dict[str, object]], *, allow_delivery: bool = True,
+) -> list[dict[str, object]]:
+    return ledger.commit_cycle(
+        items,
         cursor_time_utc=NOW,
         committed_at_utc=NOW,
         data_classification=PROVIDER_OBSERVED,
@@ -96,7 +121,6 @@ def _post_boundary_test_seed(
         # response. The production commit path requires sealed transport evidence.
         provider_response_evidence=_internal_test_response_evidence(),
     )
-    return return_item[0]["dedupe_key"]
 
 
 def _post_boundary_cuda_test_seed(ledger: SQLiteAlertLedger) -> str:
@@ -273,13 +297,33 @@ class DeliveryLedgerTests(unittest.TestCase):
                 pass
 
         sender = CentralTelegramSender(credentials=SyntheticTelegramSecretProvider().acquire())
+        identity = {
+            "identity_status": PROVIDER_OBSERVED,
+            "identity_source": "resource.labels",
+            "organization_name": ORG,
+            "project_name": "unit-test-project",
+            "container_group_name": "unit-test-group",
+            "machine_id": "unit-test-machine",
+            "instance_id": "unit-test-instance",
+        }
+        identity_message = (
+            f"Organization: {ORG}\nProject: unit-test-project\n"
+            "Container Group: unit-test-group\nMachine ID: unit-test-machine\n"
+            "Instance ID: unit-test-instance\nIdentity source: resource.labels\n"
+            "synthetic transport test"
+        )
         with (
             patch("log_alerts.central_telegram.PRODUCTION_TELEGRAM_ALLOWED", True),
             patch("log_alerts.central_telegram.http.client.HTTPSConnection", FakeConnection),
         ):
             result = sender.send_provider_alert(
-                payload={"data_classification": PROVIDER_OBSERVED, "actions_performed": False},
-                message_text="synthetic transport test",
+                payload={
+                    "data_classification": PROVIDER_OBSERVED,
+                    "query_organization": ORG,
+                    "identity": identity,
+                    "actions_performed": False,
+                },
+                message_text=identity_message,
             )
         self.assertEqual(result.state, "SENT")
         self.assertEqual(FakeConnection.last.host, "api.telegram.org")
@@ -334,29 +378,29 @@ class DeliveryLedgerTests(unittest.TestCase):
             self.assertEqual(reopened.list_deliveries()[0]["attempt_count"], 1)
             reopened.close()
 
-    def test_delivery_unknown_stays_terminal_when_machine_identity_is_enriched(self):
+    def test_unknown_provider_identity_waits_then_dispatches_after_exact_enrichment(self):
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "unknown-enriched.sqlite3"
             ledger = SQLiteAlertLedger(db_path)
             key = _post_boundary_test_seed(ledger, machine_id=None)
             calls = []
-            sender = self._sender(
-                lambda *_args: (calls.append("send") or (_ for _ in ()).throw(RuntimeError("ambiguous")))
-            )
+            sender = self._sender(lambda *_args: (calls.append("send") or (200, b'{"ok":true,"result":{"message_id":9}}')))
             first = DeliveryCoordinator(ledger, sender).dispatch_new([key], now_utc=NOW)
-            self.assertEqual(first[0].state, "DELIVERY_UNKNOWN")
-            self.assertEqual(calls, ["send"])
+            self.assertEqual(first, ())
+            self.assertEqual(calls, [])
+            self.assertEqual(ledger.list_deliveries()[0]["state"], "PENDING")
             ledger.close()
 
             reopened = SQLiteAlertLedger(db_path)
             _resolved_identity_enrichment(reopened, key)
             self.assertEqual(reopened.list_outbox()[0]["payload"]["identity"]["machine_id"], "unit-test-machine")
-            self.assertEqual(reopened.list_deliveries()[0]["state"], "DELIVERY_UNKNOWN")
-            self.assertEqual(reopened.list_deliveries()[0]["attempt_count"], 1)
+            self.assertEqual(reopened.list_deliveries()[0]["state"], "PENDING")
+            self.assertEqual(reopened.list_pending_delivery_keys(), [key])
             second = DeliveryCoordinator(reopened, sender).dispatch_new([key], now_utc=NOW)
-            self.assertEqual(second, ())
+            self.assertEqual(len(second), 1)
+            self.assertEqual(second[0].state, "SENT")
             self.assertEqual(calls, ["send"])
-            self.assertEqual(reopened.list_deliveries()[0]["state"], "DELIVERY_UNKNOWN")
+            self.assertEqual(reopened.list_deliveries()[0]["attempt_count"], 1)
             reopened.close()
 
     def test_cuda_identity_enrichment_preserves_canonical_audit_and_terminal_delivery(self):
@@ -375,8 +419,9 @@ class DeliveryLedgerTests(unittest.TestCase):
 
                 sender = self._sender(responder)
                 first = DeliveryCoordinator(ledger, sender).dispatch_new([key], now_utc=NOW)
-                self.assertEqual(first[0].state, terminal_state)
-                self.assertEqual(calls, ["send"])
+                self.assertEqual(first, ())
+                self.assertEqual(calls, [])
+                self.assertEqual(ledger.list_deliveries()[0]["state"], "PENDING")
                 original = ledger.list_outbox()[0]["message_text"]
                 for audit in (
                     f"Event time: {NOW}",
@@ -404,8 +449,7 @@ class DeliveryLedgerTests(unittest.TestCase):
                     "Evidence: PROVIDER_OBSERVED",
                 ):
                     self.assertIn(audit, enriched["message_text"])
-                self.assertEqual(reopened.list_deliveries()[0]["state"], terminal_state)
-                self.assertEqual(reopened.list_deliveries()[0]["attempt_count"], 1)
+                self.assertEqual(reopened.list_deliveries()[0]["state"], "PENDING")
                 reopened.close()
 
                 persisted = SQLiteAlertLedger(db_path)
@@ -417,6 +461,9 @@ class DeliveryLedgerTests(unittest.TestCase):
                     "Evidence: PROVIDER_OBSERVED",
                 ):
                     self.assertIn(audit, final_row["message_text"])
+                first_verified = DeliveryCoordinator(persisted, sender).dispatch_new([key], now_utc=NOW)
+                self.assertEqual(first_verified[0].state, terminal_state)
+                self.assertEqual(calls, ["send"])
                 self.assertEqual(persisted.list_deliveries()[0]["state"], terminal_state)
                 second = DeliveryCoordinator(persisted, sender).dispatch_new([key], now_utc=NOW)
                 self.assertEqual(second, ())
@@ -440,6 +487,118 @@ class DeliveryLedgerTests(unittest.TestCase):
             self.assertEqual(reopened.list_deliveries()[0]["state"], "PENDING")
             self.assertEqual(reopened.list_deliveries()[0]["attempt_count"], 0)
             reopened.close()
+
+    def test_pending_scan_cursor_finds_complete_alert_after_more_than_one_page_and_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "pending-fair-scan.sqlite3"
+            ledger = SQLiteAlertLedger(db_path)
+            incomplete_items = [
+                _post_boundary_test_item(
+                    dedupe_key=f"{index:064x}", machine_id=None,
+                    evidence_sha256=f"{index + 1:064x}",
+                )
+                for index in range(MAX_PENDING_DELIVERY_SCAN + 1)
+            ]
+            valid_key = f"{MAX_PENDING_DELIVERY_SCAN + 1:064x}"
+            items = incomplete_items + [_post_boundary_test_item(
+                dedupe_key=valid_key,
+                evidence_sha256=f"{MAX_PENDING_DELIVERY_SCAN + 2:064x}",
+            )]
+            ledger.commit_cycle(
+                items,
+                cursor_time_utc=NOW,
+                committed_at_utc=NOW,
+                data_classification=PROVIDER_OBSERVED,
+                live_scope={
+                    "organization_name": ORG,
+                    "operation": "READ_LOG_QUERY",
+                    "query_sha256": QUERY_HASH,
+                    "data_classification": PROVIDER_OBSERVED,
+                },
+                allow_provider_delivery=True,
+                provider_response_evidence=_internal_test_response_evidence(),
+            )
+            self.assertEqual(ledger.list_pending_delivery_keys(), [])
+            ledger.close()
+
+            reopened = SQLiteAlertLedger(db_path)
+            keys = reopened.list_pending_delivery_keys()
+            self.assertEqual(keys, [valid_key])
+            calls = []
+            coordinator = DeliveryCoordinator(
+                reopened,
+                self._sender(lambda *_args: (calls.append("send") or (
+                    200, b'{"ok":true,"result":{"message_id":10}}',
+                ))),
+            )
+            first = coordinator.dispatch_new(keys, now_utc=NOW)
+            second = coordinator.dispatch_new(keys, now_utc=NOW)
+            self.assertEqual([attempt.state for attempt in first], ["SENT"])
+            self.assertEqual(second, ())
+            self.assertEqual(calls, ["send"])
+            rows = reopened.list_deliveries()
+            self.assertEqual(len(rows), MAX_PENDING_DELIVERY_SCAN + 2)
+            self.assertEqual(
+                [row for row in rows if row["dedupe_key"] == valid_key][0]["attempt_count"],
+                1,
+            )
+            self.assertTrue(all(
+                row["attempt_count"] == 0 and row["state"] == "PENDING"
+                for row in rows if row["dedupe_key"] != valid_key
+            ))
+            reopened.close()
+
+    def test_pending_scan_cycle_excludes_arrivals_until_the_next_durable_cycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "pending-cycle-boundary.sqlite3"
+            ledger = SQLiteAlertLedger(db_path)
+            initial_unknown = [
+                _post_boundary_test_item(
+                    dedupe_key=f"{index:064x}", machine_id=None,
+                    evidence_sha256=f"{index + 100:064x}",
+                )
+                for index in range(2)
+            ]
+            initial_valid_key = f"{10:064x}"
+            initial = initial_unknown + [_post_boundary_test_item(
+                dedupe_key=initial_valid_key, evidence_sha256=f"{110:064x}",
+            )]
+            _commit_post_boundary_test_items(ledger, initial)
+
+            with patch("log_alerts.ledger.MAX_PENDING_DELIVERY_SCAN", 2):
+                self.assertEqual(ledger.list_pending_delivery_keys(), [])
+                late_key = f"{5:064x}"
+                _commit_post_boundary_test_items(ledger, [_post_boundary_test_item(
+                    dedupe_key=late_key, evidence_sha256=f"{111:064x}",
+                )])
+                ledger.close()
+
+                reopened = SQLiteAlertLedger(db_path)
+                calls = []
+                coordinator = DeliveryCoordinator(
+                    reopened,
+                    self._sender(lambda *_args: (calls.append("send") or (
+                        200, b'{"ok":true,"result":{"message_id":11}}',
+                    ))),
+                )
+                initial_keys = reopened.list_pending_delivery_keys()
+                self.assertEqual(initial_keys, [initial_valid_key])
+                self.assertEqual(
+                    [item.state for item in coordinator.dispatch_new(initial_keys, now_utc=NOW)],
+                    ["SENT"],
+                )
+                # The late row was inserted after the cycle snapshot. The new
+                # cycle first scans the two unresolved rows, then reaches it.
+                self.assertEqual(reopened.list_pending_delivery_keys(), [])
+                late_keys = reopened.list_pending_delivery_keys()
+                self.assertEqual(late_keys, [late_key])
+                self.assertEqual(
+                    [item.state for item in coordinator.dispatch_new(late_keys, now_utc=NOW)],
+                    ["SENT"],
+                )
+                self.assertEqual(coordinator.dispatch_new(late_keys, now_utc=NOW), ())
+                self.assertEqual(calls, ["send", "send"])
+                reopened.close()
 
     def test_ambiguous_transport_and_explicit_http_failure_are_terminal(self):
         for expected, responder in (
@@ -481,6 +640,25 @@ class DeliveryLedgerTests(unittest.TestCase):
             sender.send_provider_alert(payload=synthetic_payload, message_text="synthetic")
         self.assertEqual(ledger.list_deliveries(), [])
         ledger.close()
+
+    def test_provider_alert_without_complete_identity_is_rejected_by_sender(self):
+        sender = self._sender(lambda *_args: (200, b'{"ok":true}'))
+        payload = {
+            "data_classification": PROVIDER_OBSERVED,
+            "query_organization": ORG,
+            "identity": {
+                "identity_status": "UNKNOWN",
+                "identity_source": "resource.labels",
+                "organization_name": ORG,
+                "project_name": "unit-test-project",
+                "container_group_name": "unit-test-group",
+                "machine_id": None,
+                "instance_id": "unit-test-instance",
+            },
+            "actions_performed": False,
+        }
+        with self.assertRaises(TelegramSecretError):
+            sender.send_provider_alert(payload=payload, message_text="no provider identity")
 
     def test_live_scope_cannot_change_or_mix_with_fixture_data(self):
         ledger = SQLiteAlertLedger()

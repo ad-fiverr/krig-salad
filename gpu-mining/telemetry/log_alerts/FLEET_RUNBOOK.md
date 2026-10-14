@@ -15,6 +15,15 @@ the checked reference. Do not replace the placeholder below with guessed
 syntax. A contract probe and separate operator authorization are required
 before starting a real watcher.
 
+The image also supports a `FL4SH_ROLE=central` entrypoint role. It does not
+launch Fl4shMiner. The role requires non-secret target, query and state-path
+settings, then enters the existing live CLI gates; Salad and Telegram
+credentials are still acquired only through hidden interactive TTY prompts.
+The miner role rejects local Telegram so an alert with `LOCAL_MONITOR_ONLY`
+can never be presented as the fleet's provider-identified alert. Central
+delivery remains blocked until all five provider identity fields are verified
+and the message includes their source.
+
 ## Non-secret target file
 
 Create `fleet-targets.json` with only the approved target pairs:
@@ -58,6 +67,12 @@ leaves that organization's cursor unchanged for safe retry on the next
 scheduled poll. One organization's 401/403 or timeout does not stop other
 targets.
 
+The central process holds `.watcher.lock` under its configured state directory
+for its lifetime. This prevents a duplicate only on hosts that share the same
+lock file and filesystem locking semantics; it is not a cross-host or
+distributed lease. Keep the process single-replica until a separately reviewed
+distributed coordinator exists.
+
 ## Identity and state
 
 Each alert begins with `Organization`, `Project`, `Container Group`, `Machine
@@ -87,11 +102,29 @@ resource-label maps. This is single-host state, not distributed coordination.
 The watcher has no Salad action transport. It never starts, stops, restarts,
 creates, deletes, updates, or reallocates Salad resources. Every prepared
 message reports `Actions performed: false`. Synthetic/offline observations
-cannot be sent to Telegram. Live Telegram delivery is limited to newly inserted,
-unsuppressed provider-observed alerts. Ambiguous delivery remains
-`DELIVERY_UNKNOWN` and is not automatically retried.
+cannot be sent to Telegram. An unsuppressed provider-observed alert stays
+`PENDING` until the complete five-field provider identity is verified and
+included in its message. Exact late identity enrichment can unlock that same
+pending dedupe key; it does not reopen a terminal delivery state. Ambiguous
+delivery remains `DELIVERY_UNKNOWN` and is not automatically retried.
 
 This task did not run the launcher, probe Salad, send Telegram, write Firebase,
 deploy, or spend cloud credits. A real contract probe remains a distinct,
 one-request, Telegram-disabled operation and requires separate operator
 authorization.
+
+## Miner productive-health boundary
+
+With `FL4SH_MONITOR_ENABLED=1`, the image healthcheck requires PID 1's
+supervisor, its live Fl4shMiner child, and a fresh, positive device-hashrate
+sample tied to the current child PID, monitor session and policy hash. Pearl
+autotune estimates, CUDA pool-equivalent estimates, GPU initialization and
+configuration logs do not satisfy this check. If no positive device sample
+arrives before `FL4SH_STARTUP_HASHRATE_TIMEOUT_SECONDS` (default 180 seconds),
+the supervisor emits a sanitized startup-failure record, terminates the child
+after a bounded grace period and exits unsuccessfully. The central watcher can
+attach provider Machine ID and Instance ID only from Salad's exact resource
+labels or an exact same-scope List Instances response; otherwise the alert
+remains held. Salad may establish `Instance Running` independently of this
+healthcheck, so the container cannot prevent a transient provider-side state,
+but it will not report productive health without observed TH/s.

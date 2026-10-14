@@ -58,21 +58,16 @@ _CONFIG_INVALID_RE = re.compile(
     r"MISSING_TELEGRAM_CHAT_ID|INVALID_MONITOR_SETTING|"
     r"INVALID_ENTRYPOINT_CONFIGURATION)$"
 )
+_STARTUP_HASHRATE_TIMEOUT_MAX_SECONDS = 3600
 _STARTUP_TIMESTAMP = r"(?:[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} )?"
 _CUDA_FATAL_RE = re.compile(r"^" + _STARTUP_TIMESTAMP + re.escape(CUDA_FATAL_LINE) + r"$")
 _CUDA_EXIT_STATUS_RE = re.compile(r"^" + _STARTUP_TIMESTAMP + re.escape(CUDA_EXIT_STATUS_LINE) + r"$")
 FIXTURE_LIFECYCLE_SOURCE = "SYNTHETIC_PROVIDER_LIFECYCLE_FIXTURE"
-_INITIALIZED_RE = re.compile(
-    r"^" + _STARTUP_TIMESTAMP + r"Device\s*\[(?P<device>[0-9]{1,3})\]\s+"
-    r"(?P<gpu>[^\r\n:]{1,256})\s*:\s*Initialized$",
-    re.IGNORECASE,
-)
 _HASHRATE_PROGRESS_RE = re.compile(
     r"^" + _STARTUP_TIMESTAMP + r"Device\s*\[(?P<device>[0-9]{1,3})\]\s+"
     r"hashRate:\s*(?P<rate>[0-9]+(?:\.[0-9]+)?)\s+TH/s(?:,.*)?$",
     re.IGNORECASE,
 )
-_MONITOR_PROGRESS_RE = re.compile(r"^FL4SH_MONITOR\s+state=(?P<state>CONFIG|GPU_DETECTED)(?:\s|$)")
 _SAFE_REASON_CODES = frozenset({
     "INVALID_GPU_FLOORS_JSON", "MISSING_TELEGRAM_TOKEN", "MISSING_TELEGRAM_CHAT_ID",
     "INVALID_MONITOR_SETTING", "INVALID_ENTRYPOINT_CONFIGURATION",
@@ -90,6 +85,7 @@ _EVENT_FIELDS = frozenset({
     "recent_failure_count", "unstable_duration_seconds", "prior_failure_count",
     "recent_failure_window_start_utc", "recovery_signal", "recovered_at_utc",
     "retry_seconds", "timestamp_utc", "solutions_evidence_sha256",
+    "startup_timeout_seconds",
 })
 _MARKER_FIELDS = frozenset({
     "FL4SH_MONITOR", "state", "alert_id", "event", "actions_performed", "episode_id",
@@ -856,7 +852,39 @@ def _parse_text_message(text: str) -> tuple[MonitorAlert | None, AlertMarker | N
         return _normalize_pool_recovered(fields), None
     if fields.get("state") == "NO_FLOOR_CONFIGURED":
         return _normalize_no_floor(fields), None
+    if fields.get("state") in {"STARTUP_HASHRATE_TIMEOUT", "STARTUP_HASHRATE_FAILED"}:
+        return _normalize_startup_hashrate_failure(fields), None
     return None, None
+
+
+def _normalize_startup_hashrate_failure(fields: Mapping[str, Any]) -> MonitorAlert:
+    state = fields.get("state")
+    expected_reason = {
+        "STARTUP_HASHRATE_TIMEOUT": "NO_POSITIVE_DEVICE_HASHRATE",
+        "STARTUP_HASHRATE_FAILED": "MINER_EXITED_BEFORE_HASHRATE",
+    }.get(state)
+    if (
+        expected_reason is None
+        or fields.get("reason") != expected_reason
+        or fields.get("actions_performed") not in {False, "false"}
+    ):
+        raise LogRecordError("startup hashrate failure does not match the fixed contract")
+    timeout_value = fields.get("startup_timeout_seconds")
+    if type(timeout_value) is int:
+        timeout = timeout_value
+    elif isinstance(timeout_value, str) and re.fullmatch(r"[0-9]{1,4}", timeout_value):
+        timeout = int(timeout_value)
+    else:
+        raise LogRecordError("startup hashrate timeout is invalid")
+    if timeout < 1 or timeout > _STARTUP_HASHRATE_TIMEOUT_MAX_SECONDS:
+        raise LogRecordError("startup hashrate timeout is outside bounds")
+    policy_hash = _safe_token(fields.get("policy_hash"), _POLICY_HASH_RE)
+    return MonitorAlert("MINER_STARTUP_HASHRATE_TIMEOUT", {
+        "reason": expected_reason,
+        "startup_timeout_seconds": timeout,
+        "policy_hash": policy_hash,
+        "actions_performed": False,
+    })
 
 
 def _parse_structured_message(value: Any) -> tuple[MonitorAlert | None, AlertMarker | None]:
@@ -911,7 +939,10 @@ def _parse_structured_message(value: Any) -> tuple[MonitorAlert | None, AlertMar
         if "pool_episode_id" in fields:
             return _normalize_pool_episode_failed(fields), None
         return _normalize_pool(fields), None
-    if state in {"POOL_CONNECTION_UNSTABLE", "POOL_CONNECTION_RECOVERED", "NO_FLOOR_CONFIGURED"}:
+    if state in {
+        "POOL_CONNECTION_UNSTABLE", "POOL_CONNECTION_RECOVERED", "NO_FLOOR_CONFIGURED",
+        "STARTUP_HASHRATE_TIMEOUT", "STARTUP_HASHRATE_FAILED",
+    }:
         fields = value.get("fields", value)
         if not isinstance(fields, Mapping):
             raise LogRecordError("structured monitor fields are malformed")
@@ -921,6 +952,8 @@ def _parse_structured_message(value: Any) -> tuple[MonitorAlert | None, AlertMar
             return _normalize_pool_unstable(fields), None
         if state == "POOL_CONNECTION_RECOVERED":
             return _normalize_pool_recovered(fields), None
+        if state in {"STARTUP_HASHRATE_TIMEOUT", "STARTUP_HASHRATE_FAILED"}:
+            return _normalize_startup_hashrate_failure({**fields, "state": state}), None
         return _normalize_no_floor(fields), None
     message = value.get("message")
     if isinstance(message, str):
@@ -936,19 +969,13 @@ def _startup_signal(text: str | None) -> str | None:
     """
     if not isinstance(text, str) or len(text) > MAX_TEXT_LOG_CHARS:
         return None
-    monitor_match = _MONITOR_PROGRESS_RE.match(text)
-    if monitor_match is not None:
-        return "MONITOR_CONFIG" if monitor_match.group("state") == "CONFIG" else "GPU_DETECTED"
-    initialized = _INITIALIZED_RE.fullmatch(text)
-    if initialized is not None and initialized.group("gpu").strip():
-        return "DEVICE_INITIALIZED"
     hashrate = _HASHRATE_PROGRESS_RE.fullmatch(text)
     if hashrate is not None:
         try:
             rate = float(hashrate.group("rate"))
         except (ValueError, OverflowError):
             return None
-        if math.isfinite(rate) and 0 <= rate <= 100_000:
+        if math.isfinite(rate) and 0 < rate <= 100_000:
             return "DEVICE_HASHRATE"
     return None
 
@@ -976,8 +1003,6 @@ def _startup_signal_from_structured(value: Any) -> str | None:
         return _startup_signal(value)
     if not isinstance(value, Mapping):
         return None
-    if value.get("type") == "FL4SH_MONITOR" and value.get("state") in {"CONFIG", "GPU_DETECTED"}:
-        return "MONITOR_CONFIG" if value.get("state") == "CONFIG" else "GPU_DETECTED"
     for key in ("message", "text"):
         message = value.get(key)
         if isinstance(message, str):

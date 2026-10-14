@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 import getpass
 import http.client
 import json
+import re
 import ssl
 import sys
 from typing import Any, Callable
@@ -149,8 +150,35 @@ class CentralTelegramSender:
             raise TelegramSecretError("only provider-observed alerts are eligible for delivery")
         if payload.get("actions_performed") is not False:
             raise TelegramSecretError("alert action status is invalid")
+        identity = payload.get("identity")
+        required_identity_fields = (
+            "organization_name", "project_name", "container_group_name", "machine_id", "instance_id",
+        )
+        if (
+            not isinstance(identity, Mapping)
+            or identity.get("identity_status") != PROVIDER_OBSERVED
+            or identity.get("identity_source") not in {"resource.labels", "list_container_group_instances"}
+            or any(
+                not isinstance(identity.get(name), str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", identity[name])
+                for name in required_identity_fields
+            )
+            or identity.get("organization_name") != payload.get("query_organization")
+        ):
+            raise TelegramSecretError("complete provider-observed identity is required for delivery")
         if not isinstance(message_text, str) or not message_text or len(message_text) > MAX_TELEGRAM_TEXT_CHARS:
             raise TelegramSecretError("Telegram message is outside local limits")
+        expected_identity_lines = (
+            f"Organization: {identity['organization_name']}",
+            f"Project: {identity['project_name']}",
+            f"Container Group: {identity['container_group_name']}",
+            f"Machine ID: {identity['machine_id']}",
+            f"Instance ID: {identity['instance_id']}",
+            f"Identity source: {identity['identity_source']}",
+        )
+        message_lines = set(message_text.splitlines())
+        if any(line not in message_lines for line in expected_identity_lines):
+            raise TelegramSecretError("Telegram message must include the complete verified provider identity")
         if self._offline_responder is not None:
             return self._send_offline(message_text)
         from .live_capability import capability_allows

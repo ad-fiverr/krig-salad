@@ -45,6 +45,8 @@ if [[ "$mode" == --source ]]; then
     fail "final image must not substitute the incomplete minimal Python runtime"
   grep -Fq 'COPY --chmod=0555 gpu-mining/runtime/fl4shminer/fl4sh-runtime-monitor.py /opt/fl4shminer/fl4sh-runtime-monitor.py' "$DOCKERFILE" ||
     fail "final image does not contain the runtime monitor"
+  grep -Fq -- '--check-readiness --miner-pid' "$HEALTHCHECK" ||
+    fail "monitor-enabled healthcheck does not require productive hashrate readiness"
   grep -Fxq '!gpu-mining/runtime/fl4shminer/fl4sh-runtime-monitor.py' "$DOCKER_CONTEXT_IGNORE" ||
     fail "root Docker context does not allow the runtime monitor source"
   grep -Fxq '!gpu-mining/telemetry/collector/g4a_salad_get.py' "$DOCKER_CONTEXT_IGNORE" ||
@@ -71,6 +73,7 @@ if [[ "$mode" == --source ]]; then
     SALAD_G5_HASH_WINDOW_SECONDS SALAD_G5_REEVALUATION_INTERVAL_SECONDS
     SALAD_G5_MINIMUM_SAMPLES_PER_WINDOW SALAD_G5_MAXIMUM_SAMPLE_GAP_SECONDS
     SALAD_G5_MINIMUM_WINDOW_COVERAGE_RATIO SALAD_G5_CONSECUTIVE_BAD_WINDOWS
+    FL4SH_STARTUP_HASHRATE_TIMEOUT_SECONDS
     FL4SH_MONITOR_FLOOR_TOLERANCE_THS FL4SH_MONITOR_REALLOCATE_RENOTIFY_DROP_THS
     FL4SH_TELEGRAM_ENABLED FL4SH_TELEGRAM_BOT_TOKEN FL4SH_TELEGRAM_CHAT_ID
     FL4SH_TELEGRAM_POOL_ERROR_COOLDOWN_SECONDS FL4SH_MONITOR_LABEL
@@ -95,6 +98,8 @@ if [[ "$mode" == --source ]]; then
     fail "monitor output omitted the effective floor tolerance"
   grep -Fq 'reallocate_renotify_drop_ths=4.25' "$temporary.monitor-policy.out" ||
     fail "monitor output omitted the effective re-alert drop threshold"
+  grep -Fq 'startup_hashrate_timeout_seconds=180' "$temporary.monitor-policy.out" ||
+    fail "monitor output omitted the startup hashrate timeout"
   if env "${monitor_env_unset[@]}" FL4SH_MONITOR_ENABLED=1 \
     FL4SH_MONITOR_PROFILE=RTX_5090_LAPTOP FL4SH_MONITOR_FLOOR_TOLERANCE_THS=3.1 \
     "$python_bin" -B "$MONITOR" --check-config > "$temporary.invalid-policy.out" 2>&1; then
@@ -139,6 +144,10 @@ STUB
 if [[ "${1:-}" == /opt/fl4shminer/fl4sh-runtime-monitor.py && "${2:-}" == --check-config ]]; then
   printf 'FL4SH_MONITOR configuration valid provider_binding=UNKNOWN actions_performed=false\n'
   exit 0
+fi
+if [[ "${1:-}" == -m && "${2:-}" == log_alerts.live_cli ]]; then
+  printf 'STATUS=BLOCKED INTERACTIVE_TTY_REQUIRED\n'
+  exit 3
 fi
 exit 91
 STUB
@@ -274,6 +283,30 @@ PY
   grep -Fq 'requires FL4SH_MONITOR_ENABLED=1' "$temporary.telegram-guard.out" ||
     fail "Telegram/monitor dependency guard returned an unexpected message"
 
+  if env FL4SH_POOL_URL="$pool" FL4SH_MINING_ID="$mining_id" \
+    FL4SH_MONITOR_ENABLED=1 FL4SH_MONITOR_PROFILE=RTX_5090_LAPTOP \
+    FL4SH_TELEGRAM_ENABLED=1 bash "$ENTRYPOINT" --validate-config \
+    > "$temporary.miner-telegram-guard.out" 2>&1; then
+    fail "miner-local Telegram was accepted without provider identity"
+  fi
+  grep -Fq 'FL4SH_MONITOR configuration invalid: INVALID_ENTRYPOINT_CONFIGURATION' \
+    "$temporary.miner-telegram-guard.out" ||
+    fail "miner Telegram guard did not require central provider identity"
+
+  printf '[{"organization_name":"adrianfiverr","project_name":"miners"}]\n' \
+    > "$temporary.central-targets.json"
+  if env FL4SH_ROLE=central FL4SH_MONITOR_ENABLED=0 FL4SH_TELEGRAM_ENABLED=0 \
+    FL4SH_CENTRAL_TARGETS_FILE="$temporary.central-targets.json" \
+    FL4SH_CENTRAL_QUERY='resource.type="container"' \
+    FL4SH_CENTRAL_STATE_DIR="$temporary/central-state" \
+    PYTHONPATH="$REPO_ROOT/gpu-mining/telemetry" \
+    PATH="$temporary/bin:$PATH" \
+    bash "$ENTRYPOINT" </dev/null > "$temporary.central-role.out" 2>&1; then
+    fail "central watcher passed the required interactive live gate in source smoke"
+  fi
+  grep -Fq 'STATUS=BLOCKED INTERACTIVE_TTY_REQUIRED' "$temporary.central-role.out" ||
+    fail "central role did not stop before secrets or live network access"
+
   FL4SH_POOL_URL="$pool" FL4SH_MINING_ID="$mining_id" \
     FL4SH_MONITOR_ENABLED=1 FL4SH_MONITOR_PROFILE=RTX_5090_LAPTOP \
     FL4SH_TEST_EXECUTABLE="$temporary/miner-stub" \
@@ -319,7 +352,7 @@ if command -v dpkg-query >/dev/null 2>&1; then
   [[ -z "$driver_packages" ]] || fail "runtime image contains host driver packages: $driver_packages"
 fi
 command -v python3 >/dev/null 2>&1 || fail "runtime image is missing the opt-in monitor Python interpreter"
-if ! python3 -c 'import collections, dataclasses, datetime, hashlib, http.client, json, math, os, queue, re, signal, ssl, subprocess, sys, threading, time, typing, uuid' >/tmp/fl4sh-python-stdlib.out 2>&1; then
+  if ! python3 -c 'import collections, dataclasses, datetime, hashlib, http.client, json, math, os, queue, re, signal, ssl, stat, subprocess, sys, tempfile, threading, time, typing, uuid' >/tmp/fl4sh-python-stdlib.out 2>&1; then
   printf 'Python standard-library import diagnostic (first 12 lines):\n' >&2
   head -n 12 /tmp/fl4sh-python-stdlib.out | sed -E 's/(api[_-]?key|token|secret|password)([=: ]+)[^[:space:]]+/\1\2[REDACTED]/Ig' >&2
   fail "runtime image is missing required Python standard-library modules"

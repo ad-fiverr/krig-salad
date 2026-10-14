@@ -125,9 +125,13 @@ before a live run. No query is inferred or shipped as a default.
   accepted as provider lifecycle evidence because miner output can spoof it.
   After both synthetic observations for the same complete resource, the
   90-second grace is measured before preparing
-  `RUNNING_READY_BUT_MINER_NOT_STARTED`. Only exact `FL4SH_MONITOR` CONFIG or
-  GPU_DETECTED states and bounded `Device [N] ... Initialized` / `hashRate`
-  lines count as miner progress. The guard never joins partial, conflicting or
+  `RUNNING_READY_BUT_MINER_NOT_STARTED`. Only a bounded, finite, strictly
+  positive `Device [N] hashRate: ... TH/s` sample counts as miner progress.
+  CONFIG, GPU_DETECTED, `Initialized`, zero rates, autotune estimates, and
+  pool-equivalent values do not establish productivity. The runtime monitor's
+  `STARTUP_HASHRATE_TIMEOUT` record is separately normalized to a sanitized
+  `MINER_STARTUP_HASHRATE_TIMEOUT` event, enriched only with Salad provider
+  identity. The guard never joins partial, conflicting or
   different provider resource identities. Late progress records a `MINER_STARTUP_RECOVERED`
   transition, including a provider event ingested after an alert whose event
   timestamp falls inside the grace period. The recovery event records the
@@ -215,6 +219,29 @@ See [FLEET_RUNBOOK.md](FLEET_RUNBOOK.md) for the single-command fleet launcher,
 credential prompts, state paths, and preflight gates. That launcher was not run
 as part of this offline implementation.
 
+## Combined image roles and productive health
+
+The Fl4shMiner image has a `miner` role and a separately selected `central`
+role. The miner role does not send operator Telegram notifications and rejects
+`FL4SH_TELEGRAM_ENABLED=1`; it cannot claim a Salad Machine ID from local miner
+output. In monitor mode, its healthcheck requires the supervisor, a live
+non-zombie Fl4shMiner child, and fresh positive device TH/s in an atomic
+readiness record tied to that child's PID, monitor session and policy hash. A
+missing positive sample by the configured startup timeout makes the supervisor
+stop the child and exit unsuccessfully. The default monitor-off process and
+liveness behavior remain unchanged.
+
+The central role does not start the miner. It uses the existing interactive
+Salad-read and Telegram gates, and delivery is held until organization,
+project, Container Group, Machine ID and Instance ID are complete and verified
+from provider `resource.labels` or the exact same-scope List Instances lookup.
+No unknown or conflicting binding falls back to a local identity label. The
+entrypoint's `.watcher.lock` prevents two processes only when they share the
+same local lock filesystem; it does not provide distributed coordination. A
+container can fail its own healthcheck and terminate a nonproductive miner, but
+cannot prevent a transient Salad `Instance Running` state if Salad manages that
+state independently of container health.
+
 ## Offline test
 
 From the repository root, run:
@@ -251,7 +278,7 @@ made in this task:
 | Salad credential | Reuses exact `InteractiveSecretProvider` / `SecretMaterial` classes from the repository-owned boundary | Hidden TTY input only, acquired once and kept in memory for all organizations in the process. The production transport and adapter reject arbitrary provider/material types. Environment, command-line, config, file, browser, Firebase and SQLite sources are not accepted. This task never prompts for a key. |
 | Contract probe | Implemented, not executed | One physical request with a window no longer than the configured maximum; it never splits a saturated page. Output includes completeness status, response counts, resource types, identity status counts and label-key names. It never prints label values, IDs, raw logs or credentials. Probe mode cannot send Telegram. |
 | Central Telegram | Implemented, per-invocation gated | Fixed `api.telegram.org:443` HTTPS `sendMessage`, TLS verification, finite bounds, no redirects/retries. Watch mode requires `--enable-central-telegram`; token and chat ID use hidden TTY input and remain in memory. No delivery occurred in this task. |
-| Delivery | One attempt maximum | Separate durable states: `PENDING`, `DISPATCHING`, `SENT`, `DELIVERY_UNKNOWN`, `FAILED`. A restart in `DISPATCHING` becomes `DELIVERY_UNKNOWN`; no retry occurs. Only newly inserted, unsuppressed `PROVIDER_OBSERVED` alerts can enter delivery. Synthetic alerts are never sent. |
+| Delivery | One attempt maximum | Separate durable states: `PENDING`, `DISPATCHING`, `SENT`, `DELIVERY_UNKNOWN`, `FAILED`. A restart in `DISPATCHING` becomes `DELIVERY_UNKNOWN`; no retry occurs. An unsuppressed provider-observed alert remains `PENDING` until organization, project, Container Group, Machine ID and Instance ID are all verified and present in the message. A later exact identity enrichment can unlock that same pending dedupe key; it never reopens `SENT`, `DELIVERY_UNKNOWN` or `FAILED`. Synthetic alerts are never sent. |
 | Live lifecycle | Disabled | Salad `Running`/`Ready` lifecycle semantics remain unverified; `StartupGuard` runs only on explicitly synthetic lifecycle fixtures. |
 | Reallocation / start / stop | Not implemented | No import, route, client, or action path is present. `actions_performed` remains false. |
 | Firebase | Not implemented | This package has no Firebase sink. |

@@ -203,7 +203,7 @@ class StartupGuard:
                     state["ready_time_utc"] = entry.event_time_utc
                     state["ready_evidence_sha256"] = entry.evidence_sha256
                     state["ready_source"] = entry.startup_signal_source
-            elif signal in {"MONITOR_CONFIG", "GPU_DETECTED", "DEVICE_INITIALIZED", "DEVICE_HASHRATE"}:
+            elif signal == "DEVICE_HASHRATE":
                 running = state.get("running_time_utc")
                 if running is not None and _parse_time(entry.event_time_utc) >= _parse_time(running):
                     prior_progress = state.get("progress_time_utc")
@@ -385,9 +385,14 @@ def sanitize_startup_state(value: Mapping[str, Any]) -> dict[str, Any]:
         None, "CUDA_DRIVER_VERSION_INSUFFICIENT",
     }:
         raise ValueError("startup terminal failure reason is invalid")
-    if safe.get("progress_signal") not in {
-        None, "MONITOR_CONFIG", "GPU_DETECTED", "DEVICE_INITIALIZED", "DEVICE_HASHRATE",
-    }:
+    if safe.get("progress_signal") in {"MONITOR_CONFIG", "GPU_DETECTED", "DEVICE_INITIALIZED"}:
+        # Older local state may have recorded configuration/GPU initialization
+        # as progress. Migrate it to no progress so only a positive Device
+        # hashRate sample can satisfy the startup guard.
+        safe["progress_time_utc"] = None
+        safe["progress_signal"] = None
+        safe["progress_source"] = None
+    if safe.get("progress_signal") not in {None, "DEVICE_HASHRATE"}:
         raise ValueError("startup progress signal is invalid")
     for key in ("running_source", "ready_source", "progress_source", "terminal_failure_source"):
         if safe.get(key) not in {

@@ -11,7 +11,9 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -958,7 +960,8 @@ class TelegramAuditTests(unittest.TestCase):
             "import os; print('child_secret_env=' + repr((os.getenv('FL4SH_TELEGRAM_BOT_TOKEN'), "
             "os.getenv('FL4SH_TELEGRAM_CHAT_ID'))), flush=True); "
             f"print('synthetic echo {token}', flush=True); "
-            f"print({POOL_CONNECTION_FAILED_WITH_TIMESTAMP!r}, flush=True)"
+            f"print({POOL_CONNECTION_FAILED_WITH_TIMESTAMP!r}, flush=True); "
+            "print('Device [1] hashRate: 1.00 TH/s', flush=True)"
         )
         output = io.BytesIO()
         error = io.BytesIO()
@@ -1060,7 +1063,8 @@ class TelegramAuditTests(unittest.TestCase):
         accepted = "Solutions accepted: 5-NVIDIA GeForce RTX 5090 Laptop GPU, 0 stale"
         child_code = (
             f"print({POOL_CONNECTION_FAILED_WITHOUT_TIMESTAMP!r}, flush=True); "
-            f"print({accepted!r}, flush=True)"
+            f"print({accepted!r}, flush=True); "
+            "print('Device [1] hashRate: 1.00 TH/s', flush=True)"
         )
         output = io.BytesIO()
         error = io.BytesIO()
@@ -1725,6 +1729,7 @@ class RedactionAndSupervisorTests(unittest.TestCase):
         )
         child_code = (
             f"print({raw_line!r}, flush=True); "
+            "print('Device [7] hashRate: 1.00 TH/s', flush=True); "
             f"import sys; print('stderr={secret}', file=sys.stderr, flush=True)"
         )
         completed = subprocess.run(
@@ -1857,7 +1862,10 @@ class RedactionAndSupervisorTests(unittest.TestCase):
                         "--",
                         sys.executable,
                         "-c",
-                        f"raise SystemExit({exit_code})",
+                        (
+                            "print('Device [1] hashRate: 1.00 TH/s', flush=True); "
+                            if exit_code == 0 else ""
+                        ) + f"raise SystemExit({exit_code})",
                     ],
                     env=environment,
                     stdout=subprocess.PIPE,
@@ -1929,6 +1937,7 @@ class RedactionAndSupervisorTests(unittest.TestCase):
         )
         child_code = (
             "import sys,time; "
+            "print('Device [1] hashRate: 1.00 TH/s', flush=True); "
             "sys.stdout.buffer.write(b'prefix=split-'); sys.stdout.flush(); "
             "sys.stderr.buffer.write(b'parallel-stderr\\n'); sys.stderr.flush(); "
             "time.sleep(0.4); "
@@ -2083,6 +2092,205 @@ class RedactionAndSupervisorTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(child.stdout.bytes_read, len(payload))
         self.assertEqual(child.stderr.bytes_read, len(b"still-drained\n"))
+
+
+class ProductiveReadinessTests(unittest.TestCase):
+    SESSION_ID = "01234567-89ab-cdef-0123-456789abcdef"
+
+    def test_readiness_requires_fresh_positive_sample_matching_process_and_policy(self) -> None:
+        config = make_config(SALAD_G5_MAXIMUM_SAMPLE_GAP_SECONDS="10")
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "readiness.json")
+            MONITOR._write_readiness_file(
+                path,
+                session_id=self.SESSION_ID,
+                supervisor_pid=321,
+                miner_pid=654,
+                policy_hash=config.policy_hash,
+                device_samples={1: (1.25, 1_000.0)},
+                generated_at_epoch=1_000.0,
+            )
+            self.assertTrue(MONITOR._readiness_is_healthy(
+                path, config=config, supervisor_pid=321, miner_pid=654, now_epoch=1_005.0,
+            ))
+            self.assertFalse(MONITOR._readiness_is_healthy(
+                path, config=config, supervisor_pid=321, miner_pid=655, now_epoch=1_005.0,
+            ))
+            self.assertFalse(MONITOR._readiness_is_healthy(
+                path, config=config, supervisor_pid=321, miner_pid=654, now_epoch=1_011.0,
+            ))
+            self.assertFalse(MONITOR._readiness_is_healthy(
+                path,
+                config=make_config(
+                    SALAD_G5_EXPECTED_SAMPLE_INTERVAL_SECONDS="9",
+                    SALAD_G5_MAXIMUM_SAMPLE_GAP_SECONDS="9",
+                ),
+                supervisor_pid=321,
+                miner_pid=654,
+                now_epoch=1_005.0,
+            ))
+
+    def test_zero_hashrate_and_old_session_artifacts_are_not_healthy(self) -> None:
+        config = make_config(SALAD_G5_MAXIMUM_SAMPLE_GAP_SECONDS="10")
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "readiness.json")
+            MONITOR._write_readiness_file(
+                path,
+                session_id=self.SESSION_ID,
+                supervisor_pid=1,
+                miner_pid=77,
+                policy_hash=config.policy_hash,
+                device_samples={1: (0.0, 1_000.0)},
+                generated_at_epoch=1_000.0,
+            )
+            self.assertFalse(MONITOR._readiness_is_healthy(
+                path, config=config, miner_pid=77, now_epoch=1_001.0,
+            ))
+            MONITOR._clear_readiness_file(path)
+            self.assertFalse(os.path.exists(path))
+
+    def test_readiness_cli_accepts_only_matching_fresh_pid_and_policy(self) -> None:
+        config = make_config(SALAD_G5_MAXIMUM_SAMPLE_GAP_SECONDS="10")
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "readiness.json")
+            MONITOR._write_readiness_file(
+                path,
+                session_id=self.SESSION_ID,
+                supervisor_pid=1,
+                miner_pid=77,
+                policy_hash=config.policy_hash,
+                device_samples={1: (10.0, MONITOR.time.time())},
+                generated_at_epoch=MONITOR.time.time(),
+            )
+            with mock.patch.object(MONITOR, "READINESS_PATH", path), mock.patch.dict(
+                MONITOR.os.environ,
+                {
+                    "FL4SH_MONITOR_ENABLED": "1",
+                    "FL4SH_MONITOR_PROFILE": "RTX_5090_LAPTOP",
+                    "SALAD_G5_WARMUP_SECONDS": "0",
+                    "SALAD_G5_EXPECTED_SAMPLE_INTERVAL_SECONDS": "10",
+                    "SALAD_G5_HASH_WINDOW_SECONDS": "20",
+                    "SALAD_G5_REEVALUATION_INTERVAL_SECONDS": "5",
+                    "SALAD_G5_MINIMUM_SAMPLES_PER_WINDOW": "2",
+                    "SALAD_G5_MAXIMUM_SAMPLE_GAP_SECONDS": "10",
+                    "SALAD_G5_MINIMUM_WINDOW_COVERAGE_RATIO": "0.8",
+                    "SALAD_G5_CONSECUTIVE_BAD_WINDOWS": "2",
+                },
+                clear=True,
+            ):
+                self.assertEqual(MONITOR.main(["--check-readiness", "--miner-pid", "77"]), 0)
+                self.assertNotEqual(MONITOR.main(["--check-readiness", "--miner-pid", "78"]), 0)
+                self.assertEqual(MONITOR.main(["--check-readiness", "--miner-pid", "0"]), 64)
+
+    def test_startup_watchdog_fails_closed_without_positive_device_hashrate(self) -> None:
+        environment = os.environ.copy()
+        environment.update({
+            "FL4SH_MONITOR_ENABLED": "1",
+            "FL4SH_MONITOR_PROFILE": "RTX_5090_LAPTOP",
+            "FL4SH_STARTUP_HASHRATE_TIMEOUT_SECONDS": "1",
+            "SALAD_G5_MAXIMUM_SAMPLE_GAP_SECONDS": "5",
+            "SALAD_G5_EXPECTED_SAMPLE_INTERVAL_SECONDS": "5",
+        })
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "fl4sh-runtime-monitor.py"),
+                "--", sys.executable, "-c", "import time; time.sleep(10)",
+            ],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 70, completed.stderr.decode("utf-8", "replace"))
+        output = completed.stdout.decode("utf-8", "replace")
+        self.assertIn("state=STARTUP_HASHRATE_TIMEOUT", output)
+        self.assertIn("reason=NO_POSITIVE_DEVICE_HASHRATE", output)
+        self.assertIn("actions_performed=false", output)
+        self.assertNotIn("api_key", output.lower())
+        self.assertFalse(os.path.exists(MONITOR.READINESS_PATH))
+
+    def test_clean_miner_exit_before_hashrate_is_not_healthy(self) -> None:
+        environment = os.environ.copy()
+        environment.update({
+            "FL4SH_MONITOR_ENABLED": "1",
+            "FL4SH_MONITOR_PROFILE": "RTX_5090_LAPTOP",
+            "FL4SH_STARTUP_HASHRATE_TIMEOUT_SECONDS": "30",
+        })
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "fl4sh-runtime-monitor.py"),
+                "--", sys.executable, "-c", "print('CUDA initialized only', flush=True)",
+            ],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 70)
+        self.assertIn(b"state=STARTUP_HASHRATE_FAILED", completed.stdout)
+        self.assertIn(b"reason=MINER_EXITED_BEFORE_HASHRATE", completed.stdout)
+
+    def test_positive_hashrate_sample_is_atomically_published_while_child_runs(self) -> None:
+        environment = os.environ.copy()
+        environment.update({
+            "FL4SH_MONITOR_ENABLED": "1",
+            "FL4SH_MONITOR_PROFILE": "RTX_5090_LAPTOP",
+            "FL4SH_STARTUP_HASHRATE_TIMEOUT_SECONDS": "3",
+            "SALAD_G5_EXPECTED_SAMPLE_INTERVAL_SECONDS": "1",
+            "SALAD_G5_MAXIMUM_SAMPLE_GAP_SECONDS": "1",
+            "SALAD_G5_HASH_WINDOW_SECONDS": "10",
+            "SALAD_G5_REEVALUATION_INTERVAL_SECONDS": "5",
+            "SALAD_G5_MINIMUM_SAMPLES_PER_WINDOW": "2",
+        })
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(ROOT / "fl4sh-runtime-monitor.py"),
+                "--", sys.executable, "-c",
+                "import time; print('Device [1] hashRate: 12.5 TH/s', flush=True); time.sleep(2)",
+            ],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 2.0
+            record: dict[str, object] | None = None
+            while time.monotonic() < deadline:
+                try:
+                    with open(MONITOR.READINESS_PATH, "r", encoding="utf-8") as stream:
+                        candidate = MONITOR.json.load(stream)
+                    if isinstance(candidate, dict) and candidate.get("miner_pid"):
+                        record = candidate
+                        break
+                except (OSError, ValueError):
+                    pass
+                time.sleep(0.05)
+            self.assertIsNotNone(record, "positive sample readiness file was not published")
+            assert record is not None
+            self.assertEqual(record["supervisor_pid"], process.pid)
+            config = MONITOR.MonitorConfig.from_env(environment, require_enabled=True)
+            self.assertTrue(MONITOR._readiness_is_healthy(
+                MONITOR.READINESS_PATH,
+                config=config,
+                supervisor_pid=process.pid,
+                miner_pid=int(record["miner_pid"]),
+                now_epoch=MONITOR.time.time(),
+            ))
+            self.assertEqual(process.wait(timeout=5), 0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+        self.assertFalse(os.path.exists(MONITOR.READINESS_PATH))
 
 
 if __name__ == "__main__":

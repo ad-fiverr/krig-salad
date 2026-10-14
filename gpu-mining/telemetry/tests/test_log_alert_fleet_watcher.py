@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import hashlib
+import importlib.util
 import io
 import json
 from pathlib import Path
@@ -31,7 +32,11 @@ from log_alerts.fleet_targets import (  # noqa: E402
 )
 from log_alerts.fleet_watcher import CentralFleetWatcher  # noqa: E402
 from log_alerts.live_capability import authorize_live_invocation  # noqa: E402
-from log_alerts.live_cli import main as live_cli_main  # noqa: E402
+from log_alerts import live_cli as live_cli_module  # noqa: E402
+from log_alerts.live_cli import (  # noqa: E402
+    WatcherAlreadyRunning,
+    main as live_cli_main,
+)
 from log_alerts.live_transport import (  # noqa: E402
     LiveSaladReadTransport,
     LiveTransportBlocked,
@@ -39,6 +44,15 @@ from log_alerts.live_transport import (  # noqa: E402
     SaladTransportResponse,
     secret_boundary_types,
 )
+
+
+_SMOKE_PATH = TELEMETRY_ROOT.parent / "runtime" / "fl4shminer" / "ci-fleet-image-smoke.py"
+_SMOKE_SPEC = importlib.util.spec_from_file_location("fl4sh_fleet_image_smoke_test", _SMOKE_PATH)
+if _SMOKE_SPEC is None or _SMOKE_SPEC.loader is None:
+    raise RuntimeError("Fl4sh fleet image smoke module is unavailable")
+_SMOKE_MODULE = importlib.util.module_from_spec(_SMOKE_SPEC)
+sys.modules[_SMOKE_SPEC.name] = _SMOKE_MODULE
+_SMOKE_SPEC.loader.exec_module(_SMOKE_MODULE)
 
 
 ORGANIZATIONS = ("fleet-alpha", "fleet-bravo")
@@ -169,6 +183,46 @@ def _page(items: list[dict[str, object]]) -> dict[str, object]:
 
 
 class CentralFleetWatcherTests(unittest.TestCase):
+    def test_synthetic_image_layout_resolves_monitor_and_healthcheck_at_install_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            image_root = Path(temporary) / "fl4shminer"
+            image_root.mkdir()
+            for relative in _SMOKE_MODULE.WATCHER_INPUTS:
+                target = image_root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("# synthetic packaged fixture\n", encoding="utf-8")
+            for relative in _SMOKE_MODULE.RUNTIME_INPUTS:
+                (image_root / Path(relative).name).write_text(
+                    "# synthetic packaged fixture\n", encoding="utf-8",
+                )
+            (image_root / "fl4shminer").write_text("synthetic binary fixture\n", encoding="utf-8")
+
+            _SMOKE_MODULE.check_image_tree(image_root)
+            monitor_path, healthcheck_path = _SMOKE_MODULE.runtime_script_paths(
+                image_root, image=True,
+            )
+            self.assertEqual(monitor_path, image_root / "fl4sh-runtime-monitor.py")
+            self.assertEqual(healthcheck_path, image_root / "fl4sh-healthcheck.sh")
+            self.assertTrue(monitor_path.is_file())
+            self.assertTrue(healthcheck_path.is_file())
+
+    def test_healthcheck_has_a_distinct_central_watcher_readiness_contract(self):
+        healthcheck = (
+            TELEMETRY_ROOT.parent / "runtime" / "fl4shminer" / "fl4sh-healthcheck.sh"
+        ).read_text(encoding="utf-8")
+        for required in (
+            'container_role="${FL4SH_ROLE:-miner}"',
+            'if [[ "$container_role" == central ]]; then',
+            '[[ "$process_name" == python3 && -r /proc/1/cmdline ]]',
+            '[[ "$command_line" == *"-m log_alerts.live_cli"* ]]',
+            '[[ "$command_line" == *"--watch-live-alerts"* ]]',
+            '[[ "${FL4SH_MONITOR_ENABLED:-0}" == 0 ]]',
+            '[[ "${FL4SH_TELEGRAM_ENABLED:-0}" == 0 ]]',
+            '[[ "$container_role" == miner ]] || exit 1',
+            '--check-readiness --miner-pid "$child"',
+        ):
+            self.assertIn(required, healthcheck)
+
     def make_watcher(self, directory, items_by_org, instance_rows_by_scope, *, failing=None,
                      lookup_failing=None, query_responder=None, poll_seconds=30,
                      clock=None, monotonic=None):
@@ -821,6 +875,17 @@ class CentralFleetWatcherTests(unittest.TestCase):
                 "--query", 'severity="ERROR"',
             ])
         self.assertEqual(code, 2)
+
+    def test_watcher_lock_allows_only_one_process_per_local_state_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = live_cli_module._acquire_watcher_lock(directory)
+            try:
+                with self.assertRaises(WatcherAlreadyRunning):
+                    live_cli_module._acquire_watcher_lock(directory)
+            finally:
+                live_cli_module._release_watcher_lock(first)
+            second = live_cli_module._acquire_watcher_lock(directory)
+            live_cli_module._release_watcher_lock(second)
 
 
 if __name__ == "__main__":

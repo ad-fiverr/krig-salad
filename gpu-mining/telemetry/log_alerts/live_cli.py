@@ -6,6 +6,9 @@ import argparse
 from dataclasses import asdict
 from datetime import datetime, timezone
 import json
+import os
+from pathlib import Path
+import stat
 import sys
 from typing import Sequence
 
@@ -24,6 +27,65 @@ from .ledger import SQLiteAlertLedger
 from .live_capability import LiveCapabilityBlocked, authorize_live_invocation
 from .live_controller import LiveLogAlertController, LiveControllerBlocked
 from .live_transport import LiveSaladReadTransport, secret_boundary_types
+
+
+class WatcherAlreadyRunning(RuntimeError):
+    """A watcher already holds the state-directory process lock."""
+
+
+def _acquire_watcher_lock(state_dir: str) -> int:
+    path = Path(state_dir).expanduser()
+    if path.is_symlink():
+        raise ValueError("watcher state directory must not be a symbolic link")
+    path.mkdir(parents=True, exist_ok=True)
+    resolved = path.resolve()
+    lock_path = resolved / ".watcher.lock"
+    if lock_path.is_symlink():
+        raise ValueError("watcher lock must not be a symbolic link")
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError:
+        raise ValueError("watcher lock file is unavailable") from None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("watcher lock file must be regular")
+        if os.name == "nt":
+            import msvcrt
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\0")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            try:
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            except OSError:
+                raise WatcherAlreadyRunning() from None
+        else:
+            import fcntl
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                raise WatcherAlreadyRunning() from None
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _release_watcher_lock(descriptor: int) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -127,7 +189,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not sys.stdin.isatty():
         print("STATUS=BLOCKED INTERACTIVE_TTY_REQUIRED")
         return 3
+    watcher_lock_fd: int | None = None
     try:
+        if args.watch_live_alerts:
+            watcher_lock_fd = _acquire_watcher_lock(args.state_dir)
         secret_provider = _load_interactive_salad_provider()
         InteractiveSecretProvider, _, _ = secret_boundary_types()
         if type(secret_provider) is not InteractiveSecretProvider:
@@ -199,10 +264,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("STATUS=STOPPED GRACEFUL=true")
         return 0
+    except WatcherAlreadyRunning:
+        print("STATUS=BLOCKED WATCHER_ALREADY_RUNNING")
+        return 3
     except Exception:
         # Do not echo exception strings; URLs, log bodies or secrets may appear.
         print("STATUS=FAILED DETAILS=REDACTED")
         return 1
+    finally:
+        if watcher_lock_fd is not None:
+            _release_watcher_lock(watcher_lock_fd)
 
 
 if __name__ == "__main__":

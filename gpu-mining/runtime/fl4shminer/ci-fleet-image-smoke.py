@@ -18,7 +18,9 @@ import shlex
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import urllib.request
 
 
@@ -171,6 +173,15 @@ def expected_image_files(root: Path) -> set[str]:
         Path(item).relative_to(root).as_posix()
         for item in COPY_INPUTS
     }
+
+
+def runtime_script_paths(root: Path, *, image: bool) -> tuple[Path, Path]:
+    """Return monitor/healthcheck paths for repository and installed-image layouts."""
+    runtime_root = root if image else root / "gpu-mining/runtime/fl4shminer"
+    return (
+        runtime_root / "fl4sh-runtime-monitor.py",
+        runtime_root / "fl4sh-healthcheck.sh",
+    )
 
 
 def check_sources_exist(root: Path) -> None:
@@ -424,6 +435,66 @@ def check_imports_and_inert_startup(root: Path, *, image: bool) -> None:
     if Path(sys.modules[interactive_type.__module__].__file__).resolve() != boundary_path:
         fail("secret provider did not resolve to the exact packaged G4C boundary")
 
+    monitor_path, healthcheck_path = runtime_script_paths(root, image=image)
+    try:
+        healthcheck_source = healthcheck_path.read_text(encoding="utf-8")
+    except OSError:
+        fail("productive healthcheck source is unavailable")
+    if "--check-readiness --miner-pid \"$child\"" not in healthcheck_source:
+        fail("monitor-enabled healthcheck does not require fresh readiness for the miner child")
+    central_health_contract = (
+        'if [[ "$container_role" == central ]]; then',
+        '[[ "$process_name" == python3 && -r /proc/1/cmdline ]]',
+        '[[ "$command_line" == *"-m log_alerts.live_cli"* ]]',
+        '[[ "$command_line" == *"--watch-live-alerts"* ]]',
+        '[[ "${FL4SH_MONITOR_ENABLED:-0}" == 0 ]]',
+        '[[ "${FL4SH_TELEGRAM_ENABLED:-0}" == 0 ]]',
+    )
+    if any(contract not in healthcheck_source for contract in central_health_contract):
+        fail("central healthcheck does not verify its live watcher process and disabled local actions")
+    monitor_spec = importlib.util.spec_from_file_location("fl4sh_readiness_smoke", monitor_path)
+    if monitor_spec is None or monitor_spec.loader is None:
+        fail("runtime monitor cannot be imported for productive readiness smoke")
+    monitor_module = importlib.util.module_from_spec(monitor_spec)
+    sys.modules[monitor_spec.name] = monitor_module
+    monitor_spec.loader.exec_module(monitor_module)
+    monitor_config = monitor_module.MonitorConfig.from_env(
+        {"FL4SH_MONITOR_ENABLED": "1", "FL4SH_MONITOR_PROFILE": "RTX_5090_LAPTOP"},
+        require_enabled=True,
+    )
+    now = time.time()
+    with tempfile.TemporaryDirectory(prefix="fl4sh-readiness-smoke-") as temporary:
+        readiness_path = str(Path(temporary) / "readiness.json")
+        common = {
+            "session_id": "01234567-89ab-cdef-0123-456789abcdef",
+            "supervisor_pid": 1,
+            "miner_pid": 77,
+            "policy_hash": monitor_config.policy_hash,
+            "generated_at_epoch": now,
+        }
+        monitor_module._write_readiness_file(
+            readiness_path, device_samples={1: (12.5, now)}, **common,
+        )
+        if not monitor_module._readiness_is_healthy(
+            readiness_path, config=monitor_config, miner_pid=77, now_epoch=now + 1,
+        ):
+            fail("fresh positive Fl4shMiner TH/s did not satisfy productive readiness")
+        monitor_module._write_readiness_file(
+            readiness_path, device_samples={1: (0.0, now)}, **common,
+        )
+        if monitor_module._readiness_is_healthy(
+            readiness_path, config=monitor_config, miner_pid=77, now_epoch=now + 1,
+        ):
+            fail("zero Fl4shMiner TH/s incorrectly satisfied productive readiness")
+        monitor_module._write_readiness_file(
+            readiness_path, device_samples={1: (12.5, now - monitor_config.maximum_sample_gap_seconds - 1)},
+            **common,
+        )
+        if monitor_module._readiness_is_healthy(
+            readiness_path, config=monitor_config, miner_pid=77, now_epoch=now,
+        ):
+            fail("stale Fl4shMiner TH/s incorrectly satisfied productive readiness")
+
     loaded = set(sys.modules) - before_modules
     for name in loaded:
         root_name = name.split(".", 1)[0]
@@ -502,6 +573,7 @@ def check_imports_and_inert_startup(root: Path, *, image: bool) -> None:
     print("WATCHER_DEFAULT_OFF_OFFLINE_OK")
     if image:
         print("WATCHER_MODULE_CLI_DEFAULT_OFF_OK")
+    print("PRODUCTIVE_READINESS_CONTRACT_OK")
 
 
 def main() -> int:

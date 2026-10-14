@@ -19,8 +19,10 @@ import queue
 import re
 import signal
 import ssl
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -105,6 +107,12 @@ TELEGRAM_TOKEN_ENV = "FL4SH_TELEGRAM_BOT_TOKEN"
 TELEGRAM_CHAT_ENV = "FL4SH_TELEGRAM_CHAT_ID"
 TELEGRAM_COOLDOWN_ENV = "FL4SH_TELEGRAM_POOL_ERROR_COOLDOWN_SECONDS"
 TELEGRAM_LABEL_ENV = "FL4SH_MONITOR_LABEL"
+STARTUP_HASHRATE_TIMEOUT_ENV = "FL4SH_STARTUP_HASHRATE_TIMEOUT_SECONDS"
+DEFAULT_STARTUP_HASHRATE_TIMEOUT_SECONDS = 180
+MAX_STARTUP_HASHRATE_TIMEOUT_SECONDS = 3600
+STARTUP_STOP_GRACE_SECONDS = 5
+READINESS_PATH = os.path.join(tempfile.gettempdir(), "fl4shminer-readiness.json")
+READINESS_MAX_BYTES = 4096
 
 TIMING_ENV: dict[str, tuple[str, str, float | int]] = {
     "warmup_seconds": ("SALAD_G5_WARMUP_SECONDS", "int", 90),
@@ -115,6 +123,9 @@ TIMING_ENV: dict[str, tuple[str, str, float | int]] = {
     "maximum_sample_gap_seconds": ("SALAD_G5_MAXIMUM_SAMPLE_GAP_SECONDS", "int", 30),
     "minimum_window_coverage_ratio": ("SALAD_G5_MINIMUM_WINDOW_COVERAGE_RATIO", "float", 0.8),
     "consecutive_bad_windows": ("SALAD_G5_CONSECUTIVE_BAD_WINDOWS", "int", 2),
+    "startup_hashrate_timeout_seconds": (
+        STARTUP_HASHRATE_TIMEOUT_ENV, "int", DEFAULT_STARTUP_HASHRATE_TIMEOUT_SECONDS,
+    ),
 }
 
 
@@ -189,6 +200,7 @@ class MonitorConfig:
     maximum_sample_gap_seconds: int
     minimum_window_coverage_ratio: float
     consecutive_bad_windows: int
+    startup_hashrate_timeout_seconds: int
     floor_tolerance_ths: float
     reallocate_renotify_drop_ths: float
     policy_hash: str
@@ -248,6 +260,10 @@ class MonitorConfig:
                 timing[key] = value
 
         _validate_timing(timing)
+        if timing["startup_hashrate_timeout_seconds"] > MAX_STARTUP_HASHRATE_TIMEOUT_SECONDS:
+            raise MonitorConfigError(
+                f"{STARTUP_HASHRATE_TIMEOUT_ENV} exceeds the supported limit"
+            )
         floor_tolerance = _parse_finite_number(
             env.get(FLOOR_TOLERANCE_ENV, str(DEFAULT_FLOOR_TOLERANCE_THS)),
             FLOOR_TOLERANCE_ENV,
@@ -1123,6 +1139,7 @@ def format_config(config: MonitorConfig, *, telegram_enabled: bool = False) -> s
         f"maximum_sample_gap_seconds={config.maximum_sample_gap_seconds}",
         f"minimum_window_coverage_ratio={_format_number(config.minimum_window_coverage_ratio)}",
         f"consecutive_bad_windows={config.consecutive_bad_windows}",
+        f"startup_hashrate_timeout_seconds={config.startup_hashrate_timeout_seconds}",
         f"policy_hash={config.policy_hash}",
     ]
     if telegram_enabled:
@@ -1136,6 +1153,137 @@ def format_config(config: MonitorConfig, *, telegram_enabled: bool = False) -> s
         ]
     )
     return " ".join(fields)
+
+
+def _clear_readiness_file(path: str) -> None:
+    """Remove only our regular readiness artifact; refuse links or other files."""
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(metadata.st_mode) or os.path.islink(path):
+        raise OSError("readiness artifact is not a regular file")
+    os.unlink(path)
+
+
+def _write_readiness_file(
+    path: str,
+    *,
+    session_id: str,
+    supervisor_pid: int,
+    miner_pid: int,
+    policy_hash: str,
+    device_samples: Mapping[int, tuple[float, float]],
+    generated_at_epoch: float,
+) -> None:
+    """Atomically publish bounded scalar telemetry, never raw miner text."""
+    if os.path.islink(path):
+        raise OSError("readiness artifact cannot be a symbolic link")
+    samples = [
+        {"device_index": index, "hashrate_ths": rate, "observed_at_epoch": observed}
+        for index, (rate, observed) in sorted(device_samples.items())
+    ]
+    payload = {
+        "schema_version": 1,
+        "monitor_session_id": session_id,
+        "supervisor_pid": supervisor_pid,
+        "miner_pid": miner_pid,
+        "policy_hash": policy_hash,
+        "generated_at_epoch": generated_at_epoch,
+        "device_samples": samples,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    if len(encoded.encode("utf-8")) > READINESS_MAX_BYTES:
+        raise OSError("readiness artifact exceeds its size limit")
+    parent = os.path.dirname(path) or "."
+    handle = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", prefix=".fl4sh-readiness-",
+        suffix=".tmp", dir=parent, delete=False,
+    )
+    temporary = handle.name
+    try:
+        try:
+            os.chmod(temporary, 0o600)
+        except OSError:
+            if os.name != "nt":
+                raise
+        with handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        except OSError:
+            pass
+
+
+def _readiness_is_healthy(
+    path: str,
+    *,
+    config: MonitorConfig,
+    miner_pid: int,
+    supervisor_pid: int = 1,
+    now_epoch: float | None = None,
+) -> bool:
+    """Fail closed on stale, malformed, mismatched or non-positive telemetry."""
+    try:
+        metadata = os.lstat(path)
+        if os.path.islink(path) or not stat.S_ISREG(metadata.st_mode) or metadata.st_size > READINESS_MAX_BYTES:
+            return False
+        with open(path, "r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+        required = {
+            "schema_version", "monitor_session_id", "supervisor_pid", "miner_pid",
+            "policy_hash", "generated_at_epoch", "device_samples",
+        }
+        if not isinstance(payload, dict) or set(payload) != required:
+            return False
+        if (
+            payload["schema_version"] != 1
+            or not isinstance(payload["monitor_session_id"], str)
+            or not re.fullmatch(r"[0-9a-f-]{36}", payload["monitor_session_id"])
+            or payload["supervisor_pid"] != supervisor_pid
+            or payload["miner_pid"] != miner_pid
+            or payload["policy_hash"] != config.policy_hash
+        ):
+            return False
+        generated = payload["generated_at_epoch"]
+        if type(generated) not in {float, int} or not math.isfinite(generated):
+            return False
+        now = time.time() if now_epoch is None else now_epoch
+        age = now - float(generated)
+        if not math.isfinite(age) or age < 0 or age > config.maximum_sample_gap_seconds:
+            return False
+        samples = payload["device_samples"]
+        if not isinstance(samples, list) or not samples or len(samples) > 256:
+            return False
+        for sample in samples:
+            if not isinstance(sample, dict) or set(sample) != {
+                "device_index", "hashrate_ths", "observed_at_epoch",
+            }:
+                return False
+            rate = sample["hashrate_ths"]
+            observed = sample["observed_at_epoch"]
+            if (
+                type(sample["device_index"]) is not int
+                or not 0 <= sample["device_index"] <= 999
+                or type(rate) not in {int, float}
+                or not math.isfinite(rate)
+                or type(observed) not in {int, float}
+                or not math.isfinite(observed)
+            ):
+                return False
+            sample_age = now - float(observed)
+            if sample_age < 0 or sample_age > config.maximum_sample_gap_seconds:
+                continue
+            if rate > 0:
+                return True
+        return False
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
 
 
 def format_telegram_message(
@@ -1859,9 +2007,11 @@ def run_supervisor(
     command: list[str],
     *,
     monotonic=time.monotonic,
+    wall_clock=time.time,
     popen_factory=subprocess.Popen,
     telegram_config: TelegramConfig | None = None,
     telegram_sender: Callable[[TelegramConfig, str], bool] | None = None,
+    readiness_path: str = READINESS_PATH,
 ) -> int:
     if not config.enabled:
         print("FL4SH_MONITOR requires FL4SH_MONITOR_ENABLED=1", file=sys.stderr, flush=True)
@@ -1880,34 +2030,47 @@ def run_supervisor(
         return 64
 
     started_at = monotonic()
+    monitor_session_id = str(uuid.uuid4())
+    device_samples: dict[int, tuple[float, float]] = {}
+    positive_hashrate_seen = False
+    startup_timeout_reported = False
+    readiness_failed = False
+    terminate_deadline: float | None = None
     monitor = Fl4shMonitor(config, start_monotonic=started_at)
     print(format_config(config, telegram_enabled=notifier_config.enabled), flush=True)
     event_queue: queue.Queue[tuple[str, bytes | None]] = queue.Queue(maxsize=256)
     child_ref: dict[str, subprocess.Popen[bytes] | None] = {"child": None}
     previous_signals, pending_signal = _install_signal_forwarding(child_ref)
     try:
+        try:
+            _clear_readiness_file(readiness_path)
+        except OSError:
+            for signum, handler in previous_signals.items():
+                signal.signal(signum, handler)
+            print("FL4SH_MONITOR state=READINESS_ERROR reason=STALE_ARTIFACT actions_performed=false", file=sys.stderr, flush=True)
+            return 70
         child_kwargs: dict[str, Any] = {
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,
             "bufsize": 0,
         }
-        if notifier_config.enabled:
-            child_environment = os.environ.copy()
-            # Telegram credentials are for the supervisor only. The miner
-            # child never inherits notifier settings when alerts are enabled.
-            for secret_name in (
-                TELEGRAM_TOKEN_ENV,
-                TELEGRAM_CHAT_ENV,
-                TELEGRAM_ENABLED_ENV,
-                TELEGRAM_COOLDOWN_ENV,
-                TELEGRAM_LABEL_ENV,
-            ):
-                child_environment.pop(secret_name, None)
+        child_environment = os.environ.copy()
+        notifier_environment_keys = (TELEGRAM_TOKEN_ENV, TELEGRAM_CHAT_ENV)
+        had_notifier_environment = any(name in child_environment for name in notifier_environment_keys)
+        # Telegram configuration is supervisor-only even when a malformed or
+        # disabled parent environment still contains credential variables.
+        for secret_name in notifier_environment_keys:
+            child_environment.pop(secret_name, None)
+        if had_notifier_environment:
             child_kwargs["env"] = child_environment
         child = popen_factory(command, **child_kwargs)
     except OSError as exc:
         for signum, handler in previous_signals.items():
             signal.signal(signum, handler)
+        try:
+            _clear_readiness_file(readiness_path)
+        except OSError:
+            pass
         print(f"FL4SH_MONITOR state=SUPERVISOR_ERROR error={type(exc).__name__}", file=sys.stderr, flush=True)
         return 70
     child_ref["child"] = child
@@ -1948,9 +2111,9 @@ def run_supervisor(
     write_lock = threading.Lock()
     finished_streams: set[str] = set()
     last_monitor_error = False
-    # The central log enricher needs a process/session boundary even when the
-    # direct Telegram fallback is disabled.
-    monitor_session_id = str(uuid.uuid4())
+    miner_pid = getattr(child, "pid", None)
+    if type(miner_pid) is not int or miner_pid <= 0:
+        miner_pid = -1
 
     def telegram_audit(line: str) -> None:
         _write_stream("stdout", (line + "\n").encode("utf-8"), open_streams, write_lock)
@@ -1977,13 +2140,63 @@ def run_supervisor(
         alert_coordinator.monitor_events(events)
 
     def process_stdout_line(line_text: str) -> None:
+        nonlocal positive_hashrate_seen, readiness_failed
         emit(monitor.observe_line(line_text, now=monotonic()))
+        sample = parse_device_hashrate(line_text)
+        if sample is not None:
+            positive_hashrate_seen = positive_hashrate_seen or sample.hashrate_ths > 0
+        if sample is not None and miner_pid > 0:
+            observed_at = wall_clock()
+            device_samples[sample.device_index] = (sample.hashrate_ths, observed_at)
+            try:
+                _write_readiness_file(
+                    readiness_path,
+                    session_id=monitor_session_id,
+                    supervisor_pid=os.getpid(),
+                    miner_pid=miner_pid,
+                    policy_hash=config.policy_hash,
+                    device_samples=device_samples,
+                    generated_at_epoch=observed_at,
+                )
+            except (OSError, TypeError, ValueError):
+                if not readiness_failed:
+                    readiness_failed = True
+                    _write_stream(
+                        "stdout",
+                        b"FL4SH_MONITOR state=READINESS_ERROR reason=ATOMIC_WRITE_FAILED actions_performed=false\n",
+                        open_streams,
+                        write_lock,
+                    )
+                    current_child = child_ref["child"]
+                    if current_child is not None and current_child.poll() is None:
+                        _send_signal_to_child(current_child, signal.SIGTERM)
         alert_coordinator.stdout_line(line_text, monitor)
 
     def safe_tick() -> None:
-        nonlocal last_monitor_error
+        nonlocal last_monitor_error, startup_timeout_reported, terminate_deadline
+        now = monotonic()
+        current_child = child_ref["child"]
+        if current_child is not None and current_child.poll() is None:
+            elapsed = max(0.0, now - started_at)
+            if not positive_hashrate_seen and not startup_timeout_reported and elapsed >= config.startup_hashrate_timeout_seconds:
+                startup_timeout_reported = True
+                terminate_deadline = now + STARTUP_STOP_GRACE_SECONDS
+                _write_stream(
+                    "stdout",
+                    (
+                        "FL4SH_MONITOR state=STARTUP_HASHRATE_TIMEOUT "
+                        "reason=NO_POSITIVE_DEVICE_HASHRATE "
+                        f"startup_timeout_seconds={config.startup_hashrate_timeout_seconds} "
+                        f"policy_hash={config.policy_hash} actions_performed=false\n"
+                    ).encode("ascii"),
+                    open_streams,
+                    write_lock,
+                )
+                _send_signal_to_child(current_child, signal.SIGTERM)
+            elif startup_timeout_reported and terminate_deadline is not None and now >= terminate_deadline:
+                _send_signal_to_child(current_child, signal.SIGKILL)
         try:
-            emit(monitor.tick(now=monotonic()))
+            emit(monitor.tick(now=now))
         except Exception as exc:  # The observer must not stop the miner.
             if not last_monitor_error:
                 _write_stream(
@@ -2048,10 +2261,34 @@ def run_supervisor(
         for signum, handler in previous_signals.items():
             signal.signal(signum, handler)
         notifier.close()
+        try:
+            _clear_readiness_file(readiness_path)
+        except OSError:
+            _write_stream(
+                "stderr",
+                b"FL4SH_MONITOR state=READINESS_ERROR reason=CLEANUP_FAILED actions_performed=false\n",
+                open_streams,
+                write_lock,
+            )
 
     return_code = child.wait()
     # Match the conventional shell status for signal-terminated children. In
     # particular, SIGKILL cannot be installed as a supervisor signal handler.
+    if startup_timeout_reported or readiness_failed:
+        return 70
+    if not positive_hashrate_seen and return_code == 0:
+        _write_stream(
+            "stdout",
+            (
+                "FL4SH_MONITOR state=STARTUP_HASHRATE_FAILED "
+                "reason=MINER_EXITED_BEFORE_HASHRATE "
+                f"startup_timeout_seconds={config.startup_hashrate_timeout_seconds} "
+                f"policy_hash={config.policy_hash} actions_performed=false\n"
+            ).encode("ascii"),
+            {"stdout": True, "stderr": True},
+            threading.Lock(),
+        )
+        return 70
     return 128 + abs(return_code) if return_code < 0 else return_code
 
 
@@ -2070,10 +2307,32 @@ def _check_config() -> int:
     return 0
 
 
+def _check_readiness(args: list[str]) -> int:
+    if len(args) != 3 or args[:2] != ["--check-readiness", "--miner-pid"]:
+        return 64
+    if not re.fullmatch(r"[0-9]{1,10}", args[2]):
+        return 64
+    try:
+        miner_pid = int(args[2])
+        if miner_pid <= 1:
+            return 64
+        config = MonitorConfig.from_env(require_enabled=True)
+    except (ValueError, MonitorConfigError):
+        return 1
+    return 0 if _readiness_is_healthy(
+        READINESS_PATH,
+        config=config,
+        miner_pid=miner_pid,
+        supervisor_pid=1,
+    ) else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if args == ["--check-config"]:
         return _check_config()
+    if args and args[0] == "--check-readiness":
+        return _check_readiness(args)
     try:
         config = MonitorConfig.from_env(require_enabled=True)
         telegram_config = TelegramConfig.from_env()

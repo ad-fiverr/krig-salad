@@ -164,7 +164,10 @@ class CentralFleetWatcher:
             if cycle.data_classification == "PROVIDER_OBSERVED":
                 coordinator = DeliveryCoordinator(ledger, self.sender)
                 attempts = coordinator.dispatch_new(
-                    [str(item["dedupe_key"]) for item in cycle.prepared_notifications],
+                    # A later overlapping provider page may have completed an
+                    # exact identity lookup for an older pending alert. The
+                    # ledger returns only a bounded batch with all five IDs.
+                    ledger.list_pending_delivery_keys(),
                     now_utc=end_time_utc,
                 )
                 delivery_states = tuple(item.state for item in attempts)
