@@ -83,6 +83,9 @@ WORKFLOW_TRIGGERS = frozenset(
         "gpu-mining/telemetry/collector/g4a_salad_get.py",
         "gpu-mining/g4c-live/live_secret_boundary.py",
         ".github/workflows/build-fl4shminer.yml",
+        ".github/fl4sh-publish-targets.json",
+        ".github/scripts/fl4sh_publish.py",
+        ".github/scripts/test_fl4sh_publish.py",
     }
 )
 
@@ -272,38 +275,52 @@ def check_workflow(root: Path) -> None:
             f"(missing={sorted(WORKFLOW_TRIGGERS - triggers)}, extra={sorted(triggers - WORKFLOW_TRIGGERS)})"
         )
 
-    previous_step = re.search(
-        r"(?ms)^      - name: Capture the previously published version digest\n(?P<body>.*?)(?=^      - name: )",
-        workflow,
+    if workflow.count("docker buildx build") != 1 or "--push" in workflow:
+        fail("fanout must reuse one local image build and never rebuild for publication")
+    if workflow.count("docker run --rm --network none") != 1 or "--gpus" in workflow:
+        fail("fanout requires one image smoke without network or GPU")
+    required_parts = (
+        "--provenance=false", "--load", "fl4sh_publish.py capture",
+        "fl4sh_publish.py image-id", "fl4sh_publish.py seal", "fl4sh_publish.py summary",
+        "continue-on-error: true", "if: always() && github.ref == 'refs/heads/main'",
+        "contents: read", "cancel-in-progress: false",
     )
-    if previous_step is None:
-        fail("previous image digest verification step is missing")
-    previous_body = previous_step.group("body")
-    required_probe_parts = (
-        "https://auth.docker.io/token?",
-        "https://registry-1.docker.io/v2/",
-        "--request GET",
-        "--dump-header -",
-        "--output /dev/null",
-        "--write-out",
-        "--registry-manifest-response",
+    if any(part not in workflow for part in required_parts):
+        fail("fanout omitted a required build, smoke, evidence or aggregate-failure gate")
+    positions = [workflow.index(part) for part in (
+        "fl4sh_publish.py base-login", "docker buildx build", "fl4sh_publish.py base-logout",
+        "docker run --rm --network none", "fl4sh_publish.py seal", "fl4sh_publish.py publish",
+    )]
+    if positions != sorted(positions):
+        fail("pull authentication, logout, smoke, seal and publication order changed")
+    targets = (
+        ("primary", "DOCKERHUB_USERNAME", "DOCKERHUB_TOKEN"),
+        ("loboeldrin", "DOCKERHUB_USERNAME_LOBOELDRIN", "DOCKERHUB_TOKEN_LOBOELDRIN"),
+        ("adrianfiverr", "DOCKERHUB_USERNAME_ADRIANFIVERR", "DOCKERHUB_TOKEN_ADRIANFIVERR"),
+        ("naxter1234", "DOCKERHUB_USERNAME_NAXTER1234", "DOCKERHUB_TOKEN_NAXTER1234"),
+        ("ardevsolutions", "DOCKERHUB_USERNAME_ARDEVSOLUTIONS", "DOCKERHUB_TOKEN_ARDEVSOLUTIONS"),
+        ("boeing787", "DOCKERHUB_USERNAME_BOEING787", "DOCKERHUB_TOKEN_BOEING787"),
     )
-    if any(part not in previous_body for part in required_probe_parts):
-        fail("previous digest lookup is missing its authenticated HTTPS Registry V2 GET probe")
-    if "imagetools inspect" in previous_body or "|| true" in previous_body:
-        fail("previous digest lookup must not mask registry failures")
-    if "--location" in previous_body or re.search(r"(?m)^\s+-L(?:\s|$)", previous_body):
-        fail("previous digest lookup must not follow redirects")
-    if "PREVIOUS_FOUND" not in workflow or "HTTP 404" not in workflow:
-        fail("workflow must carry the explicit prior-tag presence result and document confirmed absence")
+    for target, username_secret, token_secret in targets:
+        step = re.search(r"(?ms)^      - name: Publish " + re.escape(target) + r"\n(.*?)(?=^      - name: |\Z)", workflow)
+        if step is None:
+            fail("fanout is missing an approved target step")
+        body = step.group(1)
+        if ("${{ secrets." + username_secret + " }}" not in body
+                or "${{ secrets." + token_secret + " }}" not in body
+                or "publish --target " + target + " --evidence" not in body
+                or "continue-on-error: true" not in body):
+            fail("fanout target credential binding or partial-failure reporting changed")
+    if len(re.findall(r"fl4sh_publish\.py publish --target", workflow)) != len(targets) or "secrets[" in workflow:
+        fail("fanout has an unapproved or dynamic target/secret binding")
     check_registry_manifest_response_classifier()
 
     required_paths = (
         "gpu-mining/runtime/fl4shminer/Dockerfile",
         '--build-arg "IMAGE_REVISION=$GITHUB_SHA"',
     )
-    if workflow.count(required_paths[0]) < 2 or workflow.count(required_paths[1]) < 2:
-        fail("both root-context builds must use the explicit Dockerfile and full GITHUB_SHA")
+    if any(workflow.count(path) != 1 for path in required_paths):
+        fail("the single root-context build must use the explicit Dockerfile and full GITHUB_SHA")
     if not re.search(r"(?m)^\s+\.\s*$", workflow):
         fail("workflow does not use the repository root as a build context")
     if re.search(r"(?m)^\s+gpu-mining/runtime/fl4shminer\s*$", workflow):
@@ -316,6 +333,9 @@ def check_workflow(root: Path) -> None:
         "gpu-mining/telemetry/collector/g4a_salad_get.py": True,
         "gpu-mining/g4c-live/live_secret_boundary.py": True,
         ".github/workflows/build-fl4shminer.yml": True,
+        ".github/fl4sh-publish-targets.json": True,
+        ".github/scripts/fl4sh_publish.py": True,
+        ".github/scripts/test_fl4sh_publish.py": True,
         "gpu-mining/telemetry/collector/continuous.py": False,
         "gpu-mining/telemetry/tests/test_g4a_salad_get.py": False,
         "gpu-mining/tools/unrelated.py": False,

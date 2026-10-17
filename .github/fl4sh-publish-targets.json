@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "targets": [
+    {"id": "primary", "repository": "myblockchaincompany/fl4shminer-salad", "username": "myblockchaincompany", "username_secret": "DOCKERHUB_USERNAME", "token_secret": "DOCKERHUB_TOKEN"},
+    {"id": "loboeldrin", "repository": "loboeldrin/comfyui-minimax-h3", "username": "loboeldrin", "username_secret": "DOCKERHUB_USERNAME_LOBOELDRIN", "token_secret": "DOCKERHUB_TOKEN_LOBOELDRIN"},
+    {"id": "adrianfiverr", "repository": "adrianfiverr/pytorch-rc-2.15-dev", "username": "adrianfiverr", "username_secret": "DOCKERHUB_USERNAME_ADRIANFIVERR", "token_secret": "DOCKERHUB_TOKEN_ADRIANFIVERR"},
+    {"id": "naxter1234", "repository": "naxter1234/traning_lora", "username": "naxter1234", "username_secret": "DOCKERHUB_USERNAME_NAXTER1234", "token_secret": "DOCKERHUB_TOKEN_NAXTER1234"},
+    {"id": "ardevsolutions", "repository": "ardevsolutions/comfyui_video_wan2.5", "username": "ardevsolutions", "username_secret": "DOCKERHUB_USERNAME_ARDEVSOLUTIONS", "token_secret": "DOCKERHUB_TOKEN_ARDEVSOLUTIONS"},
+    {"id": "boeing787", "repository": "boeing787/model_funning_tuning", "username": "boeing787", "username_secret": "DOCKERHUB_USERNAME_BOEING787", "token_secret": "DOCKERHUB_TOKEN_BOEING787"}
+  ]
+}

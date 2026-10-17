@@ -91,7 +91,28 @@ The image smoke test runs with Docker networking disabled and no GPU:
 
 It verifies the required Python standard-library imports, installed binary hash and ELF header, runtime package boundary, config handling, and healthcheck behavior outside a mining container. It does not connect to a pool or invoke the real miner. A passing image smoke is required before the workflow publishes the version, commit, and latest tags.
 
-The independent GitHub Actions workflow builds and smoke-tests a local linux/amd64 image before Docker Hub login. On main only, it publishes the same image as 1.5.2, sha-<12-character-commit>, and latest, then checks that all tags resolve to the published digest. Required repository secrets are DOCKERHUB_USERNAME and DOCKERHUB_TOKEN. The destination is fixed to docker.io/myblockchaincompany/fl4shminer-salad.
+The GitHub Actions workflow authenticates the pinned CUDA pull with the primary account, builds one local linux/amd64 image, logs out, and runs one image smoke with no network or GPU. It captures the local config digest (image ID), OCI source/revision/version and rootfs diff IDs, then seals that evidence only after smoke passes. Publication tags that exact image ID; it never rebuilds per account or uploads a multi-GB build artifact between jobs.
+
+The exact allowlist is `.github/fl4sh-publish-targets.json`. The primary destination and its original secrets are preserved. Each publisher step receives only the corresponding pair, logs in through stdin using a fresh temporary Docker config, captures all Docker/provider output, logs out in `finally`, and removes its config. Secrets are never written to summaries or evidence. Registry inspection uses fixed authenticated HTTPS GETs with bounded responses, no redirects or automatic retries; only HTTP 404 means a prior tag is absent.
+
+| Destination (`docker.io/`) | Username secret | Token secret |
+|---|---|---|
+| myblockchaincompany/fl4shminer-salad | DOCKERHUB_USERNAME | DOCKERHUB_TOKEN |
+| loboeldrin/comfyui-minimax-h3 | DOCKERHUB_USERNAME_LOBOELDRIN | DOCKERHUB_TOKEN_LOBOELDRIN |
+| adrianfiverr/pytorch-rc-2.15-dev | DOCKERHUB_USERNAME_ADRIANFIVERR | DOCKERHUB_TOKEN_ADRIANFIVERR |
+| naxter1234/traning_lora | DOCKERHUB_USERNAME_NAXTER1234 | DOCKERHUB_TOKEN_NAXTER1234 |
+| ardevsolutions/comfyui_video_wan2.5 | DOCKERHUB_USERNAME_ARDEVSOLUTIONS | DOCKERHUB_TOKEN_ARDEVSOLUTIONS |
+| boeing787/model_funning_tuning | DOCKERHUB_USERNAME_BOEING787 | DOCKERHUB_TOKEN_BOEING787 |
+
+All repositories use `1.5.2`, `sha-<12-character-commit>`, and `latest`. Before each tag mutation the publisher rechecks that the full revision is still `origin/main`. An existing commit tag with different image content fails closed. A retry of the exact tested content can reuse verified tags without pushing them again; a rebuild of the same Git SHA that produces different bytes is not an idempotent retry. Version/latest may move only for the current main revision. The previous version digest is retained in per-target results, so unchanged verified content is distinguishable from an unverified/obsolete release.
+
+After publishing, authenticated Registry V2 GETs verify each tag and the manifest body digest, the config digest must match the tested image ID, and a pull by immutable digest must reproduce its architecture, labels and rootfs identity. Each repository's three tags must resolve to one digest. The aggregate compares config/layer content across all six repositories without assuming manifest encodings or digests are automatically identical across namespaces. A secondary failure does not suppress later target attempts, and the final always-run report lists all six as PUBLISHED/FAILED/SKIPPED/PENDING and fails the aggregate unless every target is verified.
+
+Offline fanout QA: `python -B .github/scripts/test_fl4sh_publish.py`. The tests inject synthetic Docker/registry responses and forbid sockets. No live publication has been validated by these tests. A future release requires explicit authorization for all six repositories and replacement of their existing version/latest contents, which may belong to other applications. Repository credentials must have only the required repository push permissions; their real validity/scopes remain unverified offline.
+
+Manual rollback is a separately authorized operation: select each repository's previously recorded immutable digest, verify its OCI revision/content, and retag only the explicitly approved mutable tags from that digest without rebuilding. Preserve commit tags, serialize with publication, and verify all affected tags afterwards. Do not use a normal stale workflow run to bypass the current-main gate. Publishing or rolling back Docker tags does not update running Salad containers.
+
+References: [Docker image push](https://docs.docker.com/reference/cli/docker/image/push/), [registry authentication](https://docs.docker.com/reference/api/registry/auth/), [Registry V2 manifest contract](https://distribution.github.io/distribution/spec/api/#pulling-an-image-manifest).
 
 ### Unified miner and central watcher image
 
@@ -99,7 +120,7 @@ The image packages the miner runtime with the current `log_alerts` central fleet
 
 The default entrypoint continues to start Fl4shMiner, including its existing optional local monitor behavior. The central watcher is a separate CLI capability and never starts automatically in miner replicas. A dedicated, separately authorized watcher process can invoke `python3 -m log_alerts.live_cli`; the image sets `PYTHONPATH=/opt/fl4shminer/gpu-mining/telemetry`. In `FL4SH_ROLE=central`, the healthcheck requires PID 1 to be the live `python3 -m log_alerts.live_cli --watch-live-alerts` process and requires both the miner monitor and local Telegram notifier to remain disabled; it does not require a miner child or miner hashrate. The watcher smoke blocks network, DNS, credential prompts, and delivery, and verifies that live reads remain disabled by default. Packaging the watcher does not enable live operations.
 
-The workflow rebuilds for changes under `gpu-mining/runtime/fl4shminer/**`, any source under `gpu-mining/telemetry/log_alerts/**`, the exact `gpu-mining/telemetry/collector/g4a_salad_get.py` resolver, the exact `gpu-mining/g4c-live/live_secret_boundary.py` secret boundary, and the workflow itself. Both CI and publication builds use the repository root as context and the explicit Fl4sh Dockerfile. OCI `source` identifies this repository, `revision` is the full integration commit SHA, and `version` remains Fl4shMiner `1.5.2`; the immutable digest identifies a concrete image build.
+The workflow rebuilds for changes under `gpu-mining/runtime/fl4shminer/**`, any source under `gpu-mining/telemetry/log_alerts/**`, the exact `gpu-mining/telemetry/collector/g4a_salad_get.py` resolver, the exact `gpu-mining/g4c-live/live_secret_boundary.py` secret boundary, the workflow, and the exact fanout allowlist/helper/test paths. The single build uses the repository root and explicit Fl4sh Dockerfile. OCI `source` identifies this repository, `revision` is the full integration commit SHA, and `version` remains Fl4shMiner `1.5.2`; immutable digests identify concrete published manifests.
 
 Use the immutable docker.io/myblockchaincompany/fl4shminer-salad@sha256:<digest> reference reported by the successful workflow for a later Salad test. The digest is created by the publish run and must be copied from that run; a mutable tag is not deployment evidence.
 

@@ -10,6 +10,9 @@ on:
       - gpu-mining/telemetry/collector/g4a_salad_get.py
       - gpu-mining/g4c-live/live_secret_boundary.py
       - .github/workflows/build-fl4shminer.yml
+      - .github/fl4sh-publish-targets.json
+      - .github/scripts/fl4sh_publish.py
+      - .github/scripts/test_fl4sh_publish.py
   workflow_dispatch:
 
 permissions:
@@ -25,14 +28,26 @@ env:
 
 jobs:
   build-test-publish:
-    name: Build, smoke-test, and publish pinned image
+    name: Build once, smoke-test, and publish six allowlisted targets
+    if: github.repository == 'ad-fiverr/krig-salad'
     runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Check out source
         uses: actions/checkout@v7.0.1
 
+      - name: Prepare isolated runner paths
+        run: |
+          set -Eeuo pipefail
+          {
+            echo "DOCKER_CONFIG=$RUNNER_TEMP/fl4sh-build-auth"
+            echo "BUILD_EVIDENCE=$RUNNER_TEMP/fl4sh-build-evidence.json"
+            echo "PUBLISH_RESULTS=$RUNNER_TEMP/fl4sh-publish-results"
+          } >> "$GITHUB_ENV"
+
       - name: Check runner disk space
-        shell: bash
         run: |
           set -Eeuo pipefail
           available_kib="$(df -Pk / | awk 'END {print $4}')"
@@ -45,6 +60,9 @@ jobs:
       - name: Parse workflow YAML
         run: ruby -e 'require "yaml"; doc = YAML.load_file(ARGV.fetch(0)); abort "jobs missing" unless doc.is_a?(Hash) && doc["jobs"].is_a?(Hash)' .github/workflows/build-fl4shminer.yml
 
+      - name: Validate fanout contract with offline fixtures
+        run: python3 -B .github/scripts/test_fl4sh_publish.py
+
       - name: Run source smoke tests
         run: bash gpu-mining/runtime/fl4shminer/ci-smoke-test.sh --source
 
@@ -53,20 +71,17 @@ jobs:
 
       - name: Authenticate Docker Hub for pinned CUDA base pull
         if: github.ref == 'refs/heads/main'
-        shell: bash
         env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-        run: |
-          set -Eeuo pipefail
-          printf '%s' "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+          FANOUT_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          FANOUT_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: python3 -B .github/scripts/fl4sh_publish.py base-login
 
-      - name: Build local linux/amd64 image from repository root
-        shell: bash
+      - name: Build local linux/amd64 image once from repository root
         run: |
           set -Eeuo pipefail
           local_build_args=(
             --platform linux/amd64
+            --provenance=false
             --load
             --metadata-file "$RUNNER_TEMP/fl4sh-local-build.json"
             --build-arg "IMAGE_REVISION=$GITHUB_SHA"
@@ -75,181 +90,73 @@ jobs:
             .
           )
           docker buildx build "${local_build_args[@]}"
-          image_platform="$(docker image inspect fl4shminer-salad:ci --format '{{.Os}}/{{.Architecture}}')"
-          [[ "$image_platform" == linux/amd64 ]]
-          image_revision="$(docker image inspect fl4shminer-salad:ci --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
-          image_source="$(docker image inspect fl4shminer-salad:ci --format '{{ index .Config.Labels "org.opencontainers.image.source" }}')"
-          image_version="$(docker image inspect fl4shminer-salad:ci --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')"
-          [[ "$image_revision" == "$GITHUB_SHA" ]]
-          [[ "$image_source" == "https://github.com/ad-fiverr/krig-salad" ]]
-          [[ "$image_version" == "$VERSION" ]]
-          printf 'Local image platform: %s; OCI revision/source/version verified.\n' "$image_platform"
+          python3 -B .github/scripts/fl4sh_publish.py capture --evidence "$BUILD_EVIDENCE"
 
       - name: End Docker Hub pull session before smoke test
         if: github.ref == 'refs/heads/main'
-        run: docker logout docker.io
+        run: python3 -B .github/scripts/fl4sh_publish.py base-logout
 
       - name: Smoke-test image without network or GPU
-        run: docker run --rm --network none --entrypoint /opt/fl4shminer/ci-smoke-test.sh fl4shminer-salad:ci --image
-
-      - name: Log in to Docker Hub after smoke passes
-        if: github.ref == 'refs/heads/main'
-        uses: docker/login-action@v4.6.0
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Capture the previously published version digest
-        if: github.ref == 'refs/heads/main'
-        id: previous
-        shell: bash
         run: |
           set -Eeuo pipefail
-          set +x
-          repository="$(printf '%s' "$IMAGE" | sed 's#^docker.io/##')"
-          [[ "$repository" == "myblockchaincompany/fl4shminer-salad" ]] || {
-            echo 'Unexpected image repository for prior digest check.' >&2
-            exit 1
-          }
-          token_response="$(curl --proto '=https' --tlsv1.2 --connect-timeout 5 --max-time 15 --silent --show-error --fail \
-            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$repository:pull")"
-          registry_token="$(jq -er '(.token // .access_token) | select(type == "string" and length > 0)' <<< "$token_response")"
-          unset token_response
-          manifest_url="https://registry-1.docker.io/v2/$repository/manifests/$VERSION"
-          manifest_response="$(curl --proto '=https' --tlsv1.2 --connect-timeout 5 --max-time 15 --silent --show-error \
-            --request GET --dump-header - --output /dev/null \
-            --write-out '__REGISTRY_HTTP_STATUS__%{http_code}' \
-            --header "Authorization: Bearer $registry_token" \
-            --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
-            "$manifest_url")"
-          unset registry_token
-          http_status="$(awk -F'__REGISTRY_HTTP_STATUS__' 'NF > 1 {print $NF}' <<< "$manifest_response")"
-          [[ "$http_status" =~ ^[0-9]{3}$ ]] || {
-            echo 'Registry V2 response omitted its HTTP status.' >&2
-            exit 1
-          }
-          response_headers="$(sed '/__REGISTRY_HTTP_STATUS__/,$d' <<< "$manifest_response")"
-          previous_digest="$(awk 'tolower($1) == "docker-content-digest:" {gsub(sprintf("%c", 13), "", $2); print $2; exit}' <<< "$response_headers")"
-          result="$(python3 gpu-mining/runtime/fl4shminer/ci-fleet-image-smoke.py --registry-manifest-response "$http_status" "$previous_digest")"
-          if [[ "$result" == "NOT_FOUND" ]]; then
-            {
-              echo 'found=false'
-              echo 'digest='
-            } >> "$GITHUB_OUTPUT"
-            echo 'Registry V2 confirmed that the previous version tag is absent (HTTP 404).'
-          else
-            [[ "$result" =~ ^sha256:[0-9a-f]{64}$ ]] || {
-              echo 'Registry V2 classifier returned an invalid prior digest.' >&2
-              exit 1
-            }
-            {
-              echo 'found=true'
-              echo "digest=$result"
-            } >> "$GITHUB_OUTPUT"
-            echo "Previous version digest verified: $result"
-          fi
+          image_id="$(python3 -B .github/scripts/fl4sh_publish.py image-id --evidence "$BUILD_EVIDENCE")"
+          docker run --rm --network none --entrypoint /opt/fl4shminer/ci-smoke-test.sh "$image_id" --image
+          python3 -B .github/scripts/fl4sh_publish.py seal --evidence "$BUILD_EVIDENCE"
 
-      - name: Publish version, commit, and latest tags
+      # Step-level bindings avoid dynamic secret names and keep each publisher
+      # process from receiving another account's secret pair.
+      - name: Publish primary
         if: github.ref == 'refs/heads/main'
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          short_sha="$(printf '%.12s' "$GITHUB_SHA")"
-          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
-          docker buildx build \
-            --platform linux/amd64 \
-            --provenance=false \
-            --build-arg "IMAGE_REVISION=$GITHUB_SHA" \
-            --file gpu-mining/runtime/fl4shminer/Dockerfile \
-            --push \
-            --metadata-file "$RUNNER_TEMP/fl4sh-publish-metadata.json" \
-            --tag "$IMAGE:$VERSION" \
-            --tag "$IMAGE:sha-$short_sha" \
-            --tag "$IMAGE:latest" \
-            .
-          expected_digest="$(jq -r '."containerimage.digest" // empty' "$RUNNER_TEMP/fl4sh-publish-metadata.json")"
-          [[ "$expected_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
-            printf 'Buildx did not report a valid published digest.\n' >&2
-            exit 1
-          }
-
-      - name: Verify published tags, new digest, and OCI labels
-        if: github.ref == 'refs/heads/main'
-        shell: bash
+        continue-on-error: true
         env:
-          PREVIOUS_FOUND: ${{ steps.previous.outputs.found }}
-          PREVIOUS_DIGEST: ${{ steps.previous.outputs.digest }}
-        run: |
-          set -Eeuo pipefail
-          expected_digest="$(jq -r '."containerimage.digest" // empty' "$RUNNER_TEMP/fl4sh-publish-metadata.json")"
-          short_sha="$(printf '%.12s' "$GITHUB_SHA")"
-          case "$PREVIOUS_FOUND" in
-            true)
-              [[ "$PREVIOUS_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || {
-                printf 'Previous version digest was not verified.\n' >&2
-                exit 1
-              }
-              if [[ "$expected_digest" == "$PREVIOUS_DIGEST" ]]; then
-                printf 'Published version digest did not change from the previous image.\n' >&2
-                exit 1
-              fi
-              ;;
-            false)
-              [[ -z "$PREVIOUS_DIGEST" ]] || {
-                printf 'Prior tag state is inconsistent with its digest.\n' >&2
-                exit 1
-              }
-              printf 'Prior version tag absence was verified by Registry V2 HTTP 404.\n'
-              ;;
-            *)
-              printf 'Previous version tag state is missing or invalid.\n' >&2
-              exit 1
-              ;;
-          esac
-          for tag in "$VERSION" "sha-$short_sha" latest; do
-            reference="$IMAGE:$tag"
-            description="$(docker buildx imagetools inspect "$reference")"
-            actual_digest="$(awk '$1 == "Digest:" {print $2; exit}' <<< "$description")"
-            [[ "$actual_digest" == "$expected_digest" ]] || {
-              printf '%s resolved to %s; expected %s\n' "$reference" "$actual_digest" "$expected_digest" >&2
-              exit 1
-            }
-            printf '%s -> %s\n' "$reference" "$actual_digest"
-          done
-          docker pull --platform linux/amd64 "$IMAGE:$VERSION"
-          published_revision="$(docker image inspect "$IMAGE:$VERSION" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
-          published_source="$(docker image inspect "$IMAGE:$VERSION" --format '{{ index .Config.Labels "org.opencontainers.image.source" }}')"
-          published_version="$(docker image inspect "$IMAGE:$VERSION" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')"
-          [[ "$published_revision" == "$GITHUB_SHA" ]]
-          [[ "$published_source" == "https://github.com/ad-fiverr/krig-salad" ]]
-          [[ "$published_version" == "$VERSION" ]]
-          printf 'Published OCI revision/source/version verified for %s.\n' "$GITHUB_SHA"
+          FANOUT_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          FANOUT_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: python3 -B .github/scripts/fl4sh_publish.py publish --target primary --evidence "$BUILD_EVIDENCE" --results "$PUBLISH_RESULTS"
 
-      - name: Write immutable image reference to run summary
+      - name: Publish loboeldrin
         if: github.ref == 'refs/heads/main'
-        shell: bash
+        continue-on-error: true
         env:
-          PREVIOUS_FOUND: ${{ steps.previous.outputs.found }}
-          PREVIOUS_DIGEST: ${{ steps.previous.outputs.digest }}
-        run: |
-          set -Eeuo pipefail
-          digest="$(jq -r '."containerimage.digest" // empty' "$RUNNER_TEMP/fl4sh-publish-metadata.json")"
-          short_sha="$(printf '%.12s' "$GITHUB_SHA")"
-          {
-            printf '## Fl4shMiner Salad image published\n\n'
-            printf -- '- Version tag: %s:%s\n' "$IMAGE" "$VERSION"
-            printf -- '- Commit tag: %s:sha-%s\n' "$IMAGE" "$short_sha"
-            printf -- '- Latest tag: %s:latest\n' "$IMAGE"
-            printf -- '- Immutable reference: %s@%s\n' "$IMAGE" "$digest"
-            printf -- '- OCI revision: %s\n' "$GITHUB_SHA"
-            printf -- '- OCI source: https://github.com/ad-fiverr/krig-salad\n'
-            if [[ "$PREVIOUS_FOUND" == true ]]; then
-              printf -- '- Previous version digest: %s\n' "$PREVIOUS_DIGEST"
-            elif [[ "$PREVIOUS_FOUND" == false && -z "$PREVIOUS_DIGEST" ]]; then
-              printf -- '- Previous version tag absence: confirmed by Registry V2 HTTP 404\n'
-            else
-              printf 'Previous version tag state is missing or invalid.\n' >&2
-              exit 1
-            fi
-            printf '\nAll three remote tags resolved to the same verified digest after the no-network image smoke test.\n'
-          } >> "$GITHUB_STEP_SUMMARY"
+          FANOUT_USERNAME: ${{ secrets.DOCKERHUB_USERNAME_LOBOELDRIN }}
+          FANOUT_TOKEN: ${{ secrets.DOCKERHUB_TOKEN_LOBOELDRIN }}
+        run: python3 -B .github/scripts/fl4sh_publish.py publish --target loboeldrin --evidence "$BUILD_EVIDENCE" --results "$PUBLISH_RESULTS"
+
+      - name: Publish adrianfiverr
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        env:
+          FANOUT_USERNAME: ${{ secrets.DOCKERHUB_USERNAME_ADRIANFIVERR }}
+          FANOUT_TOKEN: ${{ secrets.DOCKERHUB_TOKEN_ADRIANFIVERR }}
+        run: python3 -B .github/scripts/fl4sh_publish.py publish --target adrianfiverr --evidence "$BUILD_EVIDENCE" --results "$PUBLISH_RESULTS"
+
+      - name: Publish naxter1234
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        env:
+          FANOUT_USERNAME: ${{ secrets.DOCKERHUB_USERNAME_NAXTER1234 }}
+          FANOUT_TOKEN: ${{ secrets.DOCKERHUB_TOKEN_NAXTER1234 }}
+        run: python3 -B .github/scripts/fl4sh_publish.py publish --target naxter1234 --evidence "$BUILD_EVIDENCE" --results "$PUBLISH_RESULTS"
+
+      - name: Publish ardevsolutions
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        env:
+          FANOUT_USERNAME: ${{ secrets.DOCKERHUB_USERNAME_ARDEVSOLUTIONS }}
+          FANOUT_TOKEN: ${{ secrets.DOCKERHUB_TOKEN_ARDEVSOLUTIONS }}
+        run: python3 -B .github/scripts/fl4sh_publish.py publish --target ardevsolutions --evidence "$BUILD_EVIDENCE" --results "$PUBLISH_RESULTS"
+
+      - name: Publish boeing787
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        env:
+          FANOUT_USERNAME: ${{ secrets.DOCKERHUB_USERNAME_BOEING787 }}
+          FANOUT_TOKEN: ${{ secrets.DOCKERHUB_TOKEN_BOEING787 }}
+        run: python3 -B .github/scripts/fl4sh_publish.py publish --target boeing787 --evidence "$BUILD_EVIDENCE" --results "$PUBLISH_RESULTS"
+
+      - name: Clear build authentication even on failure
+        if: always() && github.ref == 'refs/heads/main'
+        run: python3 -B .github/scripts/fl4sh_publish.py base-logout
+
+      - name: Report all targets and require complete verified publication
+        if: always() && github.ref == 'refs/heads/main'
+        run: python3 -B .github/scripts/fl4sh_publish.py summary --evidence "$BUILD_EVIDENCE" --results "$PUBLISH_RESULTS"
