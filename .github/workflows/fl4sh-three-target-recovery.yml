@@ -1,0 +1,138 @@
+name: Recover Fl4shMiner Docker Hub targets 4-6
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-fl4shminer-salad-main
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    if: github.repository == 'ad-fiverr/krig-salad' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the selected main revision
+        uses: actions/checkout@v7.0.1
+
+      - name: Install pinned Skopeo
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes skopeo=1.4.1+ds1-1ubuntu0.1
+          skopeo --version
+
+      - name: Initialize one-shot recovery ledger
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          printf 'RECOVERY_RESULTS=%s/fl4sh-three-target-recovery.json\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          python3 -B .github/scripts/fl4sh_recover_three.py init \
+            --results "$RUNNER_TEMP/fl4sh-three-target-recovery.json" \
+            --confirmation RECOVER_TARGETS_4_6
+
+      - name: Preflight naxter1234
+        id: preflight_naxter1234
+        continue-on-error: true
+        env:
+          RECOVERY_USERNAME: ${{ secrets.DOCKERHUB_USERNAME_NAXTER1234 }}
+          RECOVERY_TOKEN: ${{ secrets.DOCKERHUB_TOKEN_NAXTER1234 }}
+        run: python3 -B .github/scripts/fl4sh_recover_three.py preflight --target naxter1234 --results "$RECOVERY_RESULTS"
+
+      - name: Preflight ardevsolutions
+        id: preflight_ardevsolutions
+        continue-on-error: true
+        env:
+          RECOVERY_USERNAME: ${{ secrets.DOCKERHUB_USERNAME_ARDEVSOLUTIONS }}
+          RECOVERY_TOKEN: ${{ secrets.DOCKERHUB_TOKEN_ARDEVSOLUTIONS }}
+        run: python3 -B .github/scripts/fl4sh_recover_three.py preflight --target ardevsolutions --results "$RECOVERY_RESULTS"
+
+      - name: Preflight boeing787
+        id: preflight_boeing787
+        continue-on-error: true
+        env:
+          RECOVERY_USERNAME: ${{ secrets.DOCKERHUB_USERNAME_BOEING787 }}
+          RECOVERY_TOKEN: ${{ secrets.DOCKERHUB_TOKEN_BOEING787 }}
+        run: python3 -B .github/scripts/fl4sh_recover_three.py preflight --target boeing787 --results "$RECOVERY_RESULTS"
+
+      - name: Verify protected primary repository before writes
+        id: verify_primary_before
+        continue-on-error: true
+        run: python3 -B .github/scripts/fl4sh_recover_three.py verify-target --target primary --results "$RECOVERY_RESULTS"
+
+      - name: Verify protected loboeldrin repository before writes
+        id: verify_loboeldrin_before
+        continue-on-error: true
+        run: python3 -B .github/scripts/fl4sh_recover_three.py verify-target --target loboeldrin --results "$RECOVERY_RESULTS"
+
+      - name: Verify protected adrianfiverr repository before writes
+        id: verify_adrianfiverr_before
+        continue-on-error: true
+        run: python3 -B .github/scripts/fl4sh_recover_three.py verify-target --target adrianfiverr --results "$RECOVERY_RESULTS"
+
+      - name: Recover naxter1234 from immutable source digest
+        if: ${{ steps.preflight_naxter1234.outcome == 'success' && steps.preflight_ardevsolutions.outcome == 'success' && steps.preflight_boeing787.outcome == 'success' && steps.verify_primary_before.outcome == 'success' && steps.verify_loboeldrin_before.outcome == 'success' && steps.verify_adrianfiverr_before.outcome == 'success' }}
+        id: recover_naxter1234
+        continue-on-error: true
+        env:
+          RECOVERY_USERNAME: ${{ secrets.DOCKERHUB_USERNAME_NAXTER1234 }}
+          RECOVERY_TOKEN: ${{ secrets.DOCKERHUB_TOKEN_NAXTER1234 }}
+        run: python3 -B .github/scripts/fl4sh_recover_three.py recover --target naxter1234 --results "$RECOVERY_RESULTS"
+
+      - name: Recover ardevsolutions from immutable source digest
+        if: ${{ always() && steps.preflight_naxter1234.outcome == 'success' && steps.preflight_ardevsolutions.outcome == 'success' && steps.preflight_boeing787.outcome == 'success' && steps.verify_primary_before.outcome == 'success' && steps.verify_loboeldrin_before.outcome == 'success' && steps.verify_adrianfiverr_before.outcome == 'success' && steps.recover_naxter1234.outcome == 'success' }}
+        id: recover_ardevsolutions
+        continue-on-error: true
+        env:
+          RECOVERY_USERNAME: ${{ secrets.DOCKERHUB_USERNAME_ARDEVSOLUTIONS }}
+          RECOVERY_TOKEN: ${{ secrets.DOCKERHUB_TOKEN_ARDEVSOLUTIONS }}
+        run: python3 -B .github/scripts/fl4sh_recover_three.py recover --target ardevsolutions --results "$RECOVERY_RESULTS"
+
+      - name: Recover boeing787 from immutable source digest
+        if: ${{ always() && steps.preflight_naxter1234.outcome == 'success' && steps.preflight_ardevsolutions.outcome == 'success' && steps.preflight_boeing787.outcome == 'success' && steps.verify_primary_before.outcome == 'success' && steps.verify_loboeldrin_before.outcome == 'success' && steps.verify_adrianfiverr_before.outcome == 'success' && steps.recover_naxter1234.outcome == 'success' && steps.recover_ardevsolutions.outcome == 'success' }}
+        id: recover_boeing787
+        continue-on-error: true
+        env:
+          RECOVERY_USERNAME: ${{ secrets.DOCKERHUB_USERNAME_BOEING787 }}
+          RECOVERY_TOKEN: ${{ secrets.DOCKERHUB_TOKEN_BOEING787 }}
+        run: python3 -B .github/scripts/fl4sh_recover_three.py recover --target boeing787 --results "$RECOVERY_RESULTS"
+
+      - name: Verify published primary repository
+        if: always()
+        continue-on-error: true
+        run: python3 -B .github/scripts/fl4sh_recover_three.py verify-target --target primary --results "$RECOVERY_RESULTS"
+
+      - name: Verify published loboeldrin repository
+        if: always()
+        continue-on-error: true
+        run: python3 -B .github/scripts/fl4sh_recover_three.py verify-target --target loboeldrin --results "$RECOVERY_RESULTS"
+
+      - name: Verify published adrianfiverr repository
+        if: always()
+        continue-on-error: true
+        run: python3 -B .github/scripts/fl4sh_recover_three.py verify-target --target adrianfiverr --results "$RECOVERY_RESULTS"
+
+      - name: Verify naxter1234 repository
+        if: always()
+        continue-on-error: true
+        run: python3 -B .github/scripts/fl4sh_recover_three.py verify-target --target naxter1234 --results "$RECOVERY_RESULTS"
+
+      - name: Verify ardevsolutions repository
+        if: always()
+        continue-on-error: true
+        run: python3 -B .github/scripts/fl4sh_recover_three.py verify-target --target ardevsolutions --results "$RECOVERY_RESULTS"
+
+      - name: Verify boeing787 repository
+        if: always()
+        continue-on-error: true
+        run: python3 -B .github/scripts/fl4sh_recover_three.py verify-target --target boeing787 --results "$RECOVERY_RESULTS"
+
+      - name: Require independent six-target verification
+        if: always()
+        run: python3 -B .github/scripts/fl4sh_recover_three.py summarize --results "$RECOVERY_RESULTS"
