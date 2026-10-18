@@ -617,7 +617,11 @@ class RegistryV2:
 
     def manifest(self, repository: str, reference: str,
                  actions: tuple[str, ...] = ("pull",)) -> ManifestState | None:
-        allowed_references = ({SOURCE_DIGEST} if repository == SOURCE_REPOSITORY else set(TAGS))
+        allowed_references = (
+            {SOURCE_DIGEST, *TAGS}
+            if repository == SOURCE_REPOSITORY
+            else set(TAGS)
+        )
         if (repository not in {target.repository for target in READ_TARGETS}
                 or reference not in allowed_references
                 or tuple(actions) not in {("pull",), ("pull", "push")}):

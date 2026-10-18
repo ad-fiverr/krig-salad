@@ -777,6 +777,47 @@ class OfflineTests(unittest.TestCase):
             with self.assertRaisesRegex(recovery.RecoveryError, "REGISTRY_RESPONSE_INVALID"):
                 registry.manifest(repository, "latest")
 
+    def test_primary_registry_manifest_accepts_pinned_digest_and_exact_approved_tags(self):
+        registry = recovery.RegistryV2()
+        digest = SOURCE_PARSED_STATE.digest
+        response = recovery.HttpResult(200, {"docker-content-digest": digest}, SOURCE_BODY)
+
+        for reference in (recovery.SOURCE_DIGEST, *recovery.TAGS):
+            with self.subTest(reference=reference):
+                with patch.object(recovery.RegistryV2, "_request", return_value=response) as request:
+                    manifest = registry.manifest(recovery.SOURCE_REPOSITORY, reference)
+                self.assertEqual(manifest, SOURCE_PARSED_STATE)
+                self.assertEqual(request.call_count, 1)
+                self.assertEqual(
+                    request.call_args.args[1],
+                    "/v2/" + recovery.SOURCE_REPOSITORY + "/manifests/" + reference,
+                )
+
+    def test_registry_reference_allowlist_rejects_unapproved_refs_without_request(self):
+        cases = (
+            (recovery.SOURCE_REPOSITORY, "latest-unapproved"),
+            ("naxter1234/traning_lora", recovery.SOURCE_DIGEST),
+            ("naxter1234/traning_lora", "sha-e66ba5e17baf-unapproved"),
+        )
+        registry = recovery.RegistryV2()
+        with patch.object(recovery.RegistryV2, "_request") as request:
+            for repository, reference in cases:
+                with self.subTest(repository=repository, reference=reference):
+                    with self.assertRaisesRegex(recovery.RecoveryError, "ARGUMENT_INVALID"):
+                        registry.manifest(repository, reference)
+        request.assert_not_called()
+
+    def test_primary_tag_verification_accepts_exact_source_digest(self):
+        result = self.controller.verify_target("primary", self.results)
+
+        self.assertEqual(result["status"], "VERIFIED")
+        self.assertEqual(set(result["tags"]), set(recovery.TAGS))
+        for tag in recovery.TAGS:
+            with self.subTest(tag=tag):
+                self.assertEqual(result["tags"][tag]["status"], "VERIFIED")
+                self.assertEqual(result["tags"][tag]["digest"], recovery.SOURCE_DIGEST)
+        self.assertEqual(self.world.write_calls, [])
+
     def test_workflow_is_manual_only_fixed_scope_and_does_not_match_existing_push_triggers(self):
         workflow = (ROOT / ".github/workflows/fl4sh-three-target-recovery.yml").read_text(encoding="utf-8")
         self.assertRegex(workflow, r"(?m)^on:\s*\n\s+workflow_dispatch:\s*$")
