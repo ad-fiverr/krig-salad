@@ -1,0 +1,38 @@
+{
+  "schema_version": "2.0",
+  "hash_guard": {
+    "gpu_floors_ths": {
+      "RTX 5090|desktop|salad_json_log_gpu_class_name": 350,
+      "RTX 5080|desktop|salad_json_log_gpu_class_name": 209,
+      "RTX 5090|laptop|salad_json_log_gpu_class_name": 120,
+      "RTX 5080|laptop|salad_json_log_gpu_class_name": 120
+    },
+    "warmup_seconds": 90,
+    "hash_window_seconds": 120,
+    "reevaluation_interval_seconds": 30,
+    "minimum_samples_per_window": 10,
+    "expected_sample_interval_seconds": 10,
+    "maximum_sample_gap_seconds": 30,
+    "minimum_window_coverage_ratio": 0.8,
+    "consecutive_bad_windows": 2,
+    "reallocation_cooldown_seconds": null,
+    "max_reallocations_per_run": null
+  },
+  "provider_mismatch_guard": {
+    "segment_id": null,
+    "grace_period_seconds": null,
+    "container_group_state": null,
+    "instance_state": null,
+    "miner_telemetry_state": null,
+    "mismatch_duration_seconds": null,
+    "confirmed_action": null
+  },
+  "economics": {
+    "attribution_id": null,
+    "rental_usd_per_hour": null,
+    "target_profit_over_rental_cost_fraction": null,
+    "observed_productive_ratio": null,
+    "net_revenue_usd_per_ths_hour": null,
+    "economic_evidence": null
+  }
+}

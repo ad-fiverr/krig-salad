@@ -1,0 +1,25 @@
+{
+  "observation_id": "kryptex-qtc-2026-10-07-frozen",
+  "observed_at": null,
+  "observed_at_precision": "minute",
+  "source_time_precision": "unknown",
+  "source": "frozen_snapshot",
+  "source_class": "derived_undocumented_public",
+  "freshness": "historical_fixture",
+  "schema_version": "oracle-v1-observed-shape",
+  "algorithm_source_reference": "gpu-mining/fuentes.md#S010",
+  "raw_reference": "GET /api/v2/daily-revenue/QTC?hashrate=1000000; respuesta diaria USD=0.00579323 y QTC=0.0000579305; acceso aprox. 2026-10-07 07:29 America/Ojinaga, precisión minuto; algoritmo QPoW documentado para Quantus",
+  "confidence": "low",
+  "payload": {
+    "coin": "QTC",
+    "algorithm": "QPoW",
+    "hashrate": {"value": "1", "unit": "MH/s"},
+    "estimated_coin_per_second": "0.000000000670491898148148148148148148",
+    "estimated_usd_per_second": "0.0000000670512731481481481481481481481",
+    "source": "frozen_snapshot",
+    "source_timestamp": null,
+    "confidence": "low",
+    "fee_inclusion_state": "unknown",
+    "raw_reference": "https://pool.kryptex.com/api/v2/daily-revenue/QTC?hashrate=1000000"
+  }
+}

@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="csrf-token" content="__CSRF_TOKEN__">
+  <title>Salad GPU Control Plane · Offline</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div><p class="eyebrow">SALADCLOUD · MINERS</p><h1>GPU Fleet Monitor</h1></div>
+    <div class="header-actions"><span id="mode-badge" class="badge">OFFLINE / LOCAL</span><button id="refresh" class="button primary">Actualizar</button></div>
+  </header>
+  <main>
+    <section class="notice" role="status"><strong>Modo seguro activo</strong><span>Lectura Salad, Firebase productivo, gasto y acciones reales están deshabilitados.</span></section>
+    <section class="summary-grid" id="summary"></section>
+    <section class="section-head"><div><p class="eyebrow">POLÍTICA ACTIVA</p><h2>Umbrales y ventanas de monitoreo</h2></div><div class="muted">El origen de cada valor se muestra junto a la configuración efectiva.</div></section>
+    <section id="policy" class="policy-panel" aria-live="polite"></section>
+    <section class="section-head"><div><p class="eyebrow">ADRIANFIVERR / MINERS</p><h2>Container Groups</h2></div><div class="muted">Cada grupo conserva su procedencia e instancias.</div></section>
+    <section id="groups" class="group-grid" aria-live="polite"></section>
+    <section class="section-head"><div><p class="eyebrow">CONTINUOUS MONITOR</p><h2>GPU observadas</h2></div><div class="muted">Los valores sin telemetría independiente permanecen UNKNOWN.</div></section>
+    <section id="devices" class="device-list"></section>
+    <section class="section-head"><div><p class="eyebrow">FLEET ECONOMICS</p><h2>Trabajo e ingreso por flotilla</h2></div><div class="muted">BTC e ingreso del worker permanecen a nivel de flotilla; no se reparten entre GPU.</div></section>
+    <section id="fleets" class="group-grid" aria-live="polite"></section>
+    <section class="section-head"><div><p class="eyebrow">CONTROL OPERATIVO</p><h2>Acciones y protecciones</h2></div></section>
+    <section id="controls" class="control-panel"></section>
+    <section class="section-head"><div><p class="eyebrow">AUDIT</p><h2>Actividad reciente</h2></div><button id="load-audit" class="button secondary">Ver auditoría</button></section>
+    <section id="audit" class="audit-list"><p class="muted">La auditoría local aún no se ha cargado.</p></section>
+  </main>
+  <footer><span>Salad GPU Control Plane</span><span>Solo localhost · No Firebase real · No acción automática</span></footer>
+</body>
+</html>

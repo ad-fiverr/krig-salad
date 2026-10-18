@@ -1,0 +1,24 @@
+{
+  "observation_id": "kryptex-prl-2026-10-07-frozen",
+  "observed_at": null,
+  "observed_at_precision": "minute",
+  "source_time_precision": "unknown",
+  "source": "frozen_snapshot",
+  "source_class": "derived_undocumented_public",
+  "freshness": "historical_fixture",
+  "schema_version": "oracle-v1-observed-shape",
+  "raw_reference": "GET /api/v2/daily-revenue/PRL?hashrate=1000000000000; acceso aprox. 2026-10-07 07:29 America/Ojinaga, precisión minuto",
+  "confidence": "low",
+  "payload": {
+    "coin": "PRL",
+    "algorithm": "PearlHash",
+    "hashrate": {"value": "1", "unit": "TH/s"},
+    "estimated_coin_per_second": "2.206272939814815e-7",
+    "estimated_usd_per_second": "0.000000271325",
+    "source": "frozen_snapshot",
+    "source_timestamp": null,
+    "confidence": "low",
+    "fee_inclusion_state": "unknown",
+    "raw_reference": "https://pool.kryptex.com/api/v2/daily-revenue/PRL?hashrate=1000000000000"
+  }
+}

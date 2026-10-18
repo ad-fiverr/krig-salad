@@ -1,0 +1,54 @@
+{
+  "schema_version": "1.0",
+  "mode": "offline_local",
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8765
+  },
+  "salad": {
+    "organization": "adrianfiverr",
+    "project": "miners",
+    "container_groups": [
+      "fl4shminer",
+      "fl4shminer-2",
+      "fl4shminer-3",
+      "fl4shminer-4"
+    ],
+    "live_get_enabled": false,
+    "secret_source": "interactive_tty_only",
+    "refresh_mode": "explicit_manual_no_polling"
+  },
+  "gpu_floors_ths": {
+    "RTX 5090|laptop|salad_json_log_gpu_class_name": 120,
+    "RTX 5080|laptop|salad_json_log_gpu_class_name": 120,
+    "RTX 5090|desktop|salad_json_log_gpu_class_name": 350,
+    "RTX 5080|desktop|salad_json_log_gpu_class_name": 209
+  },
+  "salad_hourly_price_usd_estimate": null,
+  "monitor": {
+    "warmup_seconds": 90,
+    "expected_sample_interval_seconds": 10,
+    "hash_window_seconds": 120,
+    "reevaluation_interval_seconds": 30,
+    "minimum_samples_per_window": 10,
+    "minimum_window_coverage_ratio": 0.8,
+    "maximum_sample_gap_seconds": 30,
+    "consecutive_bad_windows": 2
+  },
+  "actions": {
+    "live_actions_enabled": false,
+    "live_spend_authorized": false,
+    "auto_reallocate": false,
+    "hard_budget_usd": 30.0,
+    "kill_switch_engaged": true,
+    "action_cooldown_seconds": null,
+    "maximum_reallocations_per_machine": null,
+    "maximum_reallocations_per_fleet": null,
+    "unknown_cost_blocks_action": true,
+    "timeout_retry": false
+  },
+  "firebase_enabled": false,
+  "firebase_project_id": "demo-salad-miners",
+  "state_dir": "~/.local/share/salad-miners-g5",
+  "local_telemetry_sources": []
+}

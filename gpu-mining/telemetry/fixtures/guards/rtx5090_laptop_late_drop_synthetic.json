@@ -1,0 +1,33 @@
+{
+  "schema_version": "1.0",
+  "fixture_status": "SYNTHETIC_TEST_ONLY",
+  "scenario": "RTX 5090 Laptop begins above floor and degrades after 30 minutes",
+  "description": "This fixture is not a production measurement and does not establish a physical floor.",
+  "start_time_utc": "2026-10-08T00:00:00Z",
+  "sample_interval_seconds": 10,
+  "gpu_identity": {
+    "raw_model": "NVIDIA GeForce RTX 5090 Laptop (24 GB)",
+    "identity_source": "synthetic_test_fixture",
+    "identity_verified": true
+  },
+  "hashrate_semantics": "fl4shminer_device_reported",
+  "hashrate_source": "SYNTHETIC_TEST_FIXTURE: device hashrate",
+  "allocation": {
+    "fleet_id": "fixture-fleet",
+    "worker_id": "fixture-shared-worker",
+    "allocation_id": "fixture-allocation-v1",
+    "assignment_id": "fixture-allocation-v1",
+    "run_id": "fixture-run-late-drop",
+    "machine_id": "fixture-machine-5090l",
+    "instance_id": "fixture-instance-5090l",
+    "device_namespace": "fl4shminer_device",
+    "device_id": "0",
+    "start_anchor_verified": true,
+    "reallocation_history_known": true,
+    "reallocation_count": 0
+  },
+  "intervals": [
+    {"start_seconds": 0, "end_seconds": 1800, "hashrate_ths": 170},
+    {"start_seconds": 1800, "end_seconds": 3600, "hashrate_ths": 90}
+  ]
+}

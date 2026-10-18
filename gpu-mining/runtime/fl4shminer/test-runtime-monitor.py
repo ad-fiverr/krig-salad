@@ -85,6 +85,80 @@ def make_telegram_config(**overrides: str) -> MONITOR.TelegramConfig:
     return MONITOR.TelegramConfig.from_env(values)
 
 
+class EarlyAutotuneEmissionTests(unittest.TestCase):
+    def test_bounded_cuda_and_pearl_estimates_are_not_device_samples(self) -> None:
+        cuda = "2026/10/10 18:30:35 Device [1] CUDA autotune: 130.20 TH/s (measured pool-equivalent)"
+        pearl = "GPU=NVIDIA GeForce RTX 5090 Laptop GPU Pearl autotune hashrate = 148.5 TH/s"
+        parsed = MONITOR.parse_early_autotune(cuda)
+        self.assertEqual(
+            (parsed.device_index, parsed.signal_type, parsed.estimate_ths),
+            (1, "CUDA_POOL_EQUIVALENT", 130.2),
+        )
+        self.assertIsNone(MONITOR.parse_device_hashrate(cuda))
+        self.assertIsNone(MONITOR.parse_early_autotune(pearl).device_index)
+        self.assertIsNone(MONITOR.parse_device_hashrate(pearl))
+        for invalid in (
+            "prefix " + cuda,
+            cuda + " arbitrary suffix",
+            cuda.replace("pool-equivalent", "pool-actual"),
+            pearl.replace("148.5", "nan"),
+            "Device [1] CUDA autotune: 0 TH/s (measured pool-equivalent)",
+            "Device [1] CUDA autotune: 99999 TH/s (measured pool-equivalent)",
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertIsNone(MONITOR.parse_early_autotune(invalid))
+
+    def test_local_event_is_immediate_and_never_claims_provider_binding(self) -> None:
+        monitor = MONITOR.Fl4shMonitor(
+            make_auto_config(
+                SALAD_G5_WARMUP_SECONDS="90",
+                SALAD_G5_HASH_WINDOW_SECONDS="120",
+            ),
+            start_monotonic=0,
+        )
+        monitor.observe_line(
+            "Device [1] NVIDIA GeForce RTX 5090 Laptop GPU: Initialized", now=1
+        )
+        event = monitor.observe_line(
+            "Device [1] CUDA autotune: 80 TH/s (measured pool-equivalent)", now=2
+        )[0]
+        self.assertEqual(event["state"], "EARLY_SIGNAL_OBSERVED")
+        self.assertEqual(event["gpu_key"], "RTX_5090_LAPTOP")
+        self.assertEqual(
+            event["estimate_semantics"], "AUTOTUNE_ESTIMATE_NOT_DEVICE_HASHRATE"
+        )
+        self.assertIsNone(event["observed_window_mean_ths"])
+        self.assertEqual(event["provider_binding_status"], "UNKNOWN")
+        self.assertFalse(event["actions_performed"])
+        self.assertEqual(len(monitor.devices[1].samples), 0)
+        formatted = MONITOR.format_event(event)
+        self.assertIn("signal_type=CUDA_POOL_EQUIVALENT", formatted)
+        self.assertIn("estimate_ths=80", formatted)
+        self.assertIn("estimate_semantics=AUTOTUNE_ESTIMATE_NOT_DEVICE_HASHRATE", formatted)
+        self.assertNotIn("REALLOCATE_RECOMMENDED", formatted)
+
+    def test_unindexed_pearl_and_conflicting_identity_never_get_a_device_claim(self) -> None:
+        monitor = MONITOR.Fl4shMonitor(make_auto_config(), start_monotonic=0)
+        monitor.observe_line(
+            "Device [1] NVIDIA GeForce RTX 5090 Laptop GPU: Initialized", now=1
+        )
+        pearl = monitor.observe_line(
+            "GPU=NVIDIA GeForce RTX 5090 Laptop GPU Pearl autotune hashrate = 80 TH/s",
+            now=2,
+        )
+        early = next(item for item in pearl if item["state"] == "EARLY_SIGNAL_OBSERVED")
+        self.assertEqual(early["device"], "unobserved")
+        self.assertEqual(early["gpu_key"], "unknown")
+        conflict = monitor.observe_line(
+            "Device [1] GPU=NVIDIA GeForce RTX 5080 Laptop GPU Pearl autotune hashrate = 80 TH/s",
+            now=3,
+        )
+        early_conflict = next(
+            item for item in conflict if item["state"] == "EARLY_SIGNAL_OBSERVED"
+        )
+        self.assertEqual(early_conflict["gpu_key"], "unknown")
+
+
 class MonitorConfigTests(unittest.TestCase):
     def test_monitor_is_off_by_default(self) -> None:
         config = MONITOR.MonitorConfig.from_env({})
@@ -1508,14 +1582,14 @@ class ParsingAndWindowTests(unittest.TestCase):
         monitor = MONITOR.Fl4shMonitor(config, start_monotonic=0)
         monitor.observe_line(line(1, device=1), now=0)
 
-        # The unindexed Pearl line is ignored until Device [N] Initialized exists.
-        self.assertEqual(
-            monitor.observe_line(
-                "GPU=NVIDIA GeForce RTX 5080 Laptop GPU Pearl autotune hashrate = 9999 TH/s",
-                now=1,
-            ),
-            [],
+        # Preserve the unbound estimate, but do not promote it to identity.
+        pearl = monitor.observe_line(
+            "GPU=NVIDIA GeForce RTX 5080 Laptop GPU Pearl autotune hashrate = 9999 TH/s",
+            now=1,
         )
+        self.assertEqual([event["state"] for event in pearl], ["EARLY_SIGNAL_OBSERVED"])
+        self.assertEqual(pearl[0]["device"], "unobserved")
+        self.assertEqual(pearl[0]["gpu_key"], "unknown")
         secondary = monitor.observe_line(
             "Solutions accepted: 1-NVIDIA GeForce RTX 5080 Laptop GPU, stale=0", now=2
         )
@@ -1546,7 +1620,10 @@ class ParsingAndWindowTests(unittest.TestCase):
         pearl_events = monitor.observe_line(
             "GPU=NVIDIA GeForce RTX 5080 Laptop GPU Pearl autotune hashrate = 9999 TH/s", now=1
         )
-        self.assertEqual(pearl_events, [])
+        self.assertEqual(
+            [event["state"] for event in pearl_events], ["EARLY_SIGNAL_OBSERVED"]
+        )
+        self.assertEqual(pearl_events[0]["device"], "unobserved")
         self.assertEqual(len(monitor.devices[1].samples), 0)
         monitor.observe_line(
             "Solutions accepted: 1-NVIDIA GeForce RTX 5080 Laptop GPU, stale=0", now=2

@@ -37,6 +37,17 @@ DEVICE_RATE_RE = re.compile(
     r"(?:\s*,\s*warm:\s*(?P<warm>[0-9]+))?\b",
     re.IGNORECASE,
 )
+EARLY_AUTOTUNE_RE = re.compile(
+    r"(?:[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} )?"
+    r"(?:Device\s*\[(?P<cuda_device>[0-9]{1,3})\]\s+CUDA\s+autotune:\s*"
+    r"(?P<cuda_rate>[0-9]+(?:\.[0-9]{1,6})?)\s*"
+    r"(?P<cuda_unit>TH/s|GH/s|MH/s)\s*\(measured pool-equivalent\)"
+    r"|(?:Device\s*\[(?P<pearl_device>[0-9]{1,3})\]\s*)?"
+    r"GPU=(?P<pearl_gpu>[^\r\n=]{1,256}?)\s+Pearl autotune hashrate\s*=\s*"
+    r"(?P<pearl_rate>[0-9]+(?:\.[0-9]{1,6})?)\s*"
+    r"(?P<pearl_unit>TH/s|GH/s|MH/s))",
+    re.IGNORECASE,
+)
 MAX_GPU_KEY_CHARS = 128
 MAX_GPU_NAME_CHARS = 256
 GPU_KEY_RE = re.compile(r"[A-Z0-9]+(?:_[A-Z0-9]+)*")
@@ -499,6 +510,38 @@ class DeviceSample:
     warm_count: int | None
 
 
+@dataclass(frozen=True)
+class EarlyAutotuneSample:
+    device_index: int | None
+    signal_type: str
+    estimate_ths: float
+    gpu_key: str | None
+
+
+def parse_early_autotune(line: str) -> EarlyAutotuneSample | None:
+    """Parse one bounded estimate; never treat it as Device hashRate."""
+    if not isinstance(line, str) or len(line.encode("utf-8", "replace")) > MAX_PARSE_LINE_BYTES:
+        return None
+    match = EARLY_AUTOTUNE_RE.fullmatch(line.strip())
+    if match is None:
+        return None
+    cuda = match.group("cuda_rate") is not None
+    raw_rate = match.group("cuda_rate" if cuda else "pearl_rate")
+    unit = match.group("cuda_unit" if cuda else "pearl_unit").upper()
+    rate = float(raw_rate) * {"TH/S": 1.0, "GH/S": 0.001, "MH/S": 0.000001}[unit]
+    if not math.isfinite(rate) or rate <= 0 or rate > MAX_GPU_FLOOR_THS:
+        return None
+    device = match.group("cuda_device" if cuda else "pearl_device")
+    gpu_raw = match.group("pearl_gpu") if not cuda else None
+    gpu_key = normalize_gpu_identity(gpu_raw.strip()) if gpu_raw else None
+    return EarlyAutotuneSample(
+        int(device) if device is not None else None,
+        "CUDA_POOL_EQUIVALENT" if cuda else "PEARL_AUTOTUNE",
+        rate,
+        gpu_key,
+    )
+
+
 def parse_device_hashrate(line: str) -> DeviceSample | None:
     """Parse only one explicit Fl4shMiner Device hashRate value in TH/s."""
     matches = list(DEVICE_RATE_RE.finditer(line))
@@ -588,6 +631,27 @@ class Fl4shMonitor:
                     continue
             state = self.devices.setdefault(device_index, DeviceState(device_index))
             events.extend(self._apply_identity(state, observation))
+
+        early = parse_early_autotune(line)
+        if early is not None:
+            # The local miner does not know the provider assignment. An
+            # unindexed Pearl line is never assigned to a device by proximity.
+            state = self.devices.get(early.device_index) if early.device_index is not None else None
+            event = self._event(state, "EARLY_SIGNAL_OBSERVED", observed=None)
+            event["device"] = (
+                f"fl4shminer_device:{early.device_index}"
+                if early.device_index is not None else "unobserved"
+            )
+            event["gpu_key"] = (
+                state.gpu_key if state is not None and state.gpu_identity_status == "DETECTED"
+                and (early.gpu_key is None or early.gpu_key == state.gpu_key)
+                else "unknown"
+            )
+            event["signal_type"] = early.signal_type
+            event["estimate_ths"] = early.estimate_ths
+            event["estimate_semantics"] = "AUTOTUNE_ESTIMATE_NOT_DEVICE_HASHRATE"
+            event["source"] = "fl4shminer_stdout:autotune_estimate"
+            events.append(event)
 
         sample = parse_device_hashrate(line)
         if sample is None:
@@ -1095,6 +1159,14 @@ def format_event(event: Mapping[str, Any]) -> str:
         f'coverage={_format_number(coverage)}',
         f'window_samples={_format_number(event["window_sample_count"])}',
     ]
+    if event.get("state") == "EARLY_SIGNAL_OBSERVED":
+        fields.extend(
+            [
+                f'signal_type={event["signal_type"]}',
+                f'estimate_ths={_format_number(event["estimate_ths"])}',
+                f'estimate_semantics={event["estimate_semantics"]}',
+            ]
+        )
     if event.get("degradation_episode_id") is not None:
         fields.append(f'episode_id={event["degradation_episode_id"]}')
         fields.append(f'alert_sequence={event["alert_sequence"]}')
