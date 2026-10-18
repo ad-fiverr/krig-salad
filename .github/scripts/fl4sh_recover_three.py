@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""One-shot, fixed-scope recovery for Fl4shMiner Docker Hub targets 4-6.
+"""One-shot, fixed-scope Docker CLI recovery for Fl4shMiner targets 4-6.
 
-The command never builds an image. It copies one immutable public registry
-manifest and refuses a copy if Skopeo cannot preserve its digest.
+The command never builds an image. It pulls one immutable source digest,
+validates its local OCI identity, then tags and pushes only the three approved
+destination repositories.
 """
 
 from __future__ import annotations
@@ -37,13 +38,16 @@ SOURCE_URL = "https://github.com/ad-fiverr/krig-salad"
 VERSION = "1.5.2"
 TAGS = ("sha-e66ba5e17baf", VERSION, "latest")
 CONFIRMATION = "RECOVER_TARGETS_4_6"
-SKOPEO_VERSION = "1.4.1"
-SKOPEO_COMMAND_TIMEOUT_SECONDS = 60
-SKOPEO_COPY_TIMEOUT_SECONDS = 4 * 60 * 60
+DOCKER_COMMAND_TIMEOUT_SECONDS = 60
+DOCKER_TRANSFER_TIMEOUT_SECONDS = 4 * 60 * 60
 MAX_REGISTRY_BODY = 1_000_000
 MAX_CONFIG_OUTPUT = 2_000_000
 MAX_TOOL_OUTPUT = 1_000_000
-RESULT_SCHEMA_VERSION = 1
+RESULT_SCHEMA_VERSION = 2
+DOCKER_PHASES = frozenset({"DOCKER_PULL", "DOCKER_INSPECT", "DOCKER_LOGIN",
+                           "DOCKER_TAG", "DOCKER_PUSH", "DOCKER_LOGOUT"})
+COMMAND_FAILURE_CLASSES = frozenset({"NONZERO_EXIT", "TIMEOUT", "SPAWN_ERROR",
+                                     "OUTPUT_LIMIT", "UNKNOWN"})
 
 
 @dataclass(frozen=True)
@@ -93,21 +97,32 @@ SAFE_FAILURE_CODES = frozenset({
     "REGISTRY_FORBIDDEN", "REGISTRY_RATE_LIMITED", "REGISTRY_REDIRECT_BLOCKED",
     "REGISTRY_RESPONSE_INVALID", "REGISTRY_RESPONSE_LIMIT", "REGISTRY_UNKNOWN",
     "SOURCE_IDENTITY_INVALID", "IMAGE_IDENTITY_INVALID", "TAG_CONFLICT",
-    "SKOPEO_UNAVAILABLE", "SKOPEO_VERSION_UNSUPPORTED", "SKOPEO_FEATURE_UNAVAILABLE",
-    "SKOPEO_LOGIN_FAILED", "SKOPEO_INSPECT_FAILED", "SKOPEO_COPY_FAILED",
-    "SKOPEO_TIMEOUT", "SKOPEO_OUTPUT_LIMIT", "SKOPEO_SPAWN_FAILED",
-    "DIGEST_PRESERVATION_FAILED", "RUN_ALREADY_ATTEMPTED", "INTERRUPTED",
+    "DOCKER_UNAVAILABLE", "DOCKER_PULL_FAILED", "DOCKER_INSPECT_FAILED",
+    "DOCKER_LOGIN_FAILED", "DOCKER_TAG_FAILED", "DOCKER_PUSH_FAILED",
+    "DOCKER_LOGOUT_FAILED", "DOCKER_TIMEOUT", "DOCKER_OUTPUT_LIMIT",
+    "DOCKER_SPAWN_FAILED", "DOCKER_COMMAND_UNKNOWN",
+    "RUN_ALREADY_ATTEMPTED", "INTERRUPTED",
     "PROTECTED_TARGETS_UNVERIFIED", "PROTECTED_TARGET_DRIFT", "RECOVERY_SEQUENCE_BLOCKED",
     "INTERNAL_FAILURE",
 })
 
 
 class RecoveryError(Exception):
-    """A fixed code only; provider bodies and subprocess details are discarded."""
+    """Fixed, sanitized diagnostics only; raw subprocess data is discarded."""
 
-    def __init__(self, code: str):
+    def __init__(self, code: str, *, phase: str | None = None,
+                 failure_class: str | None = None, secondary_failure_code: str | None = None):
         self.code = code if code in SAFE_FAILURE_CODES else "INTERNAL_FAILURE"
+        self.phase = phase if phase in DOCKER_PHASES else None
+        self.failure_class = failure_class if failure_class in COMMAND_FAILURE_CLASSES else None
+        self.secondary_failure_code = (secondary_failure_code
+                                       if secondary_failure_code in SAFE_FAILURE_CODES else None)
         super().__init__(self.code)
+
+
+def _failure_fields(error: RecoveryError) -> dict:
+    return {"failure_code": error.code, "failure_phase": error.phase,
+            "failure_class": error.failure_class}
 
 
 @dataclass(frozen=True)
@@ -166,13 +181,25 @@ def _new_results(run_id: str, attempt: str) -> dict:
         "preflight": {},
         "targets": {
             target_id: {"status": "NOT_STARTED", "attempted": False,
-                        "failure_code": None,
+                        "failure_code": None, "failure_phase": None,
+                        "failure_class": None, "logout_failure_code": None,
                         "tags": {tag: {"status": "PENDING", "digest": None,
-                                       "failure_code": None} for tag in TAGS}}
+                                       "failure_code": None, "failure_phase": None,
+                                       "failure_class": None} for tag in TAGS}}
             for target_id in TARGET_IDS
         },
         "verification": {},
     }
+
+
+def _valid_failure_details(row: dict) -> bool:
+    phase, failure_class = row.get("failure_phase"), row.get("failure_class")
+    return ((phase is None and failure_class is None)
+            or (phase in DOCKER_PHASES and failure_class in COMMAND_FAILURE_CLASSES))
+
+
+def _valid_digest_or_none(value: object) -> bool:
+    return value is None or (isinstance(value, str) and publisher.DIGEST_RE.fullmatch(value) is not None)
 
 
 def _validate_results(data: object) -> dict:
@@ -196,35 +223,45 @@ def _validate_results(data: object) -> dict:
             or not isinstance(verification, dict) or not set(verification).issubset(ALL_TARGET_IDS)):
         raise RecoveryError("RESULT_STATE_INVALID")
     for target_id, row in preflight.items():
-        if (not isinstance(row, dict) or set(row) != {"status", "failure_code", "tags"}
+        if (not isinstance(row, dict) or set(row) != {
+                    "status", "failure_code", "failure_phase", "failure_class", "tags"}
                 or row.get("status") not in PREFLIGHT_STATES
                 or row.get("failure_code") not in (None, *SAFE_FAILURE_CODES)
+                or not _valid_failure_details(row)
                 or not isinstance(row.get("tags"), dict)
                 or not set(row["tags"]).issubset(TAGS)):
             raise RecoveryError("RESULT_STATE_INVALID")
     for target_id, row in targets.items():
-        if (not isinstance(row, dict) or set(row) != {"status", "attempted", "failure_code", "tags"}
+        if (not isinstance(row, dict) or set(row) != {
+                    "status", "attempted", "failure_code", "failure_phase", "failure_class",
+                    "logout_failure_code", "tags"}
                 or row.get("status") not in TARGET_STATES or type(row.get("attempted")) is not bool
                 or row.get("failure_code") not in (None, *SAFE_FAILURE_CODES)
+                or row.get("logout_failure_code") not in (None, "DOCKER_LOGOUT_FAILED")
+                or not _valid_failure_details(row)
                 or not isinstance(row.get("tags"), dict) or set(row["tags"]) != set(TAGS)):
             raise RecoveryError("RESULT_STATE_INVALID")
         for tag_row in row["tags"].values():
-            if (not isinstance(tag_row, dict) or set(tag_row) != {"status", "digest", "failure_code"}
+            if (not isinstance(tag_row, dict) or set(tag_row) != {
+                        "status", "digest", "failure_code", "failure_phase", "failure_class"}
                     or tag_row.get("status") not in TAG_STATES
-                    or tag_row.get("digest") not in (None, SOURCE_DIGEST)
-                    or tag_row.get("failure_code") not in (None, *SAFE_FAILURE_CODES)):
+                    or not _valid_digest_or_none(tag_row.get("digest"))
+                    or tag_row.get("failure_code") not in (None, *SAFE_FAILURE_CODES)
+                    or not _valid_failure_details(tag_row)):
                 raise RecoveryError("RESULT_STATE_INVALID")
     for target_id, row in verification.items():
-        if (not isinstance(row, dict) or set(row) != {"status", "failure_code", "tags"}
+        if (not isinstance(row, dict) or set(row) != {
+                    "status", "failure_code", "failure_phase", "failure_class", "tags"}
                 or row.get("status") not in {"VERIFIED", "BLOCKED", "UNKNOWN"}
                 or row.get("failure_code") not in (None, *SAFE_FAILURE_CODES)
+                or not _valid_failure_details(row)
                 or not isinstance(row.get("tags"), dict)
                 or not set(row["tags"]).issubset(TAGS)):
             raise RecoveryError("RESULT_STATE_INVALID")
         for tag_row in row["tags"].values():
             if (not isinstance(tag_row, dict) or set(tag_row) != {"status", "digest"}
                     or tag_row.get("status") not in {"VERIFIED", "ABSENT_HTTP404", "CONFLICT", "UNKNOWN"}
-                    or tag_row.get("digest") not in (None, SOURCE_DIGEST)):
+                    or not _valid_digest_or_none(tag_row.get("digest"))):
                 raise RecoveryError("RESULT_STATE_INVALID")
     return data
 
@@ -263,7 +300,7 @@ def _read_results(path: Path) -> dict:
 
 
 class PrivateWorkspace:
-    """Per-operation private directory; authfiles are removed on every exit."""
+    """Per-operation private Docker config roots removed on every exit."""
 
     def __enter__(self):
         self._temporary = tempfile.TemporaryDirectory(prefix="fl4sh-three-recovery-")
@@ -272,60 +309,29 @@ class PrivateWorkspace:
         self.runtime = self.path / "runtime"
         self.home.mkdir(mode=0o700)
         self.runtime.mkdir(mode=0o700)
-        self.source_auth = self.path / "source-auth.json"
-        self.dest_auth = self.path / "dest-auth.json"
-        self._secure_file(self.source_auth, b'{"auths":{}}\n')
-        self._secure_file(self.dest_auth, b'{"auths":{}}\n')
-        for directory in (self.path, self.home, self.runtime):
+        self.source_config = self.path / "source-docker-config"
+        self.source_config.mkdir(mode=0o700)
+        self._destination_configs = {}
+        for directory in (self.path, self.home, self.runtime, self.source_config):
             if os.name != "nt":
                 os.chmod(directory, 0o700)
         return self
 
-    @staticmethod
-    def _secure_file(path: Path, content: bytes) -> None:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-        if os.name != "nt":
-            os.chmod(path, 0o600)
-
-    def ensure_private_authfile(self, path: Path) -> None:
-        try:
-            if (not path.is_file() or path.is_symlink()
-                    or path.resolve().parent != self.path.resolve()):
-                raise ValueError
-            if os.name != "nt":
-                os.chmod(path, 0o600)
-                mode = stat.S_IMODE(path.stat().st_mode)
-                if mode & 0o077:
-                    raise ValueError
-        except Exception:
-            raise RecoveryError("SKOPEO_LOGIN_FAILED") from None
-
-    def write_destination_auth(self, credentials: Credentials) -> None:
-        """Write Docker-compatible auth to a private file, never argv or env."""
-        payload = json.dumps({
-            "auths": {"docker.io": {
-                "auth": base64.b64encode(
-                    (credentials.username + ":" + credentials.token).encode("ascii")
-                ).decode("ascii")
-            }}
-        }, separators=(",", ":")).encode("ascii") + b"\n"
-        temporary = self.path / "dest-auth.new"
-        try:
-            self._secure_file(temporary, payload)
-            temporary.replace(self.dest_auth)
-            if os.name != "nt":
-                os.chmod(self.dest_auth, 0o600)
-            self.ensure_private_authfile(self.dest_auth)
-        except RecoveryError:
-            raise
-        except Exception:
-            with contextlib.suppress(OSError):
-                temporary.unlink()
-            raise RecoveryError("SKOPEO_LOGIN_FAILED") from None
+    def destination_config(self, target_id: str) -> Path:
+        _target(target_id, write_only=True)
+        if target_id not in self._destination_configs:
+            config_path = self.path / ("docker-config-" + target_id)
+            try:
+                config_path.mkdir(mode=0o700)
+                if os.name != "nt":
+                    os.chmod(config_path, 0o700)
+                    if stat.S_IMODE(config_path.stat().st_mode) & 0o077:
+                        raise OSError
+                self._destination_configs[target_id] = config_path
+            except Exception:
+                raise RecoveryError("DOCKER_LOGIN_FAILED", phase="DOCKER_LOGIN",
+                                    failure_class="UNKNOWN") from None
+        return self._destination_configs[target_id]
 
     def __exit__(self, exc_type, exc, traceback):
         self._temporary.cleanup()
@@ -352,95 +358,107 @@ def _cleanup_interrupts():
                 signal.signal(sig, handler)
 
 
-class Skopeo:
-    """Subprocess adapter with fixed arguments, bounded output, and redaction."""
+class DockerCLI:
+    """Fixed-scope Docker CLI adapter; secrets travel only on login stdin."""
 
-    def __init__(self, workspace: PrivateWorkspace):
+    _PHASE_CODES = {
+        "DOCKER_PULL": "DOCKER_PULL_FAILED", "DOCKER_INSPECT": "DOCKER_INSPECT_FAILED",
+        "DOCKER_LOGIN": "DOCKER_LOGIN_FAILED", "DOCKER_TAG": "DOCKER_TAG_FAILED",
+        "DOCKER_PUSH": "DOCKER_PUSH_FAILED", "DOCKER_LOGOUT": "DOCKER_LOGOUT_FAILED",
+    }
+
+    def __init__(self, workspace: PrivateWorkspace, config: Path | None = None):
         self.workspace = workspace
+        self.config = config or workspace.source_config
+        if self.config.resolve().parent != workspace.path.resolve():
+            raise RecoveryError("TARGET_NOT_ALLOWED")
 
-    def command(self, args: list[str], *, stdin: str | None = None,
-                timeout: int = SKOPEO_COMMAND_TIMEOUT_SECONDS, code: str = "SKOPEO_INSPECT_FAILED") -> str:
-        clean_env = {
-            "PATH": "/usr/bin:/bin",
-            "HOME": str(self.workspace.home),
-            "XDG_RUNTIME_DIR": str(self.workspace.runtime),
-            "TMPDIR": str(self.workspace.path),
-            "LC_ALL": "C",
-            "LANG": "C",
-        }
+    def command(self, args: list[str], *, phase: str, stdin: str | None = None,
+                timeout: int = DOCKER_COMMAND_TIMEOUT_SECONDS) -> str:
+        code = self._PHASE_CODES.get(phase)
+        if code is None or not isinstance(args, list) or not args or args[0] != "docker":
+            raise RecoveryError("TARGET_NOT_ALLOWED")
+        allowed_environment = ("PATH", "HOME", "SystemRoot", "SYSTEMROOT", "TEMP", "TMP")
+        clean_env = {key: os.environ[key] for key in allowed_environment if key in os.environ}
+        clean_env.update({"DOCKER_CONFIG": str(self.config), "LC_ALL": "C", "LANG": "C"})
+
+        def reject(failure_class: str, *, code_override: str | None = None) -> None:
+            raise RecoveryError(code_override or code, phase=phase,
+                                failure_class=failure_class) from None
+
         try:
-            result = subprocess.run(["skopeo", *args], input=stdin, text=True, encoding="utf-8",
+            result = subprocess.run(args, input=stdin, text=True, encoding="utf-8",
                                     errors="replace", capture_output=True, check=False,
                                     timeout=timeout, env=clean_env)
         except subprocess.TimeoutExpired:
-            raise RecoveryError("SKOPEO_TIMEOUT") from None
+            reject("TIMEOUT")
         except FileNotFoundError:
-            raise RecoveryError("SKOPEO_UNAVAILABLE") from None
+            reject("SPAWN_ERROR", code_override="DOCKER_UNAVAILABLE")
         except OSError:
-            raise RecoveryError("SKOPEO_SPAWN_FAILED") from None
+            reject("SPAWN_ERROR")
         except Exception:
-            raise RecoveryError("INTERNAL_FAILURE") from None
-        stdout = result.stdout if isinstance(result.stdout, str) else ""
-        stderr = result.stderr if isinstance(result.stderr, str) else ""
-        if len(stdout) > MAX_TOOL_OUTPUT or len(stderr) > MAX_TOOL_OUTPUT:
-            raise RecoveryError("SKOPEO_OUTPUT_LIMIT")
-        if type(result.returncode) is not int or result.returncode != 0:
-            raise RecoveryError(code)
-        return stdout
-
-    def validate(self) -> None:
-        version = self.command(["--version"], code="SKOPEO_VERSION_UNSUPPORTED")
-        if not re.search(r"\bskopeo version 1\.4\.1(?:\s|$)", version):
-            raise RecoveryError("SKOPEO_VERSION_UNSUPPORTED")
-        expected = {
-            ("copy", "--help"): ("--src-authfile", "--dest-authfile", "--preserve-digests", "--retry-times", "--digestfile"),
-            ("inspect", "--help"): ("--config", "--authfile", "--retry-times"),
-        }
-        for args, flags in expected.items():
-            help_text = self.command(list(args), code="SKOPEO_FEATURE_UNAVAILABLE")
-            if any(flag not in help_text for flag in flags):
-                raise RecoveryError("SKOPEO_FEATURE_UNAVAILABLE")
-
-    def login(self, credentials: Credentials) -> None:
-        self.workspace.write_destination_auth(credentials)
-
-    def inspect_config(self, reference: str, authfile: Path) -> dict:
-        raw = self.command(["inspect", "--authfile", str(authfile), "--retry-times", "0",
-                            "--config", reference], code="SKOPEO_INSPECT_FAILED")
-        if len(raw.encode("utf-8")) > MAX_CONFIG_OUTPUT:
-            raise RecoveryError("SKOPEO_OUTPUT_LIMIT")
+            reject("UNKNOWN", code_override="DOCKER_COMMAND_UNKNOWN")
         try:
-            value = json.loads(raw)
-            if not isinstance(value, dict):
+            stdout = result.stdout if result.stdout is not None else ""
+            stderr = result.stderr if result.stderr is not None else ""
+            returncode = result.returncode
+            if not isinstance(stdout, (str, bytes)) or not isinstance(stderr, (str, bytes)) or type(returncode) is not int:
+                reject("UNKNOWN", code_override="DOCKER_COMMAND_UNKNOWN")
+            stdout_size = len(stdout.encode("utf-8")) if isinstance(stdout, str) else len(stdout)
+            stderr_size = len(stderr.encode("utf-8")) if isinstance(stderr, str) else len(stderr)
+        except RecoveryError:
+            raise
+        except Exception:
+            reject("UNKNOWN", code_override="DOCKER_COMMAND_UNKNOWN")
+        if stdout_size > MAX_TOOL_OUTPUT or stderr_size > MAX_TOOL_OUTPUT:
+            reject("OUTPUT_LIMIT", code_override="DOCKER_OUTPUT_LIMIT")
+        if returncode != 0:
+            reject("NONZERO_EXIT")
+        return stdout.decode("utf-8", "replace") if isinstance(stdout, bytes) else stdout
+
+    def pull_source(self, reference: str) -> None:
+        if reference != _source_reference():
+            raise RecoveryError("SOURCE_IDENTITY_INVALID")
+        self.command(["docker", "pull", "--platform", "linux/amd64", "--quiet", reference],
+                     phase="DOCKER_PULL", timeout=DOCKER_TRANSFER_TIMEOUT_SECONDS)
+
+    def inspect_source(self, reference: str) -> dict:
+        if reference != _source_reference():
+            raise RecoveryError("SOURCE_IDENTITY_INVALID")
+        raw = self.command(["docker", "image", "inspect", "--format", "{{json .}}", reference],
+                           phase="DOCKER_INSPECT")
+        if len(raw.encode("utf-8")) > MAX_CONFIG_OUTPUT:
+            raise RecoveryError("DOCKER_OUTPUT_LIMIT", phase="DOCKER_INSPECT",
+                                failure_class="OUTPUT_LIMIT")
+        try:
+            image = json.loads(raw)
+            if not isinstance(image, dict):
                 raise ValueError
-            return value
+            return image
         except Exception:
             raise RecoveryError("IMAGE_IDENTITY_INVALID") from None
 
-    def copy(self, source: str, destination: str, digestfile: Path,
-             source_auth: Path, dest_auth: Path) -> str:
-        allowed_destinations = {
-            _tag_reference(target.repository, tag)
-            for target in WRITE_TARGETS for tag in TAGS
-        }
-        if (source != _source_reference() or destination not in allowed_destinations
-                or digestfile.resolve().parent != self.workspace.path.resolve()
-                or source_auth != self.workspace.source_auth
-                or dest_auth != self.workspace.dest_auth):
+    def login(self, credentials: Credentials) -> None:
+        self.command(["docker", "login", "docker.io", "--username", credentials.username,
+                      "--password-stdin"], phase="DOCKER_LOGIN", stdin=credentials.token + "\n")
+
+    def logout(self) -> None:
+        self.command(["docker", "logout", "docker.io"], phase="DOCKER_LOGOUT")
+
+    def tag(self, image_id: str, destination: str) -> None:
+        allowed = {_tag_reference(target.repository, tag)
+                   for target in WRITE_TARGETS for tag in TAGS}
+        if image_id != SOURCE_CONFIG_DIGEST or destination not in allowed:
             raise RecoveryError("TARGET_NOT_ALLOWED")
-        output = self.command(["copy", "--src-authfile", str(source_auth),
-                               "--dest-authfile", str(dest_auth), "--preserve-digests",
-                               "--retry-times", "0", "--digestfile", str(digestfile),
-                               source, destination], timeout=SKOPEO_COPY_TIMEOUT_SECONDS,
-                              code="SKOPEO_COPY_FAILED")
-        del output
-        try:
-            digest = digestfile.read_text(encoding="ascii").strip()
-        except Exception:
-            raise RecoveryError("DIGEST_PRESERVATION_FAILED") from None
-        if not publisher.DIGEST_RE.fullmatch(digest):
-            raise RecoveryError("DIGEST_PRESERVATION_FAILED")
-        return digest
+        self.command(["docker", "tag", image_id, destination], phase="DOCKER_TAG")
+
+    def push(self, destination: str) -> None:
+        allowed = {_tag_reference(target.repository, tag)
+                   for target in WRITE_TARGETS for tag in TAGS}
+        if destination not in allowed:
+            raise RecoveryError("TARGET_NOT_ALLOWED")
+        self.command(["docker", "push", "--quiet", destination], phase="DOCKER_PUSH",
+                     timeout=DOCKER_TRANSFER_TIMEOUT_SECONDS)
 
 
 def _parse_auth_challenge(value: str, repository: str) -> None:
@@ -646,28 +664,48 @@ class RegistryV2:
         return ManifestState(parsed.digest, parsed.config, parsed.content_hash, layer_count)
 
 
-def _config_identity(config: object) -> dict:
+def _docker_image_identity(image: object) -> dict:
+    """Validate Docker's local image-inspect record against the pinned OCI image."""
     try:
-        if not isinstance(config, dict):
+        if not isinstance(image, dict):
             raise ValueError
-        labels = config["config"]["Labels"]
-        rootfs = config["rootfs"]
-        diff_ids = rootfs["diff_ids"]
-        if (config["os"] != "linux" or config["architecture"] != "amd64"
+        labels = image["Config"]["Labels"]
+        rootfs = image["RootFS"]
+        diff_ids = rootfs["Layers"]
+        image_id = image["Id"]
+        if (image_id != SOURCE_CONFIG_DIGEST or image["Os"] != "linux"
+                or image["Architecture"] != "amd64"
                 or labels["org.opencontainers.image.revision"] != SOURCE_REVISION
                 or labels["org.opencontainers.image.source"] != SOURCE_URL
                 or labels["org.opencontainers.image.version"] != VERSION
-                or rootfs["type"] != "layers" or not isinstance(diff_ids, list)
-                or not diff_ids or any(not isinstance(value, str) or not publisher.DIGEST_RE.fullmatch(value) for value in diff_ids)):
+                or rootfs["Type"] != "layers" or not isinstance(diff_ids, list)
+                or not diff_ids or any(not isinstance(value, str)
+                                       or not publisher.DIGEST_RE.fullmatch(value)
+                                       for value in diff_ids)):
+            raise ValueError
+        repo_digests = image.get("RepoDigests")
+        expected_repo_digests = {
+            SOURCE_REPOSITORY + "@" + SOURCE_DIGEST,
+            "docker.io/" + SOURCE_REPOSITORY + "@" + SOURCE_DIGEST,
+        }
+        if not isinstance(repo_digests, list) or not expected_repo_digests.intersection(repo_digests):
             raise ValueError
         return {"architecture": "amd64", "os": "linux", "revision": SOURCE_REVISION,
-                "source": SOURCE_URL, "version": VERSION, "diff_ids": list(diff_ids)}
+                "source": SOURCE_URL, "version": VERSION, "diff_ids": list(diff_ids),
+                "config_digest": image_id}
     except Exception:
         raise RecoveryError("IMAGE_IDENTITY_INVALID") from None
 
 
+def _same_image_content(observed: ManifestState, expected: ManifestState) -> bool:
+    """Accept a registry manifest re-encoding only when config and layers match."""
+    return (observed.config == expected.config
+            and observed.content_hash == expected.content_hash
+            and observed.layer_count == expected.layer_count)
+
+
 def _source_reference() -> str:
-    return "docker://docker.io/" + SOURCE_REPOSITORY + "@" + SOURCE_DIGEST
+    return "docker.io/" + SOURCE_REPOSITORY + "@" + SOURCE_DIGEST
 
 
 def _tag_reference(repository: str, tag: str) -> str:
@@ -675,46 +713,41 @@ def _tag_reference(repository: str, tag: str) -> str:
         raise RecoveryError("TARGET_NOT_ALLOWED")
     if tag not in TAGS:
         raise RecoveryError("ARGUMENT_INVALID")
-    return "docker://docker.io/" + repository + ":" + tag
-
-
-def _digest_reference(repository: str, digest: str) -> str:
-    if not publisher.DIGEST_RE.fullmatch(digest):
-        raise RecoveryError("ARGUMENT_INVALID")
-    return "docker://docker.io/" + repository + "@" + digest
+    return "docker.io/" + repository + ":" + tag
 
 
 class RecoveryController:
-    def __init__(self, *, registry_factory=RegistryV2, skopeo_factory=Skopeo,
+    def __init__(self, *, registry_factory=RegistryV2, docker_factory=DockerCLI,
                  workspace_factory=PrivateWorkspace):
         self.registry_factory = registry_factory
-        self.skopeo_factory = skopeo_factory
+        self.docker_factory = docker_factory
         self.workspace_factory = workspace_factory
 
-    def _verify_source(self, registry: RegistryV2, skopeo: Skopeo, workspace: PrivateWorkspace):
+    def _verify_source(self, registry: RegistryV2, docker: DockerCLI):
         manifest = registry.manifest(SOURCE_REPOSITORY, SOURCE_DIGEST, ("pull",))
         if (manifest is None or manifest.digest != SOURCE_DIGEST
                 or manifest.config != SOURCE_CONFIG_DIGEST):
             raise RecoveryError("SOURCE_IDENTITY_INVALID")
-        config = skopeo.inspect_config(_source_reference(), workspace.source_auth)
-        identity = _config_identity(config)
+        image = docker.inspect_source(_source_reference())
+        identity = _docker_image_identity(image)
+        if identity["config_digest"] != manifest.config:
+            raise RecoveryError("SOURCE_IDENTITY_INVALID")
         if len(identity["diff_ids"]) != manifest.layer_count:
             raise RecoveryError("IMAGE_IDENTITY_INVALID")
         return manifest, identity
 
-    def _verify_remote_tag(self, registry: RegistryV2, skopeo: Skopeo,
-                           repository: str, tag: str, source_manifest: ManifestState,
-                           source_identity: dict, authfile: Path,
-                           actions: tuple[str, ...]) -> str:
+    def _verify_remote_tag(self, registry: RegistryV2, repository: str, tag: str,
+                           source_manifest: ManifestState,
+                           actions: tuple[str, ...], *,
+                           require_exact_source_digest: bool = False
+                           ) -> tuple[str, ManifestState | None]:
         manifest = registry.manifest(repository, tag, actions)
         if manifest is None:
-            return "ABSENT_HTTP404"
-        if manifest.digest != SOURCE_DIGEST or manifest != source_manifest:
-            return "CONFLICT"
-        config = skopeo.inspect_config(_digest_reference(repository, manifest.digest), authfile)
-        if _config_identity(config) != source_identity:
-            raise RecoveryError("IMAGE_IDENTITY_INVALID")
-        return "ALREADY_PRESENT"
+            return "ABSENT_HTTP404", None
+        digest_matches = not require_exact_source_digest or manifest.digest == SOURCE_DIGEST
+        state = ("ALREADY_PRESENT" if digest_matches
+                 and _same_image_content(manifest, source_manifest) else "CONFLICT")
+        return state, manifest
 
     @staticmethod
     def _require_protected_snapshot(results: dict) -> None:
@@ -723,20 +756,21 @@ class RecoveryController:
             row = verification.get(target_id)
             if (not isinstance(row, dict) or row.get("status") != "VERIFIED"
                     or set(row.get("tags", {})) != set(TAGS)
-                    or any(row["tags"].get(tag) != {
-                        "status": "VERIFIED", "digest": SOURCE_DIGEST,
-                    } for tag in TAGS)):
+                    or any(not isinstance(row["tags"].get(tag), dict)
+                           or row["tags"][tag].get("status") != "VERIFIED"
+                                   or row["tags"][tag].get("digest") != SOURCE_DIGEST
+                                   or not publisher.DIGEST_RE.fullmatch(
+                                       str(row["tags"][tag].get("digest", ""))) for tag in TAGS)):
                 raise RecoveryError("PROTECTED_TARGETS_UNVERIFIED")
 
-    def _verify_protected_targets(self, registry: RegistryV2, skopeo: Skopeo,
-                                  workspace: PrivateWorkspace, source_manifest: ManifestState,
-                                  source_identity: dict) -> None:
+    def _verify_protected_targets(self, registry: RegistryV2,
+                                  source_manifest: ManifestState) -> None:
         for target_id in PROTECTED_TARGET_IDS:
             target = READ_BY_ID[target_id]
             for tag in TAGS:
-                state = self._verify_remote_tag(
-                    registry, skopeo, target.repository, tag, source_manifest,
-                    source_identity, workspace.source_auth, ("pull",),
+                state, _manifest = self._verify_remote_tag(
+                    registry, target.repository, tag, source_manifest, ("pull",),
+                    require_exact_source_digest=True,
                 )
                 if state != "ALREADY_PRESENT":
                     raise RecoveryError("PROTECTED_TARGET_DRIFT")
@@ -750,32 +784,35 @@ class RecoveryController:
             raise RecoveryError("RESULT_STATE_INVALID")
         try:
             with self.workspace_factory() as workspace:
-                skopeo = self.skopeo_factory(workspace)
-                skopeo.validate()
-                skopeo.login(credentials)
+                docker = self.docker_factory(workspace)
                 source_registry = self.registry_factory()
-                source_manifest, source_identity = self._verify_source(source_registry, skopeo, workspace)
+                source_manifest, _source_identity = self._verify_source(source_registry, docker)
                 target_registry = self.registry_factory(credentials)
                 tag_states = {}
                 for tag in TAGS:
-                    state = self._verify_remote_tag(target_registry, skopeo, target.repository, tag,
-                                                    source_manifest, source_identity, workspace.dest_auth,
-                                                    ("pull", "push"))
+                    state, observed = self._verify_remote_tag(
+                        target_registry, target.repository, tag, source_manifest, ("pull", "push"))
                     if state == "CONFLICT":
                         raise RecoveryError("TAG_CONFLICT")
-                    tag_states[tag] = {"status": state, "digest": SOURCE_DIGEST if state == "ALREADY_PRESENT" else None}
-                results["preflight"][target_id] = {"status": "PREFLIGHT_READY", "failure_code": None,
-                                                   "tags": tag_states}
+                    tag_states[tag] = {"status": state,
+                                       "digest": observed.digest if observed is not None else None}
+                results["preflight"][target_id] = {
+                    "status": "PREFLIGHT_READY", "failure_code": None,
+                    "failure_phase": None, "failure_class": None, "tags": tag_states,
+                }
                 _write_results(results_path, results)
                 return {"target": target_id, "status": "PREFLIGHT_READY", "tags": tag_states}
         except RecoveryError as error:
             results["preflight"][target_id] = {"status": "BLOCKED", "failure_code": error.code,
-                                               "tags": {}}
+                                               "failure_phase": error.phase,
+                                               "failure_class": error.failure_class, "tags": {}}
             _write_results(results_path, results)
             raise
         except Exception:
-            results["preflight"][target_id] = {"status": "BLOCKED", "failure_code": "INTERNAL_FAILURE",
-                                               "tags": {}}
+            results["preflight"][target_id] = {
+                "status": "BLOCKED", "failure_code": "INTERNAL_FAILURE",
+                "failure_phase": None, "failure_class": None, "tags": {},
+            }
             _write_results(results_path, results)
             raise RecoveryError("INTERNAL_FAILURE") from None
 
@@ -797,27 +834,27 @@ class RecoveryController:
             raise RecoveryError("RUN_ALREADY_ATTEMPTED")
         try:
             with self.workspace_factory() as workspace:
-                skopeo = self.skopeo_factory(workspace)
-                skopeo.validate()
-                skopeo.login(credentials)
+                source_docker = self.docker_factory(workspace)
                 source_registry = self.registry_factory()
-                source_manifest, source_identity = self._verify_source(source_registry, skopeo, workspace)
-                self._verify_protected_targets(source_registry, skopeo, workspace,
-                                               source_manifest, source_identity)
+                source_manifest, source_identity = self._verify_source(source_registry, source_docker)
+                self._verify_protected_targets(source_registry, source_manifest)
                 target_registry = self.registry_factory(credentials)
 
                 # Recheck every tag in this repository immediately before writes.
                 current = {}
+                current_manifests = {}
                 for tag in TAGS:
-                    current[tag] = self._verify_remote_tag(target_registry, skopeo, target.repository, tag,
-                                                            source_manifest, source_identity, workspace.dest_auth,
-                                                            ("pull", "push"))
+                    current[tag], current_manifests[tag] = self._verify_remote_tag(
+                        target_registry, target.repository, tag, source_manifest, ("pull", "push"))
                     if current[tag] == "CONFLICT":
                         raise RecoveryError("TAG_CONFLICT")
                 if all(state == "ALREADY_PRESENT" for state in current.values()):
                     for tag in TAGS:
-                        target_row["tags"][tag] = {"status": "ALREADY_PRESENT", "digest": SOURCE_DIGEST,
-                                                   "failure_code": None}
+                        manifest = current_manifests[tag]
+                        target_row["tags"][tag] = {
+                            "status": "ALREADY_PRESENT", "digest": manifest.digest,
+                            "failure_code": None, "failure_phase": None, "failure_class": None,
+                        }
                     target_row["status"] = "ALREADY_PRESENT"
                     _write_results(results_path, results)
                     return {"target": target_id, "status": "ALREADY_PRESENT", "writes": 0}
@@ -825,70 +862,137 @@ class RecoveryController:
                 target_row["attempted"] = True
                 target_row["status"] = "COPY_IN_PROGRESS"
                 _write_results(results_path, results)
-                for index, tag in enumerate(TAGS):
-                    if current[tag] == "ALREADY_PRESENT":
-                        target_row["tags"][tag] = {"status": "ALREADY_PRESENT", "digest": SOURCE_DIGEST,
-                                                   "failure_code": None}
-                        _write_results(results_path, results)
-                        continue
-                    # Last read before each tag write catches detected competitors.
-                    latest = target_registry.manifest(target.repository, tag, ("pull", "push"))
-                    if latest is not None:
-                        if latest != source_manifest:
-                            target_row["tags"][tag] = {"status": "CONFLICT", "digest": None,
-                                                       "failure_code": "TAG_CONFLICT"}
-                            target_row["failure_code"] = "TAG_CONFLICT"
-                            target_row["status"] = (
-                                "PARTIAL_PUBLICATION"
-                                if any(value["status"] == "PUBLISHED_VERIFIED"
-                                       for value in target_row["tags"].values())
-                                else "BLOCKED"
-                            )
+
+                destination_docker = self.docker_factory(
+                    workspace, workspace.destination_config(target_id))
+                login_attempted = False
+                operation_error = None
+                try:
+                    login_attempted = True
+                    destination_docker.login(credentials)
+                    for tag in TAGS:
+                        if current[tag] == "ALREADY_PRESENT":
+                            state, manifest = self._verify_remote_tag(
+                                target_registry, target.repository, tag, source_manifest,
+                                ("pull", "push"))
+                            if state == "CONFLICT":
+                                error = RecoveryError("TAG_CONFLICT")
+                                target_row["tags"][tag] = {
+                                    "status": "CONFLICT", "digest": None,
+                                    **_failure_fields(error),
+                                }
+                                _write_results(results_path, results)
+                                raise error
+                            if state != "ALREADY_PRESENT" or manifest is None:
+                                error = RecoveryError("REGISTRY_UNKNOWN")
+                                target_row["tags"][tag] = {
+                                    "status": "UNKNOWN", "digest": None,
+                                    **_failure_fields(error),
+                                }
+                                _write_results(results_path, results)
+                                raise error
+                            target_row["tags"][tag] = {
+                                "status": "ALREADY_PRESENT", "digest": manifest.digest,
+                                "failure_code": None, "failure_phase": None, "failure_class": None,
+                            }
                             _write_results(results_path, results)
-                            raise RecoveryError("TAG_CONFLICT")
-                        target_row["tags"][tag] = {"status": "ALREADY_PRESENT", "digest": SOURCE_DIGEST,
-                                                   "failure_code": None}
+                            continue
+                        # Last read before each tag write catches detected competitors.
+                        latest = target_registry.manifest(target.repository, tag, ("pull", "push"))
+                        if latest is not None:
+                            if not _same_image_content(latest, source_manifest):
+                                error = RecoveryError("TAG_CONFLICT")
+                                target_row["tags"][tag] = {
+                                    "status": "CONFLICT", "digest": None, **_failure_fields(error),
+                                }
+                                raise error
+                            target_row["tags"][tag] = {
+                                "status": "ALREADY_PRESENT", "digest": latest.digest,
+                                "failure_code": None, "failure_phase": None, "failure_class": None,
+                            }
+                            _write_results(results_path, results)
+                            continue
+
+                        tag_row = target_row["tags"][tag]
+                        tag_row.update({"status": "COPY_IN_PROGRESS", "digest": None,
+                                        "failure_code": None, "failure_phase": None,
+                                        "failure_class": None})
                         _write_results(results_path, results)
-                        continue
-                    target_row["tags"][tag] = {"status": "COPY_IN_PROGRESS", "digest": None,
-                                               "failure_code": None}
+                        destination = _tag_reference(target.repository, tag)
+                        try:
+                            destination_docker.tag(source_identity["config_digest"], destination)
+                            destination_docker.push(destination)
+                            final_state, final_manifest = self._verify_remote_tag(
+                                target_registry, target.repository, tag, source_manifest, ("pull", "push"))
+                            if final_state != "ALREADY_PRESENT" or final_manifest is None:
+                                raise RecoveryError("REGISTRY_UNKNOWN")
+                            tag_row.update({"status": "PUBLISHED_VERIFIED",
+                                            "digest": final_manifest.digest,
+                                            "failure_code": None, "failure_phase": None,
+                                            "failure_class": None})
+                            _write_results(results_path, results)
+                        except RecoveryError as error:
+                            if error.code == "TAG_CONFLICT":
+                                tag_row.update({"status": "CONFLICT", "digest": None,
+                                                **_failure_fields(error)})
+                            elif error.phase == "DOCKER_TAG":
+                                tag_row.update({"status": "PENDING", "digest": None,
+                                                **_failure_fields(error)})
+                            else:
+                                # A push or post-push read can have an ambiguous remote outcome.
+                                tag_row.update({"status": "UNKNOWN", "digest": None,
+                                                **_failure_fields(error)})
+                            target_row.update(_failure_fields(error))
+                            verified_any = any(value["status"] in {"PUBLISHED_VERIFIED", "ALREADY_PRESENT"}
+                                               for value in target_row["tags"].values())
+                            target_row["status"] = ("PARTIAL_PUBLICATION" if verified_any
+                                                     else "UNKNOWN" if error.phase == "DOCKER_PUSH"
+                                                     else "BLOCKED")
+                            _write_results(results_path, results)
+                            raise
+                except RecoveryError as error:
+                    operation_error = error
+                finally:
+                    if login_attempted:
+                        try:
+                            destination_docker.logout()
+                        except RecoveryError:
+                            target_row["logout_failure_code"] = "DOCKER_LOGOUT_FAILED"
+                            if operation_error is None:
+                                operation_error = RecoveryError(
+                                    "DOCKER_LOGOUT_FAILED", phase="DOCKER_LOGOUT",
+                                    failure_class="UNKNOWN")
+                            else:
+                                operation_error.secondary_failure_code = "DOCKER_LOGOUT_FAILED"
+                        _write_results(results_path, results)
+
+                if operation_error is not None:
+                    target_row["failure_code"] = operation_error.code
+                    target_row["failure_phase"] = operation_error.phase
+                    target_row["failure_class"] = operation_error.failure_class
+                    if target_row["status"] == "COPY_IN_PROGRESS":
+                        verified_any = any(value["status"] in {"PUBLISHED_VERIFIED", "ALREADY_PRESENT"}
+                                           for value in target_row["tags"].values())
+                        target_row["status"] = "PARTIAL_PUBLICATION" if verified_any else "BLOCKED"
                     _write_results(results_path, results)
-                    digestfile = workspace.path / ("copy-" + str(index) + ".digest")
-                    try:
-                        copied_digest = skopeo.copy(_source_reference(),
-                                                    _tag_reference(target.repository, tag), digestfile,
-                                                    workspace.source_auth, workspace.dest_auth)
-                        if copied_digest != SOURCE_DIGEST:
-                            raise RecoveryError("DIGEST_PRESERVATION_FAILED")
-                        final_state = self._verify_remote_tag(target_registry, skopeo, target.repository, tag,
-                                                              source_manifest, source_identity, workspace.dest_auth,
-                                                              ("pull", "push"))
-                        if final_state != "ALREADY_PRESENT":
-                            raise RecoveryError("DIGEST_PRESERVATION_FAILED")
-                        target_row["tags"][tag] = {"status": "PUBLISHED_VERIFIED", "digest": SOURCE_DIGEST,
-                                                   "failure_code": None}
-                        _write_results(results_path, results)
-                    except RecoveryError as error:
-                        # A failed copy can have an ambiguous remote outcome.
-                        target_row["tags"][tag] = {"status": "UNKNOWN", "digest": None,
-                                                   "failure_code": error.code}
-                        target_row["failure_code"] = error.code
-                        target_row["status"] = "PARTIAL_PUBLICATION"
-                        _write_results(results_path, results)
-                        raise
-                target_row["status"] = "TARGET_VERIFIED"
+                    raise operation_error
+
+                target_row.update({"status": "TARGET_VERIFIED", "failure_code": None,
+                                   "failure_phase": None, "failure_class": None})
                 _write_results(results_path, results)
                 return {"target": target_id, "status": "TARGET_VERIFIED",
-                        "writes": sum(1 for row in target_row["tags"].values() if row["status"] == "PUBLISHED_VERIFIED")}
+                        "writes": sum(1 for row in target_row["tags"].values()
+                                      if row["status"] == "PUBLISHED_VERIFIED")}
         except RecoveryError as error:
             if target_row["status"] not in {"PARTIAL_PUBLICATION", "BLOCKED"}:
                 target_row["status"] = "BLOCKED" if not target_row["attempted"] else "UNKNOWN"
-                target_row["failure_code"] = error.code
+                target_row.update(_failure_fields(error))
             _write_results(results_path, results)
             raise
         except Exception:
             target_row["status"] = "UNKNOWN" if target_row["attempted"] else "BLOCKED"
-            target_row["failure_code"] = "INTERNAL_FAILURE"
+            target_row.update({"failure_code": "INTERNAL_FAILURE",
+                               "failure_phase": None, "failure_class": None})
             _write_results(results_path, results)
             raise RecoveryError("INTERNAL_FAILURE") from None
 
@@ -904,19 +1008,17 @@ class RecoveryController:
         failure_code = None
         try:
             with self.workspace_factory() as workspace:
-                skopeo = self.skopeo_factory(workspace)
-                skopeo.validate()
-                if credentials is not None:
-                    skopeo.login(credentials)
-                source_manifest, source_identity = self._verify_source(self.registry_factory(), skopeo, workspace)
+                docker = self.docker_factory(workspace)
+                source_manifest, _source_identity = self._verify_source(self.registry_factory(), docker)
                 registry = self.registry_factory(credentials)
                 tag_states = {}
                 for tag in TAGS:
-                    state = self._verify_remote_tag(registry, skopeo, target.repository, tag, source_manifest,
-                                                    source_identity, workspace.dest_auth if credentials else workspace.source_auth,
-                                                    ("pull",))
+                    state, manifest = self._verify_remote_tag(
+                        registry, target.repository, tag, source_manifest, ("pull",),
+                        require_exact_source_digest=target_id in PROTECTED_TARGET_IDS,
+                    )
                     if state == "ALREADY_PRESENT":
-                        tag_states[tag] = {"status": "VERIFIED", "digest": SOURCE_DIGEST}
+                        tag_states[tag] = {"status": "VERIFIED", "digest": manifest.digest}
                     elif state == "ABSENT_HTTP404":
                         tag_states[tag] = {"status": "ABSENT_HTTP404", "digest": None}
                         if status != "BLOCKED":
@@ -925,8 +1027,10 @@ class RecoveryController:
                         tag_states[tag] = {"status": "CONFLICT", "digest": None}
                         status = "BLOCKED"
                         failure_code = "TAG_CONFLICT"
-                results["verification"][target_id] = {"status": status, "failure_code": failure_code,
-                                                       "tags": tag_states}
+                results["verification"][target_id] = {
+                    "status": status, "failure_code": failure_code,
+                    "failure_phase": None, "failure_class": None, "tags": tag_states,
+                }
                 _write_results(results_path, results)
                 return {"target": target_id, "status": status, "failure_code": failure_code,
                         "tags": tag_states}
@@ -936,13 +1040,16 @@ class RecoveryController:
             results["verification"][target_id] = {
                 "status": "BLOCKED" if conflict_seen else "UNKNOWN",
                 "failure_code": "TAG_CONFLICT" if conflict_seen else error.code,
+                "failure_phase": error.phase, "failure_class": error.failure_class,
                 "tags": tag_states,
             }
             _write_results(results_path, results)
             raise
         except Exception:
-            results["verification"][target_id] = {"status": "UNKNOWN", "failure_code": "INTERNAL_FAILURE",
-                                                   "tags": tag_states}
+            results["verification"][target_id] = {
+                "status": "UNKNOWN", "failure_code": "INTERNAL_FAILURE",
+                "failure_phase": None, "failure_class": None, "tags": tag_states,
+            }
             _write_results(results_path, results)
             raise RecoveryError("INTERNAL_FAILURE") from None
 
@@ -955,7 +1062,13 @@ def _summary(results: dict) -> dict:
             if row["status"] != "VERIFIED" or set(row["tags"]) != set(TAGS):
                 all_verified = False
                 break
-            if any(row["tags"][tag] != {"status": "VERIFIED", "digest": SOURCE_DIGEST} for tag in TAGS):
+            if any(row["tags"][tag].get("status") != "VERIFIED"
+                   or not publisher.DIGEST_RE.fullmatch(
+                       str(row["tags"][tag].get("digest", ""))) for tag in TAGS):
+                all_verified = False
+                break
+            if target_id in PROTECTED_TARGET_IDS and any(
+                    row["tags"][tag].get("digest") != SOURCE_DIGEST for tag in TAGS):
                 all_verified = False
                 break
     if all_verified:
@@ -995,7 +1108,7 @@ def _workflow_context(confirmation: str | None = None) -> None:
             or os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch"):
         raise RecoveryError("DISPATCH_NOT_AUTHORIZED")
     if (os.environ.get("GITHUB_RUN_ATTEMPT", "1") != "1"
-            or os.environ.get("GITHUB_RUN_NUMBER") != "1"):
+            or not re.fullmatch(r"[1-9][0-9]*", os.environ.get("GITHUB_RUN_NUMBER", ""))):
         raise RecoveryError("RERUN_NOT_ALLOWED")
 
 
@@ -1023,6 +1136,10 @@ def main(argv: list[str] | None = None) -> int:
             _workflow_context(args.confirmation)
             if args.results.exists():
                 raise RecoveryError("RESULT_FILE_EXISTS")
+            with controller.workspace_factory() as workspace:
+                docker = controller.docker_factory(workspace)
+                docker.pull_source(_source_reference())
+                controller._verify_source(controller.registry_factory(), docker)
             data = _new_results(os.environ.get("GITHUB_RUN_ID", "offline-run"),
                                 os.environ.get("GITHUB_RUN_ATTEMPT", "1"))
             _write_results(args.results, data)
@@ -1050,7 +1167,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if result["status"] == "6_OF_6_VERIFIED" else 1
         raise RecoveryError("ARGUMENT_INVALID")
     except RecoveryError as error:
-        _emit({"status": "BLOCKED", "failure_code": error.code})
+        payload = {"status": "BLOCKED", "failure_code": error.code}
+        if error.phase is not None:
+            payload["failure_phase"] = error.phase
+        if error.failure_class is not None:
+            payload["failure_class"] = error.failure_class
+        if error.secondary_failure_code is not None:
+            payload["secondary_failure_code"] = error.secondary_failure_code
+        _emit(payload)
         return 1
     except Exception:
         _emit({"status": "BLOCKED", "failure_code": "INTERNAL_FAILURE"})

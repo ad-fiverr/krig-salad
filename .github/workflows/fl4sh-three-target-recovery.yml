@@ -21,13 +21,6 @@ jobs:
       - name: Check out the selected main revision
         uses: actions/checkout@v7.0.1
 
-      - name: Install pinned Skopeo
-        run: |
-          set -Eeuo pipefail
-          sudo apt-get update
-          sudo apt-get install --yes skopeo=1.4.1+ds1-1ubuntu0.1
-          skopeo --version
-
       - name: Initialize one-shot recovery ledger
         run: |
           set -Eeuo pipefail

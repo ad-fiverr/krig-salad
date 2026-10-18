@@ -78,10 +78,17 @@ class FakeWorld:
         self.tags.update({target.repository: {tag: SOURCE_STATE for tag in recovery.TAGS}
                           for target in recovery.READ_TARGETS[:3]})
         self.registry_reads = []
-        self.copy_calls = []
-        self.fail_copy_tag = None
-        self.inject_competing_tag_after_first_copy = False
+        self.docker_calls = []
+        self.write_calls = []
+        self.fail_push_tag = None
+        self.fail_tag_tag = None
+        self.fail_login = False
+        self.fail_logout = False
+        self.inject_competing_tag_after_first_push = False
         self.competing_tag_visible = False
+        self.mutate_tag_on_read = None
+        self.mutate_tag_read_number = 3
+        self.tag_read_counts = {}
         self.config_revision = recovery.SOURCE_REVISION
         self.source_digest_corrupt = False
 
@@ -101,15 +108,22 @@ class FakeWorld:
                 and self.competing_tag_visible):
             return recovery.ManifestState("sha256:" + "f" * 64, "sha256:" + "e" * 64,
                                           "competing-content", 2)
+        key = (repository, reference)
+        self.tag_read_counts[key] = self.tag_read_counts.get(key, 0) + 1
+        if (key == self.mutate_tag_on_read
+                and self.tag_read_counts[key] == self.mutate_tag_read_number):
+            return recovery.ManifestState("sha256:" + "f" * 64, "sha256:" + "e" * 64,
+                                          "competing-content", 2)
         return self.tags.get(repository, {}).get(reference)
 
-    def put_from_copy(self, destination, tag):
-        self.copy_calls.append((destination, tag))
-        if tag == self.fail_copy_tag:
-            raise recovery.RecoveryError("SKOPEO_COPY_FAILED")
-        repository = destination.removeprefix("docker://docker.io/").rsplit(":", 1)[0]
+    def put_from_push(self, destination, tag):
+        self.write_calls.append((destination, tag))
+        if tag == self.fail_push_tag:
+            raise recovery.RecoveryError("DOCKER_PUSH_FAILED", phase="DOCKER_PUSH",
+                                         failure_class="NONZERO_EXIT")
+        repository = destination.removeprefix("docker.io/").rsplit(":", 1)[0]
         self.tags[repository][tag] = SOURCE_STATE
-        if tag == recovery.TAGS[0] and self.inject_competing_tag_after_first_copy:
+        if tag == recovery.TAGS[0] and self.inject_competing_tag_after_first_push:
             self.competing_tag_visible = True
 
 
@@ -125,29 +139,61 @@ class FakeRegistry:
         return self.world.get(repository, reference)
 
 
-class FakeSkopeo:
-    def __init__(self, workspace, world):
+def docker_image(*, revision=recovery.SOURCE_REVISION, architecture="amd64", os_name="linux"):
+    return {
+        "Id": recovery.SOURCE_CONFIG_DIGEST,
+        "Os": os_name,
+        "Architecture": architecture,
+        "Config": {"Labels": {
+            "org.opencontainers.image.revision": revision,
+            "org.opencontainers.image.source": recovery.SOURCE_URL,
+            "org.opencontainers.image.version": recovery.VERSION,
+        }},
+        "RootFS": {"Type": "layers", "Layers": list(DIFF_IDS)},
+        "RepoDigests": [recovery.SOURCE_REPOSITORY + "@" + recovery.SOURCE_DIGEST],
+    }
+
+
+class FakeDocker:
+    def __init__(self, workspace, world, config_path=None):
         self.workspace = workspace
         self.world = world
-        self.calls = []
+        self.config_path = config_path or workspace.source_config
 
-    def validate(self):
-        self.calls.append(("validate",))
+    def pull_source(self, reference):
+        self.world.docker_calls.append(("pull", reference))
+        if reference != recovery._source_reference():
+            raise recovery.RecoveryError("SOURCE_IDENTITY_INVALID")
+
+    def inspect_source(self, reference):
+        self.world.docker_calls.append(("inspect", reference))
+        return docker_image(revision=self.world.config_revision)
 
     def login(self, credentials):
-        self.calls.append(("authfile",))
-        self.workspace.write_destination_auth(credentials)
+        self.world.docker_calls.append(("login", credentials.username))
+        if self.world.fail_login:
+            raise recovery.RecoveryError("DOCKER_LOGIN_FAILED", phase="DOCKER_LOGIN",
+                                         failure_class="NONZERO_EXIT")
 
-    def inspect_config(self, reference, authfile):
-        self.calls.append(("inspect", reference))
-        return config(revision=self.world.config_revision)
-
-    def copy(self, source, destination, digestfile, source_auth, dest_auth):
-        self.calls.append(("copy", source, destination))
+    def tag(self, image_id, destination):
+        self.world.docker_calls.append(("tag", image_id, destination))
+        if image_id != recovery.SOURCE_CONFIG_DIGEST:
+            raise recovery.RecoveryError("IMAGE_IDENTITY_INVALID")
         tag = destination.rsplit(":", 1)[1]
-        self.world.put_from_copy(destination, tag)
-        digestfile.write_text(recovery.SOURCE_DIGEST, encoding="ascii")
-        return recovery.SOURCE_DIGEST
+        if tag == self.world.fail_tag_tag:
+            raise recovery.RecoveryError("DOCKER_TAG_FAILED", phase="DOCKER_TAG",
+                                         failure_class="NONZERO_EXIT")
+
+    def push(self, destination):
+        self.world.docker_calls.append(("push", destination))
+        tag = destination.rsplit(":", 1)[1]
+        self.world.put_from_push(destination, tag)
+
+    def logout(self):
+        self.world.docker_calls.append(("logout",))
+        if self.world.fail_logout:
+            raise recovery.RecoveryError("DOCKER_LOGOUT_FAILED", phase="DOCKER_LOGOUT",
+                                         failure_class="NONZERO_EXIT")
 
 
 class OfflineTests(unittest.TestCase):
@@ -165,7 +211,7 @@ class OfflineTests(unittest.TestCase):
         recovery._write_results(self.results, recovery._new_results("offline-run-1", "1"))
         self.controller = recovery.RecoveryController(
             registry_factory=self.world.registry_factory,
-            skopeo_factory=lambda workspace: FakeSkopeo(workspace, self.world),
+            docker_factory=lambda workspace, config_path=None: FakeDocker(workspace, self.world, config_path),
         )
 
     def credentials(self, target_id):
@@ -207,7 +253,7 @@ class OfflineTests(unittest.TestCase):
         self.world.source_digest_corrupt = True
         with self.assertRaisesRegex(recovery.RecoveryError, "SOURCE_IDENTITY_INVALID"):
             self.controller.preflight("naxter1234", self.results, *self.credentials("naxter1234"))
-        self.assertEqual(self.world.copy_calls, [])
+        self.assertEqual(self.world.write_calls, [])
         row = recovery._read_results(self.results)["preflight"]["naxter1234"]
         self.assertEqual(row["failure_code"], "SOURCE_IDENTITY_INVALID")
 
@@ -215,30 +261,128 @@ class OfflineTests(unittest.TestCase):
         self.world.config_revision = "0" * 40
         with self.assertRaisesRegex(recovery.RecoveryError, "IMAGE_IDENTITY_INVALID"):
             self.controller.preflight("naxter1234", self.results, *self.credentials("naxter1234"))
-        self.assertEqual(self.world.copy_calls, [])
+        self.assertEqual(self.world.write_calls, [])
 
     def test_wrong_platform_blocks_before_copy(self):
         # The image inspection must fail closed for a non-amd64 source.
-        original_factory = self.controller.skopeo_factory
-        self.controller.skopeo_factory = lambda workspace: _WrongPlatformSkopeo(workspace, self.world)
+        original_factory = self.controller.docker_factory
+        self.controller.docker_factory = lambda workspace, config_path=None: _WrongPlatformDocker(workspace, self.world, config_path)
         with self.assertRaisesRegex(recovery.RecoveryError, "IMAGE_IDENTITY_INVALID"):
             self.controller.preflight("naxter1234", self.results, *self.credentials("naxter1234"))
-        self.controller.skopeo_factory = original_factory
-        self.assertEqual(self.world.copy_calls, [])
+        self.controller.docker_factory = original_factory
+        self.assertEqual(self.world.write_calls, [])
 
     def test_layer_count_mismatch_blocks_before_copy(self):
         self.world.source_state = recovery.ManifestState(
             recovery.SOURCE_DIGEST, recovery.SOURCE_CONFIG_DIGEST, CONTENT_HASH, 3)
         with self.assertRaisesRegex(recovery.RecoveryError, "IMAGE_IDENTITY_INVALID"):
             self.controller.preflight("naxter1234", self.results, *self.credentials("naxter1234"))
-        self.assertEqual(self.world.copy_calls, [])
+        self.assertEqual(self.world.write_calls, [])
 
     def test_existing_conflicting_sha_tag_blocks_without_writes(self):
         self.world.tags["naxter1234/traning_lora"][recovery.TAGS[0]] = recovery.ManifestState(
             "sha256:" + "f" * 64, "sha256:" + "e" * 64, "bad-content", 2)
         with self.assertRaisesRegex(recovery.RecoveryError, "TAG_CONFLICT"):
             self.controller.preflight("naxter1234", self.results, *self.credentials("naxter1234"))
-        self.assertEqual(self.world.copy_calls, [])
+        self.assertEqual(self.world.write_calls, [])
+
+    def test_equivalent_reencoded_manifest_is_already_present_without_rewrite(self):
+        repository = "naxter1234/traning_lora"
+        reencoded = recovery.ManifestState("sha256:" + "9" * 64, SOURCE_STATE.config,
+                                           SOURCE_STATE.content_hash, SOURCE_STATE.layer_count)
+        self.world.tags[repository][recovery.TAGS[0]] = reencoded
+        preflight = self.controller.preflight("naxter1234", self.results,
+                                              *self.credentials("naxter1234"))
+        self.assertEqual(preflight["tags"][recovery.TAGS[0]], {
+            "status": "ALREADY_PRESENT", "digest": reencoded.digest,
+        })
+        for target_id in recovery.TARGET_IDS[1:]:
+            self.controller.preflight(target_id, self.results, *self.credentials(target_id))
+        self.verify_protected_targets()
+        result = self.controller.recover("naxter1234", self.results,
+                                         *self.credentials("naxter1234"))
+        self.assertEqual(result["status"], "TARGET_VERIFIED")
+        self.assertEqual(len(self.world.write_calls), 2)
+        target_row = recovery._read_results(self.results)["targets"]["naxter1234"]
+        self.assertEqual(target_row["tags"][recovery.TAGS[0]]["status"], "ALREADY_PRESENT")
+        self.assertEqual(target_row["tags"][recovery.TAGS[0]]["digest"], reencoded.digest)
+
+    def test_protected_tag_with_reencoded_manifest_digest_fails_exact_digest_check(self):
+        target = recovery.READ_BY_ID["primary"]
+        self.world.tags[target.repository][recovery.TAGS[0]] = recovery.ManifestState(
+            "sha256:" + "9" * 64, SOURCE_STATE.config,
+            SOURCE_STATE.content_hash, SOURCE_STATE.layer_count)
+
+        result = self.controller.verify_target("primary", self.results)
+
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["tags"][recovery.TAGS[0]]["status"], "CONFLICT")
+        self.assertEqual(self.world.write_calls, [])
+
+    def test_protected_digest_drift_blocks_recovery_before_destination_push(self):
+        self.preflight_all()
+        self.verify_protected_targets()
+        protected = recovery.READ_BY_ID["loboeldrin"]
+        self.world.tags[protected.repository][recovery.TAGS[1]] = recovery.ManifestState(
+            "sha256:" + "8" * 64, SOURCE_STATE.config,
+            SOURCE_STATE.content_hash, SOURCE_STATE.layer_count)
+
+        with self.assertRaisesRegex(recovery.RecoveryError, "PROTECTED_TARGET_DRIFT"):
+            self.controller.recover("naxter1234", self.results,
+                                    *self.credentials("naxter1234"))
+
+        self.assertEqual(self.world.write_calls, [])
+
+    def test_protected_snapshot_ledger_requires_exact_source_digest(self):
+        self.preflight_all()
+        self.verify_protected_targets()
+        data = recovery._read_results(self.results)
+        data["verification"]["primary"]["tags"][recovery.TAGS[0]]["digest"] = "sha256:" + "9" * 64
+        recovery._write_results(self.results, data)
+
+        with self.assertRaisesRegex(recovery.RecoveryError, "PROTECTED_TARGETS_UNVERIFIED"):
+            self.controller.recover("naxter1234", self.results,
+                                    *self.credentials("naxter1234"))
+
+        self.assertEqual(self.world.write_calls, [])
+
+    def test_final_six_target_audit_rejects_protected_digest_changes(self):
+        for target in recovery.WRITE_TARGETS:
+            self.world.tags[target.repository] = {
+                tag: SOURCE_STATE for tag in recovery.TAGS
+            }
+        protected = recovery.READ_BY_ID["adrianfiverr"]
+        self.world.tags[protected.repository][recovery.TAGS[2]] = recovery.ManifestState(
+            "sha256:" + "7" * 64, SOURCE_STATE.config,
+            SOURCE_STATE.content_hash, SOURCE_STATE.layer_count)
+
+        self.run_verification_all()
+        results = recovery._read_results(self.results)
+
+        self.assertEqual(results["verification"]["adrianfiverr"]["status"], "BLOCKED")
+        self.assertEqual(recovery._summary(results)["status"], "BLOCKED")
+        self.assertEqual(self.world.write_calls, [])
+
+    def test_concurrent_change_to_initially_present_tag_stops_without_later_pushes(self):
+        self.preflight_all()
+        self.verify_protected_targets()
+        repository = recovery.WRITE_BY_ID["naxter1234"].repository
+        for tag in recovery.TAGS[:2]:
+            self.world.tags[repository][tag] = recovery.ManifestState(
+                "sha256:" + "9" * 64, SOURCE_STATE.config,
+                SOURCE_STATE.content_hash, SOURCE_STATE.layer_count)
+        self.world.mutate_tag_on_read = (repository, recovery.TAGS[1])
+
+        with self.assertRaisesRegex(recovery.RecoveryError, "TAG_CONFLICT"):
+            self.controller.recover("naxter1234", self.results,
+                                    *self.credentials("naxter1234"))
+
+        row = recovery._read_results(self.results)["targets"]["naxter1234"]
+        self.assertEqual(self.world.write_calls, [])
+        self.assertEqual(row["tags"][recovery.TAGS[0]]["status"], "ALREADY_PRESENT")
+        self.assertEqual(row["tags"][recovery.TAGS[0]]["digest"], "sha256:" + "9" * 64)
+        self.assertEqual(row["tags"][recovery.TAGS[1]]["status"], "CONFLICT")
+        self.assertEqual(row["status"], "PARTIAL_PUBLICATION")
 
     def test_verification_preserves_authorized_404_as_absence_not_unknown_error(self):
         result = self.controller.verify_target("naxter1234", self.results)
@@ -248,7 +392,7 @@ class OfflineTests(unittest.TestCase):
                             for tag in recovery.TAGS))
         row = recovery._read_results(self.results)["verification"]["naxter1234"]
         self.assertEqual(row["status"], "UNKNOWN")
-        self.assertEqual(self.world.copy_calls, [])
+        self.assertEqual(self.world.write_calls, [])
 
     def test_recovery_only_changes_selected_allowed_destination(self):
         before = {repo: dict(tags) for repo, tags in self.world.tags.items()}
@@ -256,7 +400,7 @@ class OfflineTests(unittest.TestCase):
         self.verify_protected_targets()
         result = self.controller.recover("naxter1234", self.results, *self.credentials("naxter1234"))
         self.assertEqual(result["status"], "TARGET_VERIFIED")
-        self.assertEqual([tag for _repo, tag in self.world.copy_calls], list(recovery.TAGS))
+        self.assertEqual([tag for _repo, tag in self.world.write_calls], list(recovery.TAGS))
         for target in recovery.READ_TARGETS[:3]:
             self.assertEqual(self.world.tags[target.repository], before[target.repository])
         for target in recovery.WRITE_TARGETS[1:]:
@@ -271,15 +415,15 @@ class OfflineTests(unittest.TestCase):
             "sha256:" + "f" * 64, "sha256:" + "e" * 64, "competing-content", 2)
         with self.assertRaisesRegex(recovery.RecoveryError, "TAG_CONFLICT"):
             self.controller.recover("naxter1234", self.results, *self.credentials("naxter1234"))
-        self.assertEqual(self.world.copy_calls, [])
+        self.assertEqual(self.world.write_calls, [])
 
     def test_competing_tag_after_first_copy_is_recorded_as_partial_and_not_overwritten(self):
         self.preflight_all()
         self.verify_protected_targets()
-        self.world.inject_competing_tag_after_first_copy = True
+        self.world.inject_competing_tag_after_first_push = True
         with self.assertRaisesRegex(recovery.RecoveryError, "TAG_CONFLICT"):
             self.controller.recover("naxter1234", self.results, *self.credentials("naxter1234"))
-        self.assertEqual([tag for _repo, tag in self.world.copy_calls], [recovery.TAGS[0]])
+        self.assertEqual([tag for _repo, tag in self.world.write_calls], [recovery.TAGS[0]])
         row = recovery._read_results(self.results)["targets"]["naxter1234"]
         self.assertEqual(row["status"], "PARTIAL_PUBLICATION")
         self.assertEqual(row["tags"][recovery.TAGS[1]]["status"], "CONFLICT")
@@ -293,35 +437,35 @@ class OfflineTests(unittest.TestCase):
     def test_partial_copy_is_recorded_and_never_retried(self):
         self.preflight_all()
         self.verify_protected_targets()
-        self.world.fail_copy_tag = recovery.TAGS[1]
-        with self.assertRaisesRegex(recovery.RecoveryError, "SKOPEO_COPY_FAILED"):
+        self.world.fail_push_tag = recovery.TAGS[1]
+        with self.assertRaisesRegex(recovery.RecoveryError, "DOCKER_PUSH_FAILED"):
             self.controller.recover("naxter1234", self.results, *self.credentials("naxter1234"))
-        self.assertEqual([tag for _repo, tag in self.world.copy_calls], list(recovery.TAGS[:2]))
+        self.assertEqual([tag for _repo, tag in self.world.write_calls], list(recovery.TAGS[:2]))
         row = recovery._read_results(self.results)["targets"]["naxter1234"]
         self.assertEqual(row["status"], "PARTIAL_PUBLICATION")
         self.assertTrue(row["attempted"])
         self.assertEqual(row["tags"][recovery.TAGS[1]]["status"], "UNKNOWN")
         with self.assertRaisesRegex(recovery.RecoveryError, "RUN_ALREADY_ATTEMPTED"):
             self.controller.recover("naxter1234", self.results, *self.credentials("naxter1234"))
-        self.assertEqual(len(self.world.copy_calls), 2)
+        self.assertEqual(len(self.world.write_calls), 2)
 
     def test_later_target_is_blocked_after_previous_target_partial_failure(self):
         self.preflight_all()
         self.verify_protected_targets()
-        self.world.fail_copy_tag = recovery.TAGS[1]
-        with self.assertRaisesRegex(recovery.RecoveryError, "SKOPEO_COPY_FAILED"):
+        self.world.fail_push_tag = recovery.TAGS[1]
+        with self.assertRaisesRegex(recovery.RecoveryError, "DOCKER_PUSH_FAILED"):
             self.controller.recover("naxter1234", self.results, *self.credentials("naxter1234"))
-        writes_before = list(self.world.copy_calls)
+        writes_before = list(self.world.write_calls)
         with self.assertRaisesRegex(recovery.RecoveryError, "RECOVERY_SEQUENCE_BLOCKED"):
             self.controller.recover("ardevsolutions", self.results, *self.credentials("ardevsolutions"))
-        self.assertEqual(self.world.copy_calls, writes_before)
+        self.assertEqual(self.world.write_calls, writes_before)
         self.assertFalse(recovery._read_results(self.results)["targets"]["ardevsolutions"]["attempted"])
 
     def test_recovery_requires_protected_targets_verified_before_any_write(self):
         self.preflight_all()
         with self.assertRaisesRegex(recovery.RecoveryError, "PROTECTED_TARGETS_UNVERIFIED"):
             self.controller.recover("naxter1234", self.results, *self.credentials("naxter1234"))
-        self.assertEqual(self.world.copy_calls, [])
+        self.assertEqual(self.world.write_calls, [])
 
     def test_protected_target_drift_is_rechecked_before_each_recovery_target(self):
         self.preflight_all()
@@ -329,12 +473,12 @@ class OfflineTests(unittest.TestCase):
         self.world.tags[recovery.READ_BY_ID["primary"].repository][recovery.TAGS[0]] = None
         with self.assertRaisesRegex(recovery.RecoveryError, "PROTECTED_TARGET_DRIFT"):
             self.controller.recover("naxter1234", self.results, *self.credentials("naxter1234"))
-        self.assertEqual(self.world.copy_calls, [])
+        self.assertEqual(self.world.write_calls, [])
 
     def test_recovery_requires_all_three_preflights(self):
         with self.assertRaisesRegex(recovery.RecoveryError, "PREFLIGHT_INCOMPLETE"):
             self.controller.recover("naxter1234", self.results, *self.credentials("naxter1234"))
-        self.assertEqual(self.world.copy_calls, [])
+        self.assertEqual(self.world.write_calls, [])
 
     def test_all_six_targets_require_exact_three_tags_for_6_of_6(self):
         original_first_three = {target.repository: dict(self.world.tags[target.repository])
@@ -348,128 +492,162 @@ class OfflineTests(unittest.TestCase):
         self.run_verification_all()
         self.assertEqual(recovery._summary(recovery._read_results(self.results))["status"], "6_OF_6_VERIFIED")
 
-    def test_authfile_is_private_and_secret_is_never_in_arguments_or_results(self):
+    def test_destination_configs_are_isolated_private_and_cleaned(self):
         with recovery.PrivateWorkspace() as workspace:
-            credentials = recovery.Credentials(SYNTHETIC_USERNAME, SYNTHETIC_TOKEN)
-            workspace.write_destination_auth(credentials)
-            raw_auth = workspace.dest_auth.read_text(encoding="ascii")
-            self.assertNotIn(SYNTHETIC_TOKEN, raw_auth)
-            self.assertEqual(json.loads(raw_auth)["auths"]["docker.io"]["auth"],
-                             base64.b64encode((SYNTHETIC_USERNAME + ":" + SYNTHETIC_TOKEN).encode()).decode())
-            self.assertNotIn(SYNTHETIC_TOKEN, repr(credentials))
+            first = workspace.destination_config("naxter1234")
+            second = workspace.destination_config("ardevsolutions")
+            self.assertNotEqual(first, second)
+            self.assertEqual(first.parent, workspace.path)
+            self.assertEqual(second.parent, workspace.path)
             if os.name != "nt":
-                self.assertEqual(stat.S_IMODE(workspace.dest_auth.stat().st_mode), 0o600)
-                self.assertEqual(stat.S_IMODE(workspace.path.stat().st_mode), 0o700)
-        self.assertFalse(workspace.path.exists())
-        output = self.results.read_text(encoding="utf-8")
-        self.assertNotIn(SYNTHETIC_TOKEN, output)
-        self.assertNotIn(SYNTHETIC_USERNAME + ":" + SYNTHETIC_TOKEN, output)
-
-    def test_authfile_is_removed_when_operation_raises(self):
-        workspace_path = None
-        with self.assertRaisesRegex(RuntimeError, "synthetic failure"):
-            with recovery.PrivateWorkspace() as workspace:
-                workspace_path = workspace.path
-                workspace.write_destination_auth(recovery.Credentials(SYNTHETIC_USERNAME, SYNTHETIC_TOKEN))
-                raise RuntimeError("synthetic failure")
+                self.assertEqual(stat.S_IMODE(first.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(second.stat().st_mode), 0o700)
+            first_path = first
+            workspace_path = workspace.path
         self.assertFalse(workspace_path.exists())
+        self.assertFalse(first_path.exists())
 
-    def test_secrets_are_not_passed_to_skopeo_argv_or_environment(self):
+    def test_docker_login_secret_uses_stdin_not_argv_or_environment(self):
         with recovery.PrivateWorkspace() as workspace:
-            runner = recovery.Skopeo(workspace)
+            config_path = workspace.destination_config("naxter1234")
+            runner = recovery.DockerCLI(workspace, config_path)
             seen = {}
 
             def fake_run(args, **kwargs):
                 seen["args"] = list(args)
                 seen["env"] = dict(kwargs["env"])
+                seen["stdin"] = kwargs["input"]
                 return subprocess.CompletedProcess(args, 0, stdout="safe", stderr="")
 
             with patch.object(subprocess, "run", side_effect=fake_run):
-                runner.command(["inspect", "docker://docker.io/public/image:tag"])
+                runner.login(recovery.Credentials(SYNTHETIC_USERNAME, SYNTHETIC_TOKEN))
+            self.assertEqual(seen["args"][:3], ["docker", "login", "docker.io"])
             self.assertNotIn(SYNTHETIC_TOKEN, repr(seen["args"]))
             self.assertNotIn(SYNTHETIC_TOKEN, repr(seen["env"]))
             self.assertNotIn("RECOVERY_TOKEN", seen["env"])
+            self.assertNotIn("DOCKER_HOST", seen["env"])
+            self.assertEqual(seen["stdin"], SYNTHETIC_TOKEN + "\n")
+            self.assertEqual(seen["env"]["DOCKER_CONFIG"], str(config_path))
+        self.assertFalse(config_path.exists())
 
-    def test_sensitive_subprocess_output_and_errors_are_suppressed(self):
+    def test_docker_source_pull_uses_exact_digest_and_inspect_validates_identity(self):
         with recovery.PrivateWorkspace() as workspace:
-            runner = recovery.Skopeo(workspace)
+            runner = recovery.DockerCLI(workspace)
+            seen = []
+
+            def fake_run(args, **kwargs):
+                seen.append(list(args))
+                if args[1] == "image":
+                    return subprocess.CompletedProcess(args, 0,
+                        stdout=json.dumps(docker_image()), stderr="")
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+            with patch.object(subprocess, "run", side_effect=fake_run):
+                runner.pull_source(recovery._source_reference())
+                image = runner.inspect_source(recovery._source_reference())
+                identity = recovery._docker_image_identity(image)
+            self.assertEqual(seen[0], ["docker", "pull", "--platform", "linux/amd64", "--quiet",
+                                       recovery._source_reference()])
+            self.assertIn(recovery.SOURCE_DIGEST, seen[0][-1])
+            self.assertEqual(identity["config_digest"], recovery.SOURCE_CONFIG_DIGEST)
+            with self.assertRaisesRegex(recovery.RecoveryError, "SOURCE_IDENTITY_INVALID"):
+                runner.pull_source("docker.io/myblockchaincompany/fl4shminer-salad:latest")
+
+    def test_docker_subprocess_failure_classes_are_fixed_and_redacted(self):
+        with recovery.PrivateWorkspace() as workspace:
+            runner = recovery.DockerCLI(workspace)
             private = "synthetic-output-secret-never-print"
-            for result, code in [
-                (subprocess.CompletedProcess([], 7, stdout=private, stderr=private), "SKOPEO_INSPECT_FAILED"),
-                (subprocess.CompletedProcess([], 0, stdout="x" * (recovery.MAX_TOOL_OUTPUT + 1), stderr=""), "SKOPEO_OUTPUT_LIMIT"),
-            ]:
+            cases = [
+                (subprocess.CompletedProcess([], 7, stdout=private, stderr=private),
+                 "DOCKER_PUSH_FAILED", "NONZERO_EXIT"),
+                (subprocess.CompletedProcess([], 0, stdout="x" * (recovery.MAX_TOOL_OUTPUT + 1), stderr=""),
+                 "DOCKER_OUTPUT_LIMIT", "OUTPUT_LIMIT"),
+            ]
+            for result, code, failure_class in cases:
                 capture = io.StringIO()
                 with patch.object(subprocess, "run", return_value=result), contextlib.redirect_stdout(capture):
                     with self.assertRaises(recovery.RecoveryError) as raised:
-                        runner.command(["inspect"], code=code)
-                self.assertEqual(raised.exception.code, code)
+                        runner.command(["docker", "push", "synthetic"], phase="DOCKER_PUSH")
+                self.assertEqual((raised.exception.code, raised.exception.phase,
+                                  raised.exception.failure_class), (code, "DOCKER_PUSH", failure_class))
                 self.assertNotIn(private, str(raised.exception))
                 self.assertNotIn(private, capture.getvalue())
 
-    def test_skopeo_timeout_and_spawn_failures_are_fixed_codes(self):
+            with patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("docker", 1, output=private)):
+                with self.assertRaises(recovery.RecoveryError) as raised:
+                    runner.command(["docker", "push", "synthetic"], phase="DOCKER_PUSH")
+            self.assertEqual(raised.exception.failure_class, "TIMEOUT")
+            with patch.object(subprocess, "run", side_effect=OSError(private)):
+                with self.assertRaises(recovery.RecoveryError) as raised:
+                    runner.command(["docker", "push", "synthetic"], phase="DOCKER_PUSH")
+            self.assertEqual(raised.exception.failure_class, "SPAWN_ERROR")
+            self.assertNotIn(private, str(raised.exception))
+            with patch.object(subprocess, "run", side_effect=RuntimeError(private)):
+                with self.assertRaises(recovery.RecoveryError) as raised:
+                    runner.command(["docker", "push", "synthetic"], phase="DOCKER_PUSH")
+            self.assertEqual(raised.exception.failure_class, "UNKNOWN")
+            self.assertNotIn(private, str(raised.exception))
+
+    def test_docker_login_tag_push_logout_keep_phase_specific_codes(self):
         with recovery.PrivateWorkspace() as workspace:
-            runner = recovery.Skopeo(workspace)
-            with patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("skopeo", 1, output="secret")):
-                with self.assertRaisesRegex(recovery.RecoveryError, "SKOPEO_TIMEOUT"):
-                    runner.command(["inspect"])
-            with patch.object(subprocess, "run", side_effect=OSError("synthetic secret")):
-                with self.assertRaisesRegex(recovery.RecoveryError, "SKOPEO_SPAWN_FAILED") as raised:
-                    runner.command(["inspect"])
-                self.assertNotIn("synthetic secret", str(raised.exception))
+            runner = recovery.DockerCLI(workspace)
+            for phase, method, expected in (
+                ("DOCKER_LOGIN", lambda: runner.login(recovery.Credentials(SYNTHETIC_USERNAME, SYNTHETIC_TOKEN)), "DOCKER_LOGIN_FAILED"),
+                ("DOCKER_TAG", lambda: runner.tag(recovery.SOURCE_CONFIG_DIGEST,
+                    recovery._tag_reference("naxter1234/traning_lora", "latest")), "DOCKER_TAG_FAILED"),
+                ("DOCKER_PUSH", lambda: runner.push(recovery._tag_reference("naxter1234/traning_lora", "latest")), "DOCKER_PUSH_FAILED"),
+                ("DOCKER_LOGOUT", runner.logout, "DOCKER_LOGOUT_FAILED"),
+            ):
+                with self.subTest(phase=phase), patch.object(subprocess, "run",
+                        return_value=subprocess.CompletedProcess([], 1, stdout="private", stderr="private")):
+                    with self.assertRaises(recovery.RecoveryError) as raised:
+                        method()
+                self.assertEqual(raised.exception.code, expected)
+                self.assertEqual(raised.exception.phase, phase)
+                self.assertEqual(raised.exception.failure_class, "NONZERO_EXIT")
 
-    def test_skopeo_copy_uses_exact_source_preserve_digest_no_retry_and_digest_file(self):
-        with recovery.PrivateWorkspace() as workspace:
-            runner = recovery.Skopeo(workspace)
-            destination = recovery._tag_reference("naxter1234/traning_lora", recovery.TAGS[0])
-            digestfile = workspace.path / "copy.digest"
-            seen = {}
+    def test_logout_failure_never_replaces_primary_push_failure(self):
+        self.preflight_all()
+        self.verify_protected_targets()
+        self.world.fail_push_tag = recovery.TAGS[1]
+        self.world.fail_logout = True
+        with self.assertRaises(recovery.RecoveryError) as raised:
+            self.controller.recover("naxter1234", self.results, *self.credentials("naxter1234"))
+        self.assertEqual(raised.exception.code, "DOCKER_PUSH_FAILED")
+        self.assertEqual(raised.exception.phase, "DOCKER_PUSH")
+        self.assertEqual(raised.exception.secondary_failure_code, "DOCKER_LOGOUT_FAILED")
+        row = recovery._read_results(self.results)["targets"]["naxter1234"]
+        self.assertEqual(row["failure_code"], "DOCKER_PUSH_FAILED")
+        self.assertEqual(row["logout_failure_code"], "DOCKER_LOGOUT_FAILED")
+        self.assertNotIn(SYNTHETIC_TOKEN, self.results.read_text(encoding="utf-8"))
 
-            def fake_run(args, **kwargs):
-                seen["args"] = list(args)
-                digest_path = Path(args[args.index("--digestfile") + 1])
-                digest_path.write_text(recovery.SOURCE_DIGEST, encoding="ascii")
-                return subprocess.CompletedProcess(args, 0, stdout="synthetic output", stderr="")
+    def test_login_failure_stops_before_destination_writes_and_cleanup_runs(self):
+        self.preflight_all()
+        self.verify_protected_targets()
+        self.world.fail_login = True
+        with self.assertRaisesRegex(recovery.RecoveryError, "DOCKER_LOGIN_FAILED"):
+            self.controller.recover("naxter1234", self.results, *self.credentials("naxter1234"))
+        self.assertEqual(self.world.write_calls, [])
+        self.assertEqual(self.world.docker_calls[-1], ("logout",))
 
-            with patch.object(subprocess, "run", side_effect=fake_run):
-                digest = runner.copy(recovery._source_reference(), destination, digestfile,
-                                     workspace.source_auth, workspace.dest_auth)
-            self.assertEqual(digest, recovery.SOURCE_DIGEST)
-            self.assertEqual(seen["args"][1], "copy")
-            self.assertIn("--preserve-digests", seen["args"])
-            self.assertEqual(seen["args"][seen["args"].index("--retry-times") + 1], "0")
-            self.assertIn(recovery._source_reference(), seen["args"])
-            self.assertIn(destination, seen["args"])
-            self.assertNotIn(SYNTHETIC_TOKEN, repr(seen["args"]))
+    def test_tag_failure_is_distinct_and_does_not_start_push(self):
+        self.preflight_all()
+        self.verify_protected_targets()
+        self.world.fail_tag_tag = recovery.TAGS[0]
+        with self.assertRaisesRegex(recovery.RecoveryError, "DOCKER_TAG_FAILED"):
+            self.controller.recover("naxter1234", self.results, *self.credentials("naxter1234"))
+        self.assertEqual(self.world.write_calls, [])
+        self.assertFalse(any(call[0] == "push" for call in self.world.docker_calls))
 
-    def test_skopeo_version_and_required_flags_are_validated_without_running_binary(self):
-        with recovery.PrivateWorkspace() as workspace:
-            runner = recovery.Skopeo(workspace)
-            required = {
-                "copy --help": "--src-authfile --dest-authfile --preserve-digests --retry-times --digestfile",
-                "inspect --help": "--config --authfile --retry-times",
-            }
+    def test_no_skopeo_or_build_dependency_remains(self):
+        source = (ROOT / ".github/scripts/fl4sh_recover_three.py").read_text(encoding="utf-8").lower()
+        workflow = (ROOT / ".github/workflows/fl4sh-three-target-recovery.yml").read_text(encoding="utf-8").lower()
+        self.assertNotIn("skopeo", source)
+        self.assertNotIn("skopeo", workflow)
+        self.assertNotRegex(source, r"docker\s+(build|buildx)\b")
+        self.assertNotRegex(workflow, r"docker\s+(build|buildx|push|tag)\b")
 
-            def compatible(args, **kwargs):
-                rendered = " ".join(args[1:])
-                if rendered == "--version":
-                    output = "skopeo version 1.4.1"
-                else:
-                    output = required[rendered]
-                return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
-
-            with patch.object(subprocess, "run", side_effect=compatible):
-                runner.validate()
-
-            def incompatible(args, **kwargs):
-                rendered = " ".join(args[1:])
-                output = "skopeo version 9.9.9" if rendered == "--version" else required[rendered]
-                return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
-
-            with patch.object(subprocess, "run", side_effect=incompatible):
-                with self.assertRaisesRegex(recovery.RecoveryError, "SKOPEO_VERSION_UNSUPPORTED"):
-                    runner.validate()
-
-    def test_authfile_credential_validation_and_source_revision_are_strict(self):
+    def test_credential_validation_and_source_revision_are_strict(self):
         for token in ("", "space invalid", "newline\ninvalid", "naïve"):
             with self.assertRaisesRegex(recovery.RecoveryError, "CREDENTIALS_INVALID"):
                 recovery._validate_credentials(recovery.WRITE_BY_ID["naxter1234"], "naxter1234", token)
@@ -485,6 +663,8 @@ class OfflineTests(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             if os.name == "posix":
                 recovery._workflow_context(recovery.CONFIRMATION)
+                with patch.dict(os.environ, {**env, "GITHUB_RUN_NUMBER": "42"}, clear=True):
+                    recovery._workflow_context(recovery.CONFIRMATION)
             else:
                 with self.assertRaisesRegex(recovery.RecoveryError, "DISPATCH_NOT_AUTHORIZED"):
                     recovery._workflow_context(recovery.CONFIRMATION)
@@ -493,7 +673,7 @@ class OfflineTests(unittest.TestCase):
             {**env, "GITHUB_REF": "refs/heads/not-main"},
             {**env, "GITHUB_EVENT_NAME": "push"},
             {**env, "GITHUB_RUN_ATTEMPT": "2"},
-            {**env, "GITHUB_RUN_NUMBER": "2"},
+            {**env, "GITHUB_RUN_NUMBER": "0"},
         ):
             with patch.dict(os.environ, invalid, clear=True):
                 with self.assertRaises(recovery.RecoveryError):
@@ -603,7 +783,7 @@ class OfflineTests(unittest.TestCase):
         self.assertNotRegex(workflow, r"(?m)^\s+(push|pull_request):")
         self.assertIn("group: build-fl4shminer-salad-main", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
-        self.assertIn("skopeo=1.4.1+ds1-1ubuntu0.1", workflow)
+        self.assertNotIn("skopeo", workflow.lower())
         for target in recovery.WRITE_TARGETS:
             self.assertIn(target.repository, (ROOT / ".github/scripts/fl4sh_recover_three.py").read_text(encoding="utf-8"))
             self.assertIn("secrets." + target.username_secret, workflow)
@@ -656,28 +836,30 @@ class OfflineTests(unittest.TestCase):
         self.assertTrue(all(position > first_preflight for position in consumers))
         self.assertLess(initialize, first_preflight)
 
-    def test_no_publisher_or_build_dependency_is_used_for_writes(self):
+    def test_only_docker_cli_source_and_fixed_write_allowlist_are_used(self):
         source = (ROOT / ".github/scripts/fl4sh_recover_three.py").read_text(encoding="utf-8")
-        self.assertNotRegex(source, r"(?i)docker\s+(build|push|tag)\b")
-        self.assertIn("--preserve-digests", source)
-        self.assertIn('"--retry-times", "0"', source)
+        self.assertNotRegex(source, r"(?i)docker\s+(build|buildx)\b")
+        self.assertNotIn("skopeo", source.lower())
+        self.assertIn('["docker", "push", "--quiet", destination]', source)
+        self.assertIn('["docker", "tag", image_id, destination]', source)
         self.assertIn("SOURCE_DIGEST", source)
         self.assertEqual(recovery.WRITE_TARGETS, tuple(recovery.READ_TARGETS[3:]))
 
-    def test_low_level_copy_rejects_any_repository_outside_write_allowlist(self):
+    def test_low_level_docker_tag_and_push_reject_protected_repositories(self):
         with recovery.PrivateWorkspace() as workspace:
-            runner = recovery.Skopeo(workspace)
+            runner = recovery.DockerCLI(workspace)
             with self.assertRaisesRegex(recovery.RecoveryError, "TARGET_NOT_ALLOWED"):
                 recovery._tag_reference("myblockchaincompany/fl4shminer-salad", "latest")
             with self.assertRaisesRegex(recovery.RecoveryError, "TARGET_NOT_ALLOWED"):
-                runner.copy(recovery._source_reference(),
-                            "docker://docker.io/myblockchaincompany/fl4shminer-salad:latest",
-                            workspace.path / "copy.digest", workspace.source_auth, workspace.dest_auth)
+                runner.tag(recovery.SOURCE_CONFIG_DIGEST,
+                           "docker.io/myblockchaincompany/fl4shminer-salad:latest")
+            with self.assertRaisesRegex(recovery.RecoveryError, "TARGET_NOT_ALLOWED"):
+                runner.push("docker.io/myblockchaincompany/fl4shminer-salad:latest")
 
 
-class _WrongPlatformSkopeo(FakeSkopeo):
-    def inspect_config(self, reference, authfile):
-        return config(architecture="arm64")
+class _WrongPlatformDocker(FakeDocker):
+    def inspect_source(self, reference):
+        return docker_image(architecture="arm64")
 
 
 class RegistryTransportTests(unittest.TestCase):
