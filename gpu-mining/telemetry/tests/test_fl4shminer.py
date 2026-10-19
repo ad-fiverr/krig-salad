@@ -116,7 +116,7 @@ class Fl4shMinerTests(unittest.TestCase):
             {
                 **identity,
                 "Time": "2026-10-18T11:59:58Z",
-                "Text Log": "2026/10/18 11:59:58 Device [1] CUDA autotune: 80.0 TH/s (measured pool-equivalent)",
+                "Text Log": "2026/10/18 11:59:58 Device [1] GPU=NVIDIA GeForce RTX 5090 Laptop GPU Pearl autotune hashrate = 80.0 TH/s",
             },
             {
                 **identity,
@@ -157,18 +157,11 @@ class Fl4shMinerTests(unittest.TestCase):
                 valid_from=datetime(2026, 10, 18, 11, 59, tzinfo=timezone.utc),
                 revalidated_at=now, policy_hash="a" * 64,
             )
-            calibration = EarlyCalibration(
-                "CUDA_POOL_EQUIVALENT", "RTX_5090_LAPTOP", 0.9, 1.1, 40,
-                now.replace(hour=0), now.replace(day=19), "a" * 64, "b" * 64,
-                "SYNTHETIC_TEST_ONLY",
-            )
             context = EarlyEvaluationContext(
                 policy=EarlyPolicy("a" * 64, {"RTX_5090_LAPTOP": 120.0}, 2.0),
                 bindings=(binding,),
                 association_records=(association_record,),
-                calibrations=(calibration,),
                 now_utc=now,
-                allow_synthetic_calibration_for_test=True,
                 allow_synthetic_binding_evidence_for_test=True,
             )
             parsed = import_fl4shminer_csv(path, recorded_at_utc=now.isoformat(), early_context=context)
@@ -176,7 +169,7 @@ class Fl4shMinerTests(unittest.TestCase):
         early_event = next(event for event in parsed.events if event["event_type"] == "hashrate_estimate")
         actual_event = next(event for event in parsed.events if event["event_type"] == "gpu_sample")
         self.assertEqual(early_event["early_decision"]["state"], "EARLY_UNDER_FLOOR")
-        self.assertEqual(early_event["early_decision"]["signal_type"], "CUDA_POOL_EQUIVALENT")
+        self.assertEqual(early_event["early_decision"]["signal_type"], "PEARL_AUTOTUNE")
         self.assertFalse(early_event["early_decision"]["actions_performed"])
         self.assertFalse(early_event["early_decision"]["action_eligible"])
         self.assertEqual(actual_event["payload"]["hashrate_ths"], 150.0)
@@ -201,7 +194,7 @@ class Fl4shMinerTests(unittest.TestCase):
                 {**identity, "Time": "2026-10-18T11:59:55Z",
                  "Text Log": "2026/10/18 11:59:55 Device [1] NVIDIA GeForce RTX 5090 Laptop GPU: Initialized"},
                 {**identity, "Time": "2026-10-18T11:59:58Z",
-                 "Text Log": "2026/10/18 11:59:58 Device [1] CUDA autotune: 80.0 TH/s (measured pool-equivalent)"},
+                 "Text Log": "2026/10/18 11:59:58 Device [1] GPU=NVIDIA GeForce RTX 5090 Laptop GPU Pearl autotune hashrate = 80.0 TH/s"},
             ]
 
         now = datetime(2026, 10, 18, 12, 0, tzinfo=timezone.utc)
@@ -229,15 +222,10 @@ class Fl4shMinerTests(unittest.TestCase):
                 valid_from=datetime(2026, 10, 18, 11, 59, tzinfo=timezone.utc),
                 revalidated_at=now, policy_hash="a" * 64,
             )
-            calibration = EarlyCalibration(
-                "CUDA_POOL_EQUIVALENT", "RTX_5090_LAPTOP", 0.9, 1.1, 40,
-                now.replace(hour=0), now.replace(day=19), "a" * 64, "b" * 64, "SYNTHETIC_TEST_ONLY",
-            )
             context = EarlyEvaluationContext(
                 policy=EarlyPolicy("a" * 64, {"RTX_5090_LAPTOP": 120.0}, 2.0),
                 bindings=(binding,), association_records=(association_record,),
-                calibrations=(calibration,), now_utc=now,
-                allow_synthetic_calibration_for_test=True,
+                calibrations=(), now_utc=now,
                 allow_synthetic_binding_evidence_for_test=True,
             )
             parsed = import_fl4shminer_csv(path, recorded_at_utc=now.isoformat(), early_context=context)
@@ -383,7 +371,7 @@ class Fl4shMinerTests(unittest.TestCase):
             {**identity, "Time": "2026-10-18T11:59:55Z",
              "Text Log": "2026/10/18 11:59:55 Device [1] NVIDIA GeForce RTX 5090 Laptop GPU: Initialized"},
             {**identity, "Time": "2026-10-18T11:59:58Z",
-             "Text Log": "2026/10/18 11:59:58 Device [1] CUDA autotune: 150.0 TH/s (measured pool-equivalent)"},
+             "Text Log": "2026/10/18 11:59:58 Device [1] GPU=NVIDIA GeForce RTX 5090 Laptop GPU Pearl autotune hashrate = 150.0 TH/s"},
             {**identity, "Time": "2026-10-18T11:59:59Z",
              "Text Log": "2026/10/18 11:59:59 Device [1] hashRate: 80.0 TH/s, stale: 0/10 (0.0%), warm: 0"},
         ]
@@ -411,15 +399,10 @@ class Fl4shMinerTests(unittest.TestCase):
                 valid_from=datetime(2026, 10, 18, 11, 59, tzinfo=timezone.utc),
                 revalidated_at=now, policy_hash="a" * 64,
             )
-            calibration = EarlyCalibration(
-                "CUDA_POOL_EQUIVALENT", "RTX_5090_LAPTOP", 0.9, 1.1, 40,
-                now.replace(hour=0), now.replace(day=19), "a" * 64, "b" * 64, "SYNTHETIC_TEST_ONLY",
-            )
             context = EarlyEvaluationContext(
                 policy=EarlyPolicy("a" * 64, {"RTX_5090_LAPTOP": 120.0}, 2.0),
                 bindings=(binding,), association_records=(association_record,),
-                calibrations=(calibration,), now_utc=now,
-                allow_synthetic_calibration_for_test=True,
+                calibrations=(), now_utc=now,
                 allow_synthetic_binding_evidence_for_test=True,
             )
             parsed = import_fl4shminer_csv(path, recorded_at_utc=now.isoformat(), early_context=context)

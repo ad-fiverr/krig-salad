@@ -37,7 +37,7 @@ class EarlyAutotuneTests(unittest.TestCase):
             "fl4sh-source-event_start", "2026-10-18T11:59:40Z",
             monitor_policy_evidence_sha256(self.policy_evidence),
         )
-        self.signal = EarlyObservation("CUDA_POOL_EQUIVALENT", 1, "RTX_5090_LAPTOP", 80.0,
+        self.signal = EarlyObservation("PEARL_AUTOTUNE", 1, "RTX_5090_LAPTOP", 80.0,
                                        NOW - timedelta(seconds=2), POLICY_HASH,
                                        source_reference=self.source_reference,
                                        policy_evidence=self.policy_evidence,
@@ -81,7 +81,10 @@ class EarlyAutotuneTests(unittest.TestCase):
     def test_underfloor_is_informational_even_with_explicit_synthetic_binding(self):
         result = self.decide()
         self.assertEqual(result.state, "EARLY_UNDER_FLOOR")
-        self.assertLess(result.predicted_upper_ths, result.floor_ths - self.policy.margin_ths)
+        self.assertEqual(result.reason, "PEARL_BELOW_FLOOR")
+        self.assertEqual(result.floor_ths, 120.0)
+        self.assertIsNone(result.predicted_lower_ths)
+        self.assertIsNone(result.predicted_upper_ths)
         self.assertEqual(result.assignment_generation, "generation-synthetic")
         self.assertFalse(result.actions_performed)
         self.assertFalse(result.action_eligible)
@@ -97,54 +100,84 @@ class EarlyAutotuneTests(unittest.TestCase):
         self.assertEqual(first, replay)
         self.assertFalse(first.actions_performed or replay.actions_performed)
 
-    def test_interval_overlapping_floor_is_unknown(self):
-        self.assertEqual(self.decide(signal=replace(self.signal, estimate_ths=110.0)).state, "EARLY_UNKNOWN")
+    def test_pearl_below_floor_is_direct_underfloor_without_prediction_interval(self):
+        result = self.decide(signal=replace(self.signal, estimate_ths=119.99))
+        self.assertEqual(result.state, "EARLY_UNDER_FLOOR")
+        self.assertEqual(result.reason, "PEARL_BELOW_FLOOR")
+        self.assertIsNone(result.predicted_lower_ths)
+        self.assertIsNone(result.predicted_upper_ths)
 
-    def test_exact_threshold_boundary_does_not_underfloor(self):
-        signal = replace(self.signal, estimate_ths=(120.0 - 2.0) / 1.1)
-        self.assertNotEqual(self.decide(signal=signal).state, "EARLY_UNDER_FLOOR")
+    def test_exact_threshold_boundary_passes_without_margin(self):
+        result = self.decide(signal=replace(self.signal, estimate_ths=120.0))
+        self.assertEqual(result.state, "EARLY_PASS")
+        self.assertEqual(result.reason, "PEARL_AT_OR_ABOVE_FLOOR")
+
+    def test_pearl_150_passes_while_cuda_80_is_diagnostic_only(self):
+        pearl = self.decide(signal=replace(self.signal, estimate_ths=150.0))
+        pearl_at_floor = self.decide(signal=replace(self.signal, estimate_ths=120.0))
+        cuda = self.decide(signal=replace(
+            self.signal, signal_type="CUDA_POOL_EQUIVALENT", estimate_ths=80.0,
+        ))
+        self.assertEqual(pearl.state, "EARLY_PASS")
+        self.assertEqual(pearl.reason, "PEARL_AT_OR_ABOVE_FLOOR")
+        self.assertEqual(pearl_at_floor.state, "EARLY_PASS")
+        self.assertEqual(pearl_at_floor.reason, "PEARL_AT_OR_ABOVE_FLOOR")
+        self.assertEqual(cuda.state, "EARLY_UNKNOWN")
+        self.assertEqual(cuda.reason, "CUDA_POOL_EQUIVALENT_DIAGNOSTIC_ONLY")
+
+    def test_pearl_100_is_underfloor_even_when_cuda_is_150(self):
+        pearl = self.decide(signal=replace(self.signal, estimate_ths=100.0))
+        cuda = self.decide(signal=replace(
+            self.signal, signal_type="CUDA_POOL_EQUIVALENT", estimate_ths=150.0,
+        ))
+        self.assertEqual(pearl.state, "EARLY_UNDER_FLOOR")
+        self.assertEqual(pearl.reason, "PEARL_BELOW_FLOOR")
+        self.assertEqual(cuda.state, "EARLY_UNKNOWN")
+        self.assertFalse(pearl.action_eligible or pearl.actions_performed)
+
+    def test_policy_margin_does_not_change_direct_pearl_comparison(self):
+        policy_with_margin = replace(self.policy, margin_ths=25.0)
+        at_floor = self.decide(signal=replace(self.signal, estimate_ths=120.0), policy=policy_with_margin)
+        below = self.decide(signal=replace(self.signal, estimate_ths=119.0), policy=policy_with_margin)
+        self.assertEqual(at_floor.state, "EARLY_PASS")
+        self.assertEqual(below.state, "EARLY_UNDER_FLOOR")
 
     def test_unindexed_pearl_is_not_bound_by_one_device_coincidence(self):
         signal = replace(self.signal, signal_type="PEARL_AUTOTUNE", device_index=None)
         calibration = replace(self.calibration, signal_type="PEARL_AUTOTUNE")
         self.assertEqual(self.decide(signal=signal, calibration=calibration).reason, "DEVICE_UNVERIFIED")
 
-    def test_pearl_with_explicit_device_needs_its_own_calibration(self):
-        signal = replace(self.signal, signal_type="PEARL_AUTOTUNE")
-        self.assertEqual(self.decide(signal=signal).reason, "CALIBRATION_WRONG_PROFILE")
-        calibration = replace(self.calibration, signal_type="PEARL_AUTOTUNE")
-        self.assertEqual(self.decide(signal=signal, calibration=calibration).state, "EARLY_UNDER_FLOOR")
+    def test_pearl_with_explicit_device_uses_floor_without_calibration(self):
+        result = self.decide(calibration=None)
+        self.assertEqual(result.state, "EARLY_UNDER_FLOOR")
+        self.assertEqual(result.calibration_status, "NOT_APPLICABLE")
+        self.assertIsNone(result.calibration_evidence_sha256)
 
-    def test_missing_calibration_is_unknown(self):
-        self.assertEqual(self.decide(calibration=None).reason, "CALIBRATION_MISSING")
+    def test_cuda_pool_equivalent_is_diagnostic_only(self):
+        result = self.decide(signal=replace(
+            self.signal, signal_type="CUDA_POOL_EQUIVALENT", estimate_ths=1.0,
+        ), calibration=None)
+        self.assertEqual(result.state, "EARLY_UNKNOWN")
+        self.assertEqual(result.reason, "CUDA_POOL_EQUIVALENT_DIAGNOSTIC_ONLY")
+        self.assertFalse(result.action_eligible or result.actions_performed)
 
-    def test_synthetic_calibration_is_rejected_by_default(self):
-        result = evaluate_early_autotune(
-            self.signal, self.binding, self.calibration, self.policy, now_utc=NOW,
-            association_records=(self.association_record,),
-            allow_synthetic_binding_evidence_for_test=True,
+    def test_invalid_stale_or_wrong_profile_calibration_cannot_change_pearl_decision(self):
+        variants = (
+            replace(self.calibration, status="UNAPPROVED"),
+            replace(self.calibration, expires_at_utc=NOW - timedelta(seconds=1)),
+            replace(self.calibration, pair_count=0, gpu_key="RTX_5080_DESKTOP"),
         )
-        self.assertEqual(result.reason, "CALIBRATION_NOT_APPROVED")
-
-    def test_stale_calibration_is_unknown(self):
-        old = replace(self.calibration, expires_at_utc=NOW - timedelta(seconds=1))
-        self.assertEqual(self.decide(calibration=old).reason, "CALIBRATION_STALE")
-
-    def test_insufficient_pairs_is_unknown(self):
-        self.assertEqual(self.decide(calibration=replace(self.calibration, pair_count=29)).reason,
-                         "CALIBRATION_INSUFFICIENT_PAIRS")
-
-    def test_other_gpu_calibration_is_unknown(self):
-        self.assertEqual(self.decide(calibration=replace(self.calibration, gpu_key="RTX_5080_DESKTOP")).reason,
-                         "CALIBRATION_WRONG_PROFILE")
+        for calibration in variants:
+            with self.subTest(status=calibration.status, gpu=calibration.gpu_key):
+                self.assertEqual(self.decide(calibration=calibration).state, "EARLY_UNDER_FLOOR")
 
     def test_changed_policy_hash_invalidates_signal_binding_and_calibration(self):
         changed = replace(self.policy, policy_hash="c" * 64)
         self.assertEqual(self.decide(policy=changed).reason, "POLICY_MISMATCH")
         self.assertEqual(self.decide(binding=replace(self.binding, policy_hash="c" * 64)).reason,
                          "BINDING_UNVERIFIED")
-        self.assertEqual(self.decide(calibration=replace(self.calibration, policy_hash="c" * 64)).reason,
-                         "CALIBRATION_POLICY_OR_EVIDENCE_INVALID")
+        self.assertEqual(self.decide(calibration=replace(self.calibration, policy_hash="c" * 64)).state,
+                         "EARLY_UNDER_FLOOR")
 
     def test_stale_or_future_signal_is_unknown(self):
         old = replace(self.signal, event_time_utc=NOW - timedelta(seconds=61))
@@ -343,14 +376,14 @@ class EarlyAutotuneTests(unittest.TestCase):
         self.assertNotIn("machine_id", serialized)
         self.assertNotIn("instance_id", serialized)
         self.assertTrue(serialized["evaluated_at_utc"].endswith("Z"))
-        self.assertEqual(serialized["calibration_status"], "APPLIED_SYNTHETIC_TEST_ONLY")
-        self.assertEqual(serialized["calibration_evidence_sha256"], "b" * 64)
+        self.assertEqual(serialized["calibration_status"], "NOT_APPLICABLE")
+        self.assertIsNone(serialized["calibration_evidence_sha256"])
         self.assertFalse(serialized["action_eligible"] or serialized["actions_performed"])
 
-    def test_missing_calibration_is_explicit_in_serialized_unknown(self):
+    def test_missing_calibration_is_explicitly_irrelevant_in_serialized_decision(self):
         result = self.decide(calibration=None)
-        self.assertEqual(result.state, "EARLY_UNKNOWN")
-        self.assertEqual(result.to_dict()["calibration_status"], "MISSING")
+        self.assertEqual(result.state, "EARLY_UNDER_FLOOR")
+        self.assertEqual(result.to_dict()["calibration_status"], "NOT_APPLICABLE")
         self.assertIsNone(result.to_dict()["calibration_evidence_sha256"])
 
     def test_unverified_provider_binding_and_ambiguity_fail_closed(self):
@@ -362,7 +395,7 @@ class EarlyAutotuneTests(unittest.TestCase):
         self.assertEqual(self.decide(signal=replace(self.signal, gpu_key=None)).reason, "GPU_UNVERIFIED")
         other = replace(self.signal, gpu_key="RTX_3060")
         other_binding = replace(self.binding, gpu_key="RTX_3060")
-        self.assertEqual(self.decide(signal=other, binding=other_binding).reason, "FLOOR_UNAVAILABLE")
+        self.assertEqual(self.decide(signal=other, binding=other_binding).reason, "FLOOR_UNCONFIGURED")
 
     def test_known_cuda_initialization_failure_is_unqualified_but_not_actionable(self):
         failed = replace(self.signal, estimate_ths=None, startup_failure_reason="CUDA_DRIVER_VERSION_INSUFFICIENT",

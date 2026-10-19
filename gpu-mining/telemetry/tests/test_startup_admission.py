@@ -58,7 +58,7 @@ def make_evidence(*, gpu_key="RTX_5080_LAPTOP", floors=None, calibration=True, n
         monitor_policy_evidence_sha256(policy_evidence),
     )
     observation = EarlyObservation(
-        "CUDA_POOL_EQUIVALENT", 1, gpu_key, 80.0, now - timedelta(seconds=2), policy_hash,
+        "PEARL_AUTOTUNE", 1, gpu_key, 80.0, now - timedelta(seconds=2), policy_hash,
         source_reference=reference,
         policy_evidence=policy_evidence,
         policy_evidence_status="PARSED",
@@ -81,7 +81,7 @@ def make_evidence(*, gpu_key="RTX_5080_LAPTOP", floors=None, calibration=True, n
     calibrations = ()
     if calibration:
         calibrations = (EarlyCalibration(
-            "CUDA_POOL_EQUIVALENT", gpu_key, 0.9, 1.0, 40,
+            "PEARL_AUTOTUNE", gpu_key, 0.9, 1.0, 40,
             now - timedelta(days=1), now + timedelta(days=1), policy_hash,
             "b" * 64, "SYNTHETIC_TEST_ONLY",
         ),)
@@ -114,12 +114,20 @@ def synthetic_log(text: str, *, classification: str = DATA_CLASSIFICATION):
 
 
 class StartupAdmissionEngineTests(unittest.TestCase):
-    def test_exact_typed_calibration_and_binding_can_classify_but_never_authorize(self):
+    def test_exact_typed_pearl_binding_classifies_without_authorizing(self):
         observation, context = make_evidence()
         decision = StartupAdmissionEngine().evaluate(observation, context)
         self.assertEqual(decision.state, "EARLY_UNDER_FLOOR")
+        self.assertEqual(decision.reason, "PEARL_BELOW_FLOOR")
         self.assertFalse(decision.actions_performed)
         self.assertFalse(decision.action_eligible)
+
+    def test_pearl_direct_floor_does_not_need_calibration(self):
+        observation, context = make_evidence(calibration=False)
+        decision = StartupAdmissionEngine().evaluate(observation, context)
+        self.assertEqual(decision.state, "EARLY_UNDER_FLOOR")
+        self.assertEqual(decision.to_dict()["calibration_status"], "NOT_APPLICABLE")
+        self.assertFalse(decision.actions_performed or decision.action_eligible)
 
     def test_unknown_4070_ti_without_empirical_floor_stays_unknown(self):
         observation, context = make_evidence(
@@ -127,17 +135,19 @@ class StartupAdmissionEngineTests(unittest.TestCase):
         )
         decision = StartupAdmissionEngine().evaluate(observation, context)
         self.assertEqual(decision.state, "EARLY_UNKNOWN")
-        self.assertEqual(decision.reason, "FLOOR_UNAVAILABLE")
+        self.assertEqual(decision.reason, "FLOOR_UNCONFIGURED")
         self.assertIsNone(decision.floor_ths)
         self.assertFalse(decision.action_eligible)
 
-    def test_duplicate_matching_calibration_is_ambiguous_and_unknown(self):
+    def test_duplicate_or_malformed_calibration_cannot_change_direct_pearl_result(self):
         observation, context = make_evidence()
         duplicate = replace(context.calibrations[0], evidence_sha256="e" * 64)
-        context = replace(context, calibrations=context.calibrations + (duplicate,))
+        malformed = object()
+        context = replace(context, calibrations=context.calibrations + (duplicate, malformed))
         decision = StartupAdmissionEngine().evaluate(observation, context)
-        self.assertEqual(decision.state, "EARLY_UNKNOWN")
-        self.assertEqual(decision.reason, "CONTRADICTORY_EVIDENCE")
+        self.assertEqual(decision.state, "EARLY_UNDER_FLOOR")
+        self.assertEqual(decision.reason, "PEARL_BELOW_FLOOR")
+        self.assertFalse(decision.actions_performed or decision.action_eligible)
 
     def test_unverified_or_missing_context_cannot_be_promoted(self):
         observation, _context = make_evidence()

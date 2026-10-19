@@ -1,8 +1,8 @@
-"""Pure, fail-closed startup estimate classifier; it never performs an action.
+"""Pure, fail-closed Pearl startup floor classifier; it never performs an action.
 
-Autotune values are prediction inputs, never Device hashRate measurements.
-The caller must supply independently verified provider binding and an approved,
-GPU- and signal-specific calibration. No production calibration is bundled.
+PEARL_AUTOTUNE is compared directly with the exact configured GPU floor after
+the caller supplies independently verified provider binding. CUDA pool-equivalent
+autotune remains diagnostic only, and neither estimate is Device hashRate.
 """
 
 from __future__ import annotations
@@ -213,7 +213,7 @@ class EarlyDecision:
     decision_version: int = 1
     evaluated_at_utc: str | None = None
     source_reference_sha256: str | None = None
-    calibration_status: str = "MISSING"
+    calibration_status: str = "NOT_APPLICABLE"
     calibration_evidence_sha256: str | None = None
 
     def to_dict(self) -> dict[str, object]:
@@ -275,7 +275,11 @@ def evaluate_early_autotune(
     association_records: Sequence[AssociationEvidenceRecord] = (),
     allow_synthetic_binding_evidence_for_test: bool = False,
 ) -> EarlyDecision:
-    """Classify an early estimate. Every error returns UNKNOWN, never authority."""
+    """Compare Pearl autotune directly to its exact GPU floor; never authorize action.
+
+    ``calibration`` and its test flag remain in the signature for caller
+    compatibility, but are intentionally irrelevant to the direct Pearl rule.
+    """
     provenance_hash = _source_reference_hash(observation.source_reference)
     base = dict(
         signal_type=observation.signal_type if observation.signal_type in SIGNAL_TYPES else None,
@@ -288,12 +292,8 @@ def evaluate_early_autotune(
         policy_hash=policy.policy_hash if policy is not None else None,
         evaluated_at_utc=now_utc.isoformat().replace("+00:00", "Z") if _utc(now_utc) else None,
         source_reference_sha256=provenance_hash,
-        calibration_status="MISSING" if calibration is None else "PRESENT_UNVALIDATED",
-        calibration_evidence_sha256=(
-            calibration.evidence_sha256
-            if type(calibration) is EarlyCalibration and _hash(calibration.evidence_sha256)
-            else None
-        ),
+        calibration_status="NOT_APPLICABLE",
+        calibration_evidence_sha256=None,
     )
 
     def unknown(reason: str) -> EarlyDecision:
@@ -387,50 +387,25 @@ def evaluate_early_autotune(
     if attestation_result != "VALID":
         return unknown(attestation_result)
     floor = policy.floors_ths.get(observation.gpu_key)
-    if not _number(floor) or floor <= policy.margin_ths:
-        return unknown("FLOOR_UNAVAILABLE")
-    if calibration is None:
-        return unknown("CALIBRATION_MISSING")
-    if calibration.signal_type != observation.signal_type or calibration.gpu_key != observation.gpu_key:
-        return unknown("CALIBRATION_WRONG_PROFILE")
-    if calibration.policy_hash != policy.policy_hash or not _hash(calibration.evidence_sha256):
-        return unknown("CALIBRATION_POLICY_OR_EVIDENCE_INVALID")
-    if calibration.status != "APPROVED_MEASURED_PAIRS":
-        if not (allow_synthetic_calibration_for_test and calibration.status == "SYNTHETIC_TEST_ONLY"):
-            return unknown("CALIBRATION_NOT_APPROVED")
-    if type(calibration.pair_count) is not int or calibration.pair_count < policy.minimum_calibration_pairs:
-        return unknown("CALIBRATION_INSUFFICIENT_PAIRS")
-    if not _utc(calibration.approved_at_utc) or not _utc(calibration.expires_at_utc):
-        return unknown("CALIBRATION_TIME_UNVERIFIED")
-    if not (calibration.approved_at_utc <= now_utc <= calibration.expires_at_utc):
-        return unknown("CALIBRATION_STALE")
-    if not _number(calibration.lower_multiplier) or not _number(calibration.upper_multiplier):
-        return unknown("CALIBRATION_INVALID")
-    if calibration.lower_multiplier > calibration.upper_multiplier or calibration.upper_multiplier > 100:
-        return unknown("CALIBRATION_INVALID")
-    lower = observation.estimate_ths * calibration.lower_multiplier
-    upper = observation.estimate_ths * calibration.upper_multiplier
-    if not math.isfinite(upper):
-        return unknown("CALIBRATION_INVALID")
-    if upper < floor - policy.margin_ths:
-        state, reason = "EARLY_UNDER_FLOOR", "UPPER_BOUND_BELOW_THRESHOLD"
-    elif lower >= floor:
-        state, reason = "EARLY_PASS", "LOWER_BOUND_AT_OR_ABOVE_FLOOR"
+    if not _number(floor):
+        return unknown("FLOOR_UNCONFIGURED")
+    if observation.signal_type == "CUDA_POOL_EQUIVALENT":
+        return unknown("CUDA_POOL_EQUIVALENT_DIAGNOSTIC_ONLY")
+    if observation.signal_type != "PEARL_AUTOTUNE":
+        return unknown("SIGNAL_UNVERIFIED")
+    if observation.estimate_ths >= floor:
+        state, reason = "EARLY_PASS", "PEARL_AT_OR_ABOVE_FLOOR"
     else:
-        state, reason = "EARLY_UNKNOWN", "PREDICTION_OVERLAPS_THRESHOLD"
+        state, reason = "EARLY_UNDER_FLOOR", "PEARL_BELOW_FLOOR"
     return EarlyDecision(
         state, reason, observation.signal_type, observation.device_index,
-        observation.gpu_key, observation.estimate_ths, lower, upper, floor,
+        observation.gpu_key, observation.estimate_ths, None, None, floor,
         policy.policy_hash, binding.assignment_id, binding.assignment_generation,
         binding.machine_id, binding.instance_id,
         source_reference_sha256=provenance_hash,
         evaluated_at_utc=now_utc.isoformat().replace("+00:00", "Z"),
-        calibration_status=(
-            "APPLIED_SYNTHETIC_TEST_ONLY"
-            if calibration.status == "SYNTHETIC_TEST_ONLY"
-            else "APPLIED_APPROVED_MEASURED_PAIRS"
-        ),
-        calibration_evidence_sha256=calibration.evidence_sha256,
+        calibration_status="NOT_APPLICABLE",
+        calibration_evidence_sha256=None,
     )
 
 

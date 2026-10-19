@@ -1,8 +1,8 @@
-"""Fail-closed orchestration for the existing typed startup estimator.
+"""Fail-closed orchestration for the typed Pearl startup floor decision.
 
-This module does not define new calibration or provider-binding semantics. It
-selects only an unambiguous, exact match from the already approved evidence
-types and delegates the decision to ``evaluate_early_autotune``.
+Provider binding and generation evidence remain exact and independently
+verified. Calibration inputs are retained for API compatibility but do not
+participate in the direct PEARL_AUTOTUNE floor comparison.
 """
 
 from __future__ import annotations
@@ -10,7 +10,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from .fl4sh_early_autotune import (
-    EarlyCalibration,
     EarlyDecision,
     EarlyEvaluationContext,
     EarlyObservation,
@@ -74,22 +73,14 @@ class StartupAdmissionEngine:
             and item.gpu_key == observation.gpu_key
             and item.observation_reference == observation.source_reference
         ]
-        invalid_calibration = any(type(item) is not EarlyCalibration for item in active.calibrations)
-        calibrations = [
-            item for item in active.calibrations
-            if type(item) is EarlyCalibration
-            and item.signal_type == observation.signal_type
-            and item.gpu_key == observation.gpu_key
-        ]
-
         binding = bindings[0] if len(bindings) == 1 else None
-        calibration = calibrations[0] if len(calibrations) == 1 else None
+        # Pearl uses the configured floor directly. Calibration objects cannot
+        # change, suppress, or promote this decision.
+        calibration = None
         conflicting = (
             contradictory_evidence
             or invalid_binding
-            or invalid_calibration
             or len(bindings) > 1
-            or len(calibrations) > 1
         )
         now = active.now_utc or datetime.now(timezone.utc)
         return evaluate_early_autotune(
