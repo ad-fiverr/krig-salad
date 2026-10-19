@@ -679,6 +679,131 @@ class GuardStore:
             rows = self.connection.execute("SELECT * FROM audit_events WHERE track_id=? ORDER BY julianday(occurred_at_utc), audit_id", (track_id,)).fetchall()
         return [{**dict(row), "payload": json.loads(row["payload_json"])} for row in rows]
 
+    def monitor_projection_rows(self, *, limit: int = 100) -> dict[str, list[dict[str, Any]]]:
+        """Read a bounded projection without returning source payloads.
+
+        Evaluation and lifecycle JSON is inspected locally only to extract a
+        small allowlist of typed metrics/provider labels. Raw log text,
+        provenance, source names and arbitrary reasons are never returned.
+        Oversized or malformed JSON produces an empty detail projection while
+        preserving the row's stable identifiers and fixed classifications.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("monitor projection limit must be between 1 and 100")
+        query_limit = limit + 1
+
+        evaluation_rows = self.connection.execute(
+            """SELECT e.evaluation_id, e.track_id, e.evaluated_at_utc, e.policy_hash,
+                      e.decision, e.hash_health,
+                      CASE WHEN length(e.result_json) <= 65536 THEN e.result_json ELSE NULL END AS result_json,
+                      t.allocation_id, t.assignment_id, t.machine_id, t.instance_id,
+                      t.gpu_identity_json
+               FROM evaluations AS e
+               JOIN tracks AS t ON t.track_id=e.track_id
+               ORDER BY julianday(e.evaluated_at_utc) DESC, e.evaluation_id DESC
+               LIMIT ?""",
+            (query_limit,),
+        ).fetchall()
+        audit_rows = self.connection.execute(
+            """SELECT a.audit_id, a.track_id, a.event_type, a.occurred_at_utc,
+                      t.allocation_id, t.assignment_id, t.machine_id, t.instance_id,
+                      t.gpu_identity_json
+               FROM audit_events AS a
+               LEFT JOIN tracks AS t ON t.track_id=a.track_id
+               ORDER BY julianday(a.occurred_at_utc) DESC, a.audit_id DESC
+               LIMIT ?""",
+            (query_limit,),
+        ).fetchall()
+        lifecycle_rows = self.connection.execute(
+            """SELECT event_id, allocation_id, assignment_id, machine_id,
+                      instance_id, reported_state, occurred_at_utc,
+                      CASE WHEN length(event_json) <= 65536 THEN event_json ELSE NULL END AS event_json
+               FROM lifecycle_events
+               ORDER BY julianday(occurred_at_utc) DESC, event_id DESC
+               LIMIT ?""",
+            (query_limit,),
+        ).fetchall()
+        observation_rows = self.connection.execute(
+            """SELECT o.event_id, o.track_id, o.occurred_at_utc, o.hashrate_ths,
+                      o.hashrate_semantics, t.allocation_id, t.assignment_id,
+                      t.machine_id, t.instance_id, t.gpu_identity_json
+               FROM observations AS o
+               JOIN tracks AS t ON t.track_id=o.track_id
+               WHERE o.hashrate_semantics IN ('fl4shminer_device_reported', 'krig_device_reported')
+               ORDER BY julianday(o.occurred_at_utc) DESC, o.event_id DESC
+               LIMIT ?""",
+            (query_limit,),
+        ).fetchall()
+        source_truncated = any(len(items) > limit for items in (evaluation_rows, audit_rows, lifecycle_rows, observation_rows))
+        evaluation_rows = evaluation_rows[:limit]
+        audit_rows = audit_rows[:limit]
+        lifecycle_rows = lifecycle_rows[:limit]
+        observation_rows = observation_rows[:limit]
+
+        def parsed_object(raw: Any) -> dict[str, Any] | None:
+            if not isinstance(raw, str) or len(raw.encode("utf-8")) > 65536:
+                return None
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError):
+                return None
+            return parsed if isinstance(parsed, dict) else None
+
+        evaluations: list[dict[str, Any]] = []
+        for row in evaluation_rows:
+            value = dict(row)
+            result = parsed_object(value.pop("result_json"))
+            details = result.get("details") if isinstance(result, dict) else None
+            details = details if isinstance(details, dict) else {}
+            windows = details.get("windows")
+            last_window = windows[-1] if isinstance(windows, list) and windows and isinstance(windows[-1], dict) else {}
+            evaluations.append({
+                **value,
+                "details": {
+                    "gpu_floor_ths": details.get("gpu_floor_ths"),
+                    "consecutive_bad_windows_observed": details.get("consecutive_bad_windows_observed"),
+                    "last_window": {
+                        key: last_window.get(key)
+                        for key in (
+                            "mean_hashrate_ths", "sample_count", "coverage_ratio",
+                            "maximum_observed_gap_seconds", "valid",
+                        )
+                    },
+                } if result is not None else None,
+            })
+
+        lifecycle: list[dict[str, Any]] = []
+        for row in lifecycle_rows:
+            value = dict(row)
+            event = parsed_object(value.pop("event_json"))
+            identity = event.get("provider_identity") if isinstance(event, dict) else None
+            identity = identity if isinstance(identity, dict) else {}
+            provider_source_valid = bool(
+                isinstance(event, dict)
+                and event.get("source") == "salad_exported_lifecycle_csv"
+                and event.get("source_class") == "provider_log_observation"
+            )
+            lifecycle.append({
+                **value,
+                "provider_label_source_valid": provider_source_valid,
+                "provider_identity_labels": {
+                    key: identity.get(key)
+                    for key in (
+                        "Resource labels machine id",
+                        "Resource labels instance id",
+                        "Resource labels container group name",
+                    )
+                } if provider_source_valid else {},
+            })
+
+        return {
+            "evaluations": evaluations,
+            "audits": [dict(row) for row in audit_rows],
+            "lifecycle": lifecycle,
+            "observations": [dict(row) for row in observation_rows],
+            "source_truncated": source_truncated,
+        }
+
     def has_audit(self, dedupe_key: str) -> bool:
         return self.connection.execute("SELECT 1 FROM audit_events WHERE dedupe_key=?", (dedupe_key,)).fetchone() is not None
 

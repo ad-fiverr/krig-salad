@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Protocol
@@ -349,7 +350,355 @@ class ContinuousMonitor:
         }
 
 
-def fleet_monitor_status(store: GuardStore, policy: HashGuardPolicy | None = None) -> dict[str, Any]:
+_PROJECTION_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_PROJECTION_POLICY_HASH_RE = re.compile(r"^[a-f0-9]{64}$")
+
+
+def _projection_number(value: Any, *, minimum: float | None = None, maximum: float | None = None) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(number) or (minimum is not None and number < minimum) or (maximum is not None and number > maximum):
+        return None
+    return value
+
+
+def _projection_id(value: Any) -> str | None:
+    if not isinstance(value, str) or not _PROJECTION_IDENTIFIER_RE.fullmatch(value):
+        return None
+    return value
+
+
+def _projection_time(value: Any) -> str | None:
+    try:
+        return canonical_utc(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _projection_ref(kind: str, value: Any) -> str | None:
+    if not isinstance(value, str) or not value or len(value) > 1024:
+        return None
+    digest = hashlib.sha256((kind + "\0" + value).encode("utf-8", "replace")).hexdigest()[:32]
+    return f"{kind}_{digest}"
+
+
+def _projection_gpu_identity(raw: Any) -> tuple[str | None, str]:
+    if not isinstance(raw, str) or len(raw.encode("utf-8")) > 4096:
+        return None, "UNKNOWN"
+    try:
+        identity = json.loads(raw)
+    except (TypeError, ValueError):
+        return None, "UNKNOWN"
+    if not isinstance(identity, Mapping):
+        return None, "UNKNOWN"
+    normalized = normalize_gpu_identity(
+        identity.get("raw_model"),
+        identity_source=identity.get("identity_source"),
+        identity_verified=identity.get("identity_verified"),
+        reported_form_factor=identity.get("form_factor"),
+    )
+    if normalized.get("identity_verified") is not True:
+        return None, "UNKNOWN"
+    model = normalized.get("model")
+    form = normalized.get("form_factor")
+    if not isinstance(model, str) or form not in {"laptop", "desktop"}:
+        return None, "UNKNOWN"
+    model_key = re.sub(r"[^A-Z0-9]+", "_", model.upper()).strip("_")
+    return (f"{model_key}_{form.upper()}", "EXACT_LOCAL_IDENTITY") if model_key else (None, "UNKNOWN")
+
+
+def _track_identity_projection(
+    row: Mapping[str, Any], binding_by_track: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    track_id = row.get("track_id")
+    track_ref = _projection_ref("track", track_id)
+    result = {
+        "track_ref": track_ref,
+        "generation_ref": track_ref,
+        "generation_scope": "LOCAL_MONITOR_TRACK" if track_ref else "UNKNOWN",
+        "identity_status": "UNKNOWN",
+        "identity_source": "NONE",
+        "machine_id": None,
+        "instance_id": None,
+        "container_group_id": None,
+    }
+    binding = binding_by_track.get(track_id) if isinstance(track_id, str) else None
+    if not isinstance(binding, Mapping):
+        return result
+    status = binding.get("binding_status")
+    if status == "CONFLICTING":
+        result["identity_status"] = "CONFLICTING"
+        return result
+    if status != "VERIFIED":
+        if status == "SYNTHETIC/UNVERIFIED":
+            result["identity_status"] = "SYNTHETIC_UNVERIFIED"
+        return result
+    provider = binding.get("provider") if isinstance(binding.get("provider"), Mapping) else {}
+    assignment = binding.get("assignment") if isinstance(binding.get("assignment"), Mapping) else {}
+    machine_id = _projection_id(row.get("machine_id"))
+    instance_id = _projection_id(row.get("instance_id"))
+    assignment_id = _projection_id(row.get("assignment_id"))
+    provider_group = _projection_id(provider.get("container_group_id"))
+    assignment_group = _projection_id(assignment.get("container_group_id"))
+    exact = bool(machine_id and instance_id and assignment_id) and all((
+        provider.get("machine_id") == machine_id,
+        assignment.get("machine_id") == machine_id,
+        provider.get("instance_id") == instance_id,
+        assignment.get("instance_id") == instance_id,
+        provider.get("assignment_id") == assignment_id,
+        assignment.get("assignment_id") == assignment_id,
+        provider_group is not None,
+        assignment_group == provider_group,
+    ))
+    if not exact:
+        result["identity_status"] = "CONFLICTING"
+        return result
+    result.update({
+        "identity_status": "VERIFIED",
+        "identity_source": "INDEPENDENT_PROVIDER_ASSIGNMENT_BINDING",
+        "machine_id": machine_id,
+        "instance_id": instance_id,
+        "container_group_id": provider_group,
+    })
+    return result
+
+
+def _provider_label_identity(row: Mapping[str, Any]) -> dict[str, Any]:
+    if row.get("provider_label_source_valid") is not True:
+        return {
+            "identity_status": "UNKNOWN",
+            "identity_source": "NONE",
+            "machine_id": None,
+            "instance_id": None,
+            "container_group_name": None,
+        }
+    labels = row.get("provider_identity_labels")
+    labels = labels if isinstance(labels, Mapping) else {}
+    raw_machine_label = labels.get("Resource labels machine id")
+    raw_instance_label = labels.get("Resource labels instance id")
+    machine_label = _projection_id(raw_machine_label)
+    instance_label = _projection_id(raw_instance_label)
+    stored_machine = _projection_id(row.get("machine_id"))
+    stored_instance = _projection_id(row.get("instance_id"))
+    group_name = _projection_id(labels.get("Resource labels container group name"))
+    if (raw_machine_label is not None and machine_label is None) or (raw_instance_label is not None and instance_label is None):
+        return {
+            "identity_status": "CONFLICTING",
+            "identity_source": "NONE",
+            "machine_id": None,
+            "instance_id": None,
+            "container_group_name": None,
+        }
+    if machine_label and instance_label:
+        if machine_label != stored_machine or instance_label != stored_instance:
+            status = "CONFLICTING"
+            machine_id = instance_id = None
+        else:
+            status = "PROVIDER_LABELS_PRESENT_UNVERIFIED_SEMANTICS"
+            machine_id, instance_id = machine_label, instance_label
+    elif machine_label or instance_label or stored_machine or stored_instance:
+        status = "UNKNOWN"
+        machine_id = instance_id = None
+    else:
+        status = "UNKNOWN"
+        machine_id = instance_id = None
+    return {
+        "identity_status": status,
+        "identity_source": "PROVIDER_RESOURCE_LABELS" if status == "PROVIDER_LABELS_PRESENT_UNVERIFIED_SEMANTICS" else "NONE",
+        "machine_id": machine_id,
+        "instance_id": instance_id,
+        "container_group_name": group_name if machine_id is not None else None,
+    }
+
+
+def fleet_monitor_event_feed(
+    store: GuardStore,
+    *,
+    limit: int = 100,
+    binding_by_track: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Project a bounded, sanitized, restart-stable local monitor event feed."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ValueError("monitor event feed limit must be between 1 and 100")
+    bindings = binding_by_track if isinstance(binding_by_track, Mapping) else {}
+    rows = store.monitor_projection_rows(limit=limit)
+    events: list[dict[str, Any]] = []
+
+    def base_event(
+        *, kind: str, source_id: Any, occurred_at: Any, track_row: Mapping[str, Any] | None,
+        event_type: str, state: str, severity: str, reason_code: str,
+        source_classification: str,
+    ) -> dict[str, Any]:
+        row = track_row if isinstance(track_row, Mapping) else {}
+        track_identity = _track_identity_projection(row, bindings) if row.get("track_id") else {
+            "track_ref": None, "generation_ref": None, "generation_scope": "UNKNOWN",
+            "identity_status": "UNKNOWN", "identity_source": "NONE",
+            "machine_id": None, "instance_id": None, "container_group_id": None,
+        }
+        gpu_key, gpu_identity_status = _projection_gpu_identity(row.get("gpu_identity_json")) if row else (None, "UNKNOWN")
+        event_id = _projection_ref(kind, source_id)
+        return {
+            "event_id": event_id,
+            "event_type": event_type,
+            "state": state,
+            "severity": severity,
+            "reason_code": reason_code,
+            "occurred_at_utc": _projection_time(occurred_at),
+            **track_identity,
+            "gpu_key": gpu_key,
+            "gpu_identity_status": gpu_identity_status,
+            "evidence_classification": source_classification,
+            "actions_performed": False,
+        }
+
+    decision_states = {
+        "PASS": ("HEALTHY", "INFO", "AT_OR_ABOVE_CONFIGURED_FLOOR"),
+        "WOULD_WAIT": ("DEGRADED", "WARNING", "BELOW_FLOOR_WINDOW_THRESHOLD_PENDING"),
+        "WOULD_REALLOCATE": ("DEGRADED", "ALERT", "SUSTAINED_BELOW_CONFIGURED_FLOOR"),
+        "WOULD_STOP": ("DEGRADED", "ALERT", "REALLOCATION_LIMIT_REACHED"),
+        "TELEMETRY_STALE": ("STALE", "WARNING", "MAXIMUM_SAMPLE_GAP_EXCEEDED"),
+        "NO_FLOOR_CONFIGURED": ("NO_FLOOR_CONFIGURED", "WARNING", "EXACT_GPU_FLOOR_MISSING"),
+        "INSUFFICIENT_DATA": ("UNKNOWN", "INFO", "INSUFFICIENT_OR_INVALID_WINDOW_EVIDENCE"),
+    }
+    latest_evaluation_by_track: set[str] = set()
+    for row in rows["evaluations"]:
+        track_id = row.get("track_id")
+        if not isinstance(track_id, str) or track_id in latest_evaluation_by_track:
+            continue
+        latest_evaluation_by_track.add(track_id)
+        decision = row.get("decision")
+        mapped = decision_states.get(decision)
+        if mapped is None:
+            continue
+        state, severity, reason = mapped
+        event = base_event(
+            kind="evaluation", source_id=row.get("evaluation_id"), occurred_at=row.get("evaluated_at_utc"),
+            track_row=row, event_type="MONITOR_EVALUATION", state=state, severity=severity,
+            reason_code=reason, source_classification="LOCAL_CONTINUOUS_MONITOR_EVALUATION",
+        )
+        details = row.get("details") if isinstance(row.get("details"), Mapping) else {}
+        last_window = details.get("last_window") if isinstance(details.get("last_window"), Mapping) else {}
+        event.update({
+            "policy_hash": row.get("policy_hash") if isinstance(row.get("policy_hash"), str) and _PROJECTION_POLICY_HASH_RE.fullmatch(row["policy_hash"]) else None,
+            "decision_code": decision,
+            "hash_health": row.get("hash_health") if row.get("hash_health") in {"MEETS_CONFIGURED_FLOOR", "BELOW_CONFIGURED_FLOOR", "UNKNOWN", "UNCONFIGURED"} else "UNKNOWN",
+            "floor_ths": _projection_number(details.get("gpu_floor_ths"), minimum=0.000001),
+            "observed_window_hashrate_ths": _projection_number(last_window.get("mean_hashrate_ths"), minimum=0),
+            "sample_count": last_window.get("sample_count") if type(last_window.get("sample_count")) is int and last_window["sample_count"] >= 0 else None,
+            "coverage_ratio": _projection_number(last_window.get("coverage_ratio"), minimum=0, maximum=1),
+            "maximum_observed_gap_seconds": _projection_number(last_window.get("maximum_observed_gap_seconds"), minimum=0),
+            "bad_windows": details.get("consecutive_bad_windows_observed") if type(details.get("consecutive_bad_windows_observed")) is int and details["consecutive_bad_windows_observed"] >= 0 else None,
+        })
+        if event["event_id"] is not None and event["occurred_at_utc"] is not None:
+            events.append(event)
+
+    audit_projection = {
+        "FLOOR_BREACH_DETECTED": ("DEGRADATION_STARTED", "WARNING", "FIRST_BELOW_FLOOR_WINDOW"),
+        "SUSTAINED_LOW_HASHRATE": ("SUSTAINED_DEGRADATION", "ALERT", "CONSECUTIVE_WINDOWS_BELOW_FLOOR"),
+        "HASHRATE_RECOVERED": ("RECOVERY_OBSERVED", "INFO", "HASHRATE_RETURNED_TO_FLOOR"),
+        "REALLOCATION_RECOMMENDED": ("REALLOCATION_RECOMMENDED", "ALERT", "DRY_RUN_RECOMMENDATION"),
+        "REALLOCATION_CONFIRMED": ("REALLOCATION_OBSERVATION_RECORDED", "INFO", "EXTERNAL_CONFIRMATION_RECORDED"),
+        "ALLOCATION_TERMINATED": ("LOCAL_TRACK_CLOSED", "INFO", "TRACK_GENERATION_CLOSED"),
+        "GPU_IDENTITY_CONFLICT": ("GPU_IDENTITY_CONFLICT", "WARNING", "CONFLICTING_GPU_IDENTITY_EVIDENCE"),
+        "AMBIGUOUS_ASSIGNMENT_CONTINUITY": ("ASSIGNMENT_CONTINUITY_AMBIGUOUS", "WARNING", "MULTIPLE_TRACK_CANDIDATES"),
+        "UNSCOPED_TERMINAL_LIFECYCLE": ("LIFECYCLE_IDENTITY_UNSCOPED", "WARNING", "PROVIDER_ASSIGNMENT_NOT_UNIQUE"),
+        "GPU_DEVICE_MAPPING_AMBIGUOUS": ("GPU_DEVICE_MAPPING_AMBIGUOUS", "WARNING", "PROVIDER_GPU_MAPPING_NOT_UNIQUE"),
+    }
+    for row in rows["audits"]:
+        mapped = audit_projection.get(row.get("event_type"))
+        if mapped is None:
+            continue
+        event_type, severity, reason = mapped
+        event = base_event(
+            kind="audit", source_id=row.get("audit_id"), occurred_at=row.get("occurred_at_utc"),
+            track_row=row, event_type=event_type, state=event_type, severity=severity,
+            reason_code=reason, source_classification="LOCAL_MONITOR_AUDIT",
+        )
+        if event["event_id"] is not None and event["occurred_at_utc"] is not None:
+            events.append(event)
+
+    lifecycle_projection = {
+        "allocated": ("START_REPORTED", "INFO", "ALLOCATION_REPORTED"),
+        "allocating": ("START_REPORTED", "INFO", "ALLOCATION_REPORTED"),
+        "downloading": ("START_REPORTED", "INFO", "IMAGE_DOWNLOAD_REPORTED"),
+        "creating": ("START_REPORTED", "INFO", "INSTANCE_CREATION_REPORTED"),
+        "starting": ("START_REPORTED", "INFO", "INSTANCE_START_REPORTED"),
+        "running": ("RUNNING_REPORTED", "INFO", "PROVIDER_RUNNING_REPORTED"),
+        "ready": ("READY_REPORTED", "INFO", "PROVIDER_READY_REPORTED"),
+        "startup_probe_passed": ("STARTUP_PROBE_PASSED", "INFO", "STARTUP_PROBE_PASSED_REPORTED"),
+        "startup_probe_failed": ("STARTUP_PROBE_FAILED", "WARNING", "STARTUP_PROBE_FAILED_REPORTED"),
+        "readiness_failed": ("READINESS_FAILURE_REPORTED", "WARNING", "READINESS_FAILURE_REPORTED"),
+        "probe_failed": ("READINESS_FAILURE_REPORTED", "WARNING", "READINESS_PROBE_FAILED"),
+        "stopping": ("TERMINATION_IN_PROGRESS_REPORTED", "INFO", "PROVIDER_STOPPING_REPORTED"),
+        "stopped": ("TERMINATION_REPORTED", "INFO", "PROVIDER_STOPPED_REPORTED"),
+        "terminated": ("TERMINATION_REPORTED", "INFO", "PROVIDER_TERMINATED_REPORTED"),
+        "allocation_terminated": ("TERMINATION_REPORTED", "INFO", "ALLOCATION_TERMINATION_REPORTED"),
+        "preempted": ("PREEMPTION_OR_LOSS_REPORTED", "WARNING", "PREEMPTION_REPORTED"),
+        "lost": ("PREEMPTION_OR_LOSS_REPORTED", "WARNING", "RESOURCE_LOSS_REPORTED"),
+        "reallocated": ("REALLOCATION_OBSERVED", "INFO", "REALLOCATION_REPORTED"),
+    }
+    for row in rows["lifecycle"]:
+        mapped = lifecycle_projection.get(row.get("reported_state"))
+        if mapped is None:
+            continue
+        event_type, severity, reason = mapped
+        event = base_event(
+            kind="lifecycle", source_id=row.get("event_id"), occurred_at=row.get("occurred_at_utc"),
+            track_row=None, event_type=event_type, state=event_type, severity=severity,
+            reason_code=reason, source_classification="PROVIDER_LOG_OBSERVATION_UNVERIFIED_SEMANTICS",
+        )
+        event.update(_provider_label_identity(row))
+        event["generation_scope"] = "PROVIDER_GENERATION_UNKNOWN"
+        event["container_group_name"] = event.pop("container_group_name", None)
+        if event["event_id"] is not None and event["occurred_at_utc"] is not None:
+            events.append(event)
+
+    latest_observation_by_track: set[str] = set()
+    for row in rows["observations"]:
+        track_id = row.get("track_id")
+        if not isinstance(track_id, str) or track_id in latest_observation_by_track:
+            continue
+        latest_observation_by_track.add(track_id)
+        rate = _projection_number(row.get("hashrate_ths"), minimum=0.000001)
+        if rate is None or row.get("hashrate_semantics") not in {"fl4shminer_device_reported", "krig_device_reported"}:
+            continue
+        event = base_event(
+            kind="sample", source_id=row.get("event_id"), occurred_at=row.get("occurred_at_utc"),
+            track_row=row, event_type="ACTIVE_MINING_SAMPLE", state="ACTIVE_MINING_OBSERVED",
+            severity="INFO", reason_code="POSITIVE_DEVICE_REPORTED_HASHRATE",
+            source_classification="LOCAL_DEVICE_REPORTED_HASHRATE",
+        )
+        event["observed_hashrate_ths"] = rate
+        event["hashrate_semantics"] = row["hashrate_semantics"]
+        if event["event_id"] is not None and event["occurred_at_utc"] is not None:
+            events.append(event)
+
+    events.sort(key=lambda item: (item["occurred_at_utc"], item["event_id"]), reverse=True)
+    truncated = rows.get("source_truncated") is True or len(events) > limit
+    return {
+        "schema_version": "1.0",
+        "status": "OK",
+        "events": events[:limit],
+        "limit": limit,
+        "truncated": truncated,
+        "source": "DURABLE_LOCAL_GUARD_STORE",
+        "provider_lifecycle_semantics": "UNVERIFIED_OBSERVATIONS",
+        "pool_failures_source": "EXISTING_CENTRAL_LOG_ALERT_PIPELINE",
+        "actions_performed": False,
+    }
+
+
+def fleet_monitor_status(
+    store: GuardStore,
+    policy: HashGuardPolicy | None = None,
+    *,
+    binding_by_track: Mapping[str, Mapping[str, Any]] | None = None,
+    event_limit: int = 100,
+) -> dict[str, Any]:
     tracks: list[dict[str, Any]] = []
     for track in store.track_rows():
         latest = store.last_evaluation(track["track_id"])
@@ -389,6 +738,7 @@ def fleet_monitor_status(store: GuardStore, policy: HashGuardPolicy | None = Non
         "mode": "offline_dry_run",
         "tracks": tracks,
         "source_cursors": store.source_cursor_rows(),
+        "events": fleet_monitor_event_feed(store, limit=event_limit, binding_by_track=binding_by_track),
         "actions_performed": False,
         "live_salad_adapter": "NOT_IMPLEMENTED",
         "economic_reconciliation_status": "UNKNOWN",

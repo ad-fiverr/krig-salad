@@ -3,12 +3,13 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from collector.continuous import ContinuousMonitor
+from collector.continuous import ContinuousMonitor, fleet_monitor_event_feed
 from collector.gpu_identity import normalize_gpu_identity
 from collector.guard_store import GuardStore
 from collector.guards import HashGuardPolicy, evaluate_hash_floor
@@ -459,6 +460,220 @@ class ContinuousMonitorTests(unittest.TestCase):
             self.assertIsNone(new_track["closed_at_utc"])
             self.assertEqual(new_track["replaced_track_id"], old_track_id)
             self.assertEqual(result["terminated_track_ids"], [old_track_id])
+        finally:
+            store.close()
+
+    def test_event_feed_is_bounded_deterministic_and_never_exposes_source_payloads(self):
+        events = series(240, [(0, None, 20)], scenario="event-feed-secret")
+        for event in events:
+            event["hashrate_source"] = "DO_NOT_EXPOSE_HASH_SOURCE"
+            event["text_log"] = "DO_NOT_EXPOSE_RAW_MINER_LOG"
+            event["provenance"] = {"source": "DO_NOT_EXPOSE_PROVENANCE"}
+        store, monitor, _, track = run_series(events, make_policy())
+        try:
+            ready = {
+                "event_type": "provider_lifecycle_observation",
+                "event_id": "provider-ready-event-feed",
+                "reported_state": "ready",
+                "occurred_at_utc": at(250),
+                "allocation_id": "allocation-event-feed-secret",
+                "assignment_id": "allocation-event-feed-secret-v1",
+                "machine_id": "machine-event-feed-secret",
+                "instance_id": "instance-event-feed-secret",
+                "source": "salad_exported_lifecycle_csv",
+                "source_class": "provider_log_observation",
+                "provider_identity": {
+                    "Resource labels machine id": "machine-event-feed-secret",
+                    "Resource labels instance id": "instance-event-feed-secret",
+                    "Resource labels container group name": "fl4shminer-3",
+                    "Resource labels project name": "DO_NOT_EXPOSE_PROJECT_LABEL",
+                },
+                "text_log": "DO_NOT_EXPOSE_PROVIDER_LOG",
+                "json_log": {"credential": "DO_NOT_EXPOSE_PROVIDER_BODY"},
+                "event_source": "DO_NOT_EXPOSE_EVENT_SOURCE",
+            }
+            monitor.ingest([ready])
+            feed = fleet_monitor_event_feed(store, limit=100)
+            rendered = json.dumps(feed, sort_keys=True)
+            for secret_marker in (
+                "DO_NOT_EXPOSE_HASH_SOURCE", "DO_NOT_EXPOSE_RAW_MINER_LOG",
+                "DO_NOT_EXPOSE_PROVENANCE", "DO_NOT_EXPOSE_PROVIDER_LOG",
+                "DO_NOT_EXPOSE_PROVIDER_BODY", "DO_NOT_EXPOSE_EVENT_SOURCE",
+                "DO_NOT_EXPOSE_PROJECT_LABEL", "NVIDIA GeForce RTX 5090",
+            ):
+                self.assertNotIn(secret_marker, rendered)
+            self.assertLessEqual(len(feed["events"]), 100)
+            self.assertFalse(feed["actions_performed"])
+            self.assertTrue(all(item["actions_performed"] is False for item in feed["events"]))
+
+            recommendation = next(item for item in feed["events"] if item.get("decision_code") == "WOULD_REALLOCATE")
+            self.assertEqual(recommendation["state"], "DEGRADED")
+            self.assertEqual(recommendation["event_type"], "MONITOR_EVALUATION")
+            self.assertEqual(recommendation["floor_ths"], 120.0)
+            self.assertEqual(recommendation["observed_window_hashrate_ths"], 20.0)
+            self.assertEqual(recommendation["identity_status"], "UNKNOWN")
+            self.assertIsNone(recommendation["machine_id"])
+            self.assertEqual(recommendation["generation_scope"], "LOCAL_MONITOR_TRACK")
+            self.assertEqual(recommendation["gpu_key"], "RTX_5090_LAPTOP")
+
+            mining_sample = next(item for item in feed["events"] if item["event_type"] == "ACTIVE_MINING_SAMPLE")
+            self.assertEqual(mining_sample["state"], "ACTIVE_MINING_OBSERVED")
+            self.assertEqual(mining_sample["hashrate_semantics"], "fl4shminer_device_reported")
+            self.assertGreater(mining_sample["observed_hashrate_ths"], 0)
+
+            lifecycle = next(item for item in feed["events"] if item["event_type"] == "READY_REPORTED")
+            self.assertEqual(lifecycle["identity_status"], "PROVIDER_LABELS_PRESENT_UNVERIFIED_SEMANTICS")
+            self.assertEqual(lifecycle["identity_source"], "PROVIDER_RESOURCE_LABELS")
+            self.assertEqual(lifecycle["machine_id"], "machine-event-feed-secret")
+            self.assertEqual(lifecycle["instance_id"], "instance-event-feed-secret")
+            self.assertEqual(lifecycle["container_group_name"], "fl4shminer-3")
+            self.assertEqual(lifecycle["generation_scope"], "PROVIDER_GENERATION_UNKNOWN")
+            self.assertEqual(lifecycle["evidence_classification"], "PROVIDER_LOG_OBSERVATION_UNVERIFIED_SEMANTICS")
+
+            binding = {
+                "binding_status": "VERIFIED",
+                "provider": {
+                    "machine_id": track["machine_id"],
+                    "instance_id": track["instance_id"],
+                    "assignment_id": track["assignment_id"],
+                    "container_group_id": "fl4shminer-2",
+                },
+                "assignment": {
+                    "machine_id": track["machine_id"],
+                    "instance_id": track["instance_id"],
+                    "assignment_id": track["assignment_id"],
+                    "container_group_id": "fl4shminer-2",
+                },
+            }
+            verified_feed = fleet_monitor_event_feed(store, binding_by_track={track["track_id"]: binding})
+            verified = next(item for item in verified_feed["events"] if item.get("decision_code") == "WOULD_REALLOCATE")
+            self.assertEqual(verified["identity_status"], "VERIFIED")
+            self.assertEqual(verified["machine_id"], track["machine_id"])
+            self.assertEqual(verified["instance_id"], track["instance_id"])
+            self.assertEqual(verified["container_group_id"], "fl4shminer-2")
+
+            conflicting = {**binding, "assignment": {**binding["assignment"], "instance_id": "other-instance"}}
+            conflict_feed = fleet_monitor_event_feed(store, binding_by_track={track["track_id"]: conflicting})
+            conflict = next(item for item in conflict_feed["events"] if item.get("decision_code") == "WOULD_REALLOCATE")
+            self.assertEqual(conflict["identity_status"], "CONFLICTING")
+            self.assertIsNone(conflict["machine_id"])
+            self.assertIsNone(conflict["instance_id"])
+        finally:
+            store.close()
+
+    def test_event_feed_marks_stale_and_conflicting_provider_labels_without_leakage(self):
+        store, monitor, _, track = run_series(
+            series(240, [(0, None, 165)], scenario="event-feed-stale"), make_policy()
+        )
+        try:
+            monitor.evaluate_track(track["track_id"], at(300))
+            lifecycle = {
+                "event_type": "provider_lifecycle_observation",
+                "event_id": "provider-conflicting-event-feed",
+                "reported_state": "preempted",
+                "occurred_at_utc": at(301),
+                "machine_id": "local-machine-claim",
+                "instance_id": "local-instance-claim",
+                "source": "salad_exported_lifecycle_csv",
+                "source_class": "provider_log_observation",
+                "provider_identity": {
+                    "Resource labels machine id": "provider-machine-claim",
+                    "Resource labels instance id": "provider-instance-claim",
+                    "Resource labels container group name": "fl4shminer",
+                },
+                "text_log": "DO_NOT_EXPOSE_CONFLICTING_LOG",
+            }
+            monitor.ingest([lifecycle])
+            untrusted_identity = {
+                "event_type": "provider_lifecycle_observation",
+                "event_id": "miner-text-cannot-assert-provider-identity",
+                "reported_state": "running",
+                "occurred_at_utc": at(302),
+                "source": "fl4shminer_stdout",
+                "source_class": "miner_log_observation",
+                "machine_id": "machine-from-miner-text",
+                "instance_id": "instance-from-miner-text",
+                "provider_identity": {
+                    "Resource labels machine id": "machine-from-miner-text",
+                    "Resource labels instance id": "instance-from-miner-text",
+                    "Resource labels container group name": "fl4shminer",
+                },
+            }
+            monitor.ingest([untrusted_identity])
+            feed = fleet_monitor_event_feed(store)
+            stale = next(item for item in feed["events"] if item["event_type"] == "MONITOR_EVALUATION" and item["state"] == "STALE")
+            self.assertEqual(stale["identity_status"], "UNKNOWN")
+            provider = next(item for item in feed["events"] if item["event_type"] == "PREEMPTION_OR_LOSS_REPORTED")
+            self.assertEqual(provider["identity_status"], "CONFLICTING")
+            self.assertIsNone(provider["machine_id"])
+            self.assertIsNone(provider["instance_id"])
+            miner_claim = next(item for item in feed["events"] if item["event_type"] == "RUNNING_REPORTED")
+            self.assertEqual(miner_claim["identity_status"], "UNKNOWN")
+            self.assertIsNone(miner_claim["machine_id"])
+            self.assertIsNone(miner_claim["instance_id"])
+            self.assertNotIn("DO_NOT_EXPOSE_CONFLICTING_LOG", json.dumps(feed))
+            self.assertFalse(provider["actions_performed"])
+        finally:
+            store.close()
+
+    def test_event_feed_event_ids_survive_store_restart_and_limit_is_explicit(self):
+        with tempfile.TemporaryDirectory(prefix="continuous-event-feed-") as temp:
+            path = Path(temp) / "monitor.sqlite3"
+            store = GuardStore(path)
+            monitor = ContinuousMonitor(store, make_policy())
+            sample = make_sample(0, 150, scenario="event-feed-restart")
+            monitor.ingest([sample])
+            monitor.ingest([{
+                "event_type": "provider_lifecycle_observation",
+                "event_id": "event-feed-restart-ready",
+                "reported_state": "ready",
+                "occurred_at_utc": at(1),
+                "provider_identity": {},
+            }])
+            first = fleet_monitor_event_feed(store, limit=1)
+            self.assertEqual(first["limit"], 1)
+            self.assertTrue(first["truncated"])
+            first_ids = [item["event_id"] for item in first["events"]]
+            store.close()
+
+            reopened = GuardStore(path)
+            try:
+                second = fleet_monitor_event_feed(reopened, limit=1)
+                self.assertEqual([item["event_id"] for item in second["events"]], first_ids)
+                self.assertTrue(all(item["event_id"].startswith(("evaluation_", "sample_", "audit_", "lifecycle_")) for item in second["events"]))
+            finally:
+                reopened.close()
+
+    def test_event_feed_keeps_two_machines_as_separate_local_tracks_without_inferred_ids(self):
+        store = GuardStore(":memory:")
+        monitor = ContinuousMonitor(store, make_policy())
+        first = make_sample(0, 150, scenario="event-feed-machine-a", machine_id="machine-a", instance_id="instance-a")
+        second = make_sample(0, 155, scenario="event-feed-machine-b", machine_id="machine-b", instance_id="instance-b")
+        second["allocation_id"] = "allocation-machine-b"
+        second["assignment_id"] = "assignment-machine-b"
+        second["run_id"] = "run-machine-b"
+        monitor.ingest([first, second])
+        try:
+            feed = fleet_monitor_event_feed(store)
+            samples = [item for item in feed["events"] if item["event_type"] == "ACTIVE_MINING_SAMPLE"]
+            self.assertEqual(len(samples), 2)
+            self.assertEqual(len({item["track_ref"] for item in samples}), 2)
+            self.assertEqual(len({item["generation_ref"] for item in samples}), 2)
+            self.assertTrue(all(item["identity_status"] == "UNKNOWN" for item in samples))
+            self.assertTrue(all(item["machine_id"] is None and item["instance_id"] is None for item in samples))
+        finally:
+            store.close()
+
+    def test_event_feed_preserves_recorded_recovery_transition(self):
+        events = series(2400, [(0, 1200, 20), (1200, None, 165)], scenario="event-feed-recovery")
+        store, _, _, track = run_series(events, make_policy())
+        try:
+            audit_types = [row["event_type"] for row in store.audit_rows(track_id=track["track_id"])]
+            self.assertIn("HASHRATE_RECOVERED", audit_types)
+            feed = fleet_monitor_event_feed(store)
+            recovery = next(item for item in feed["events"] if item["event_type"] == "RECOVERY_OBSERVED")
+            self.assertEqual(recovery["reason_code"], "HASHRATE_RETURNED_TO_FLOOR")
+            self.assertFalse(recovery["actions_performed"])
         finally:
             store.close()
 

@@ -15,7 +15,7 @@ from urllib.parse import quote
 
 from collector.action_ledger import ActionLedger
 from collector.auto_reallocation_gate import AutoReallocationGate, AutoReallocationLimits
-from collector.continuous import ContinuousMonitor
+from collector.continuous import ContinuousMonitor, fleet_monitor_event_feed
 from collector.dashboard_projection import project_device, project_fleet
 from collector.device_guard import inspect_monitor_source, load_monitor_events
 from collector.fl4sh_early_autotune import (
@@ -997,6 +997,11 @@ class G5ControlPlaneService:
                 "monitor": {
                     "implementation": "ContinuousMonitor",
                     "policy_hash": self.monitor.policy_hash,
+                    "event_feed": fleet_monitor_event_feed(
+                        self.guard_store,
+                        limit=100,
+                        binding_by_track=self._bindings,
+                    ),
                     "configuration": {
                         "gpu_floors_ths": [
                             {

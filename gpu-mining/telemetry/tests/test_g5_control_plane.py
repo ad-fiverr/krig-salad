@@ -798,6 +798,67 @@ class G5ControlPlaneTests(unittest.TestCase):
             finally:
                 reopened.close()
 
+    def test_dashboard_includes_sanitized_monitor_feed_and_requires_exact_binding_for_track_ids(self):
+        service = G5ControlPlaneService(G5Config())
+        try:
+            now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            identity = normalize_gpu_identity(
+                "NVIDIA GeForce RTX 5090 Laptop GPU",
+                identity_source="synthetic_test_fixture",
+                identity_verified=True,
+            )
+            sample = {
+                "event_type": "gpu_sample", "event_id": "g5-event-feed-sample",
+                "fleet_id": "fleet-event-feed", "worker_id": "worker-event-feed",
+                "allocation_id": "allocation-event-feed", "assignment_id": "assignment-event-feed",
+                "run_id": "run-event-feed", "machine_id": "machine-event-feed",
+                "instance_id": "instance-event-feed", "device_namespace": "fl4shminer_device",
+                "device_id": "0", "occurred_at_utc": now,
+                "assignment_started_at_utc": now, "start_anchor_verified": True,
+                "hashrate_ths": 150.0, "hashrate_semantics": "fl4shminer_device_reported",
+                "hashrate_source": "DO_NOT_EXPOSE_DASHBOARD_SOURCE", "gpu_identity": identity,
+                "reallocation_history_known": True, "reallocation_count": 0,
+                "provenance": {"private_marker": "DO_NOT_EXPOSE_DASHBOARD_PROVENANCE"},
+            }
+            service.ingest_miner_events([sample])
+            state = service.state()
+            feed = state["monitor"]["event_feed"]
+            self.assertEqual(feed["status"], "OK")
+            self.assertEqual(feed["pool_failures_source"], "EXISTING_CENTRAL_LOG_ALERT_PIPELINE")
+            self.assertFalse(feed["actions_performed"])
+            mining = next(item for item in feed["events"] if item["event_type"] == "ACTIVE_MINING_SAMPLE")
+            self.assertEqual(mining["identity_status"], "UNKNOWN")
+            self.assertIsNone(mining["machine_id"])
+            self.assertIsNone(mining["instance_id"])
+            serialized = json.dumps(feed, sort_keys=True)
+            self.assertNotIn("DO_NOT_EXPOSE_DASHBOARD_SOURCE", serialized)
+            self.assertNotIn("DO_NOT_EXPOSE_DASHBOARD_PROVENANCE", serialized)
+
+            track = service.guard_store.track_rows()[0]
+            binding = {
+                "binding_status": "VERIFIED",
+                "provider": {
+                    "machine_id": track["machine_id"], "instance_id": track["instance_id"],
+                    "assignment_id": track["assignment_id"], "container_group_id": "fl4shminer-4",
+                },
+                "assignment": {
+                    "machine_id": track["machine_id"], "instance_id": track["instance_id"],
+                    "assignment_id": track["assignment_id"], "container_group_id": "fl4shminer-4",
+                },
+            }
+            service.register_binding_evidence(track["track_id"], binding)
+            bound_feed = service.state()["monitor"]["event_feed"]
+            bound_sample = next(item for item in bound_feed["events"] if item["event_type"] == "ACTIVE_MINING_SAMPLE")
+            self.assertEqual(bound_sample["identity_status"], "VERIFIED")
+            self.assertEqual(bound_sample["machine_id"], track["machine_id"])
+            self.assertEqual(bound_sample["instance_id"], track["instance_id"])
+            self.assertEqual(bound_sample["container_group_id"], "fl4shminer-4")
+            self.assertFalse(bound_sample["actions_performed"])
+            self.assertFalse(state["actions"]["live_actions_enabled"])
+            self.assertFalse(state["actions"]["auto_reallocate"])
+        finally:
+            service.close()
+
     def test_local_source_monitor_and_four_group_tls_fixture_are_composed_end_to_end(self):
         server = GateLocalTLSServer()
         with tempfile.TemporaryDirectory(prefix="g5-offline-e2e-") as temp:
