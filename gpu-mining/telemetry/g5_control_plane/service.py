@@ -23,6 +23,7 @@ from collector.fl4sh_early_autotune import (
     EarlyObservation,
     EarlyPolicy,
 )
+from collector.fleet_hashrate_rollups import MAXIMUM_SAMPLE_RECORDS_PER_TRACK, build_hashrate_rollups
 from collector.guard_store import GuardStore
 from collector.guards import HashGuardPolicy
 from collector.reallocation_controller import ReallocationController, ReallocationPolicy
@@ -943,6 +944,47 @@ class G5ControlPlaneService:
         with self._lock:
             by_group = self._current_group_evidence()
             tracks = self.guard_store.track_rows()
+            as_of = datetime.fromtimestamp(self._clock(), timezone.utc)
+            samples_by_track: dict[str, Any] = {}
+            for track in tracks:
+                track_id = track.get("track_id")
+                if not isinstance(track_id, str):
+                    continue
+                samples: list[dict[str, Any]] = []
+                if track.get("start_anchor_verified") == 1:
+                    try:
+                        started_text = str(track.get("started_at_utc") or "")
+                        started = datetime.fromisoformat(
+                            started_text[:-1] + "+00:00" if started_text.endswith("Z") else started_text
+                        )
+                        if started.tzinfo is not None and started.utcoffset() is not None:
+                            elapsed = max(0.0, (as_of - started.astimezone(timezone.utc)).total_seconds())
+                            sample_floor = max(
+                                0.0,
+                                elapsed - 86400.0 - float(self.config.maximum_sample_gap_seconds),
+                            )
+                            samples = self.guard_store.rollup_samples_for_track(
+                                track_id,
+                                since_elapsed_seconds=sample_floor,
+                                maximum_records=MAXIMUM_SAMPLE_RECORDS_PER_TRACK,
+                            )
+                    except (OverflowError, TypeError, ValueError):
+                        samples = []
+                samples_by_track.setdefault(track_id, {"samples": [], "truncated": False})
+                if samples:
+                    samples_by_track[track_id] = samples
+            hashrate_rollup_state = build_hashrate_rollups(
+                tracks,
+                samples_by_track,
+                as_of_utc=as_of,
+                maximum_sample_gap_seconds=self.config.maximum_sample_gap_seconds,
+                minimum_window_coverage_ratio=self.config.minimum_window_coverage_ratio,
+            )
+            device_rollups = {
+                item["track_id"]: item
+                for item in hashrate_rollup_state["devices"]
+                if isinstance(item.get("track_id"), str)
+            }
             devices: list[dict[str, Any]] = []
             budget_summary = self.store.budget_summary()
             for track in tracks:
@@ -966,6 +1008,7 @@ class G5ControlPlaneService:
                         "verified_spend_usd": budget_summary.get("verified_spend_usd"),
                     },
                     action_context={"status": "DISABLED", "blockers": ["G5_REVIEW_REQUIRED", "LIVE_ACTIONS_DISABLED"]},
+                    hashrate_rollups=device_rollups.get(track["track_id"], {}),
                 )
                 if projection["binding"].get("binding_status") != "VERIFIED":
                     projection["provider_instance_attribution"] = "UNKNOWN"
@@ -1026,6 +1069,14 @@ class G5ControlPlaneService:
                         },
                     },
                     "devices": devices,
+                    "fleet_hashrate_rollups": hashrate_rollup_state["fleets"],
+                    "hashrate_rollup_policy": {
+                        "windows_seconds": hashrate_rollup_state["windows_seconds"],
+                        "maximum_sample_gap_seconds": hashrate_rollup_state["maximum_sample_gap_seconds"],
+                        "minimum_window_coverage_ratio": hashrate_rollup_state["minimum_window_coverage_ratio"],
+                        "data_classification": hashrate_rollup_state["data_classification"],
+                        "billing_status": hashrate_rollup_state["billing_status"],
+                    },
                 },
                 "startup_admission": {
                     "mode": "STARTUP_FAST_PATH_SEPARATE_FROM_ROLLING_DEGRADATION",

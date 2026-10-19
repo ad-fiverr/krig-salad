@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -657,6 +658,47 @@ class GuardStore:
             }
             for row in rows
         ]
+
+    def rollup_samples_for_track(
+        self,
+        track_id: str,
+        *,
+        since_elapsed_seconds: float,
+        maximum_records: int = 100_000,
+    ) -> dict[str, Any]:
+        """Return a bounded recent sample slice and whether older history was omitted."""
+        if not isinstance(track_id, str) or not track_id.strip():
+            raise ValueError("rollup sample query requires a track id")
+        if (
+            isinstance(since_elapsed_seconds, bool)
+            or not isinstance(since_elapsed_seconds, (int, float))
+            or not math.isfinite(float(since_elapsed_seconds))
+            or since_elapsed_seconds < 0
+        ):
+            raise ValueError("rollup sample floor must be finite and non-negative")
+        if isinstance(maximum_records, bool) or not isinstance(maximum_records, int) or not 1 <= maximum_records <= 100_000:
+            raise ValueError("rollup sample limit must be between 1 and 100000")
+        rows = self.connection.execute(
+            """SELECT * FROM observations WHERE track_id=? AND elapsed_seconds>=?
+               ORDER BY julianday(occurred_at_utc) DESC, event_id DESC LIMIT ?""",
+            (track_id, float(since_elapsed_seconds), maximum_records + 1),
+        ).fetchall()
+        truncated = len(rows) > maximum_records
+        selected = list(reversed(rows[:maximum_records]))
+        return {
+            "samples": [
+                {
+                    "event_id": row["event_id"],
+                    "elapsed_seconds": row["elapsed_seconds"],
+                    "hashrate_ths": row["hashrate_ths"],
+                    "hashrate_semantics": row["hashrate_semantics"],
+                    "hashrate_source": row["hashrate_source"],
+                    "occurred_at_utc": row["occurred_at_utc"],
+                }
+                for row in selected
+            ],
+            "truncated": truncated,
+        }
 
     def last_evaluation(self, track_id: str) -> dict[str, Any] | None:
         row = self.connection.execute(

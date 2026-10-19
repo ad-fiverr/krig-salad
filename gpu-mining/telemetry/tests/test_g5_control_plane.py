@@ -124,6 +124,56 @@ class G5ControlPlaneTests(unittest.TestCase):
         self.assertTrue(all(row["instances"] == [] for row in state["salad"]["groups"]))
         self.assertEqual(sorted(self.service.guard_policy.gpu_floors_ths.values()), [120, 120, 209, 350])
 
+    def test_dashboard_exposes_bounded_device_rollups_without_inventing_fleet_scope(self):
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        service = G5ControlPlaneService(G5Config(), clock=lambda: now.timestamp())
+        identity = normalize_gpu_identity(
+            "NVIDIA GeForce RTX 5090 Laptop GPU",
+            identity_source="synthetic_test_fixture",
+            identity_verified=True,
+        )
+        try:
+            for index in range(21):
+                timestamp = now - timedelta(seconds=600 - index * 30)
+                service.guard_store.ingest_observation({
+                    "event_id": f"rollup-dashboard-{index}",
+                    "fleet_id": "fleet-dashboard",
+                    "worker_id": "worker-dashboard",
+                    "allocation_id": "allocation-dashboard",
+                    "assignment_id": "assignment-dashboard",
+                    "run_id": "run-dashboard",
+                    "machine_id": "machine-dashboard",
+                    "instance_id": "instance-dashboard",
+                    "device_namespace": "fl4shminer_device",
+                    "device_id": "0",
+                    "occurred_at_utc": timestamp.isoformat().replace("+00:00", "Z"),
+                    "assignment_started_at_utc": (now - timedelta(minutes=20)).isoformat().replace("+00:00", "Z"),
+                    "start_anchor_verified": True,
+                    "hashrate_ths": 100.0,
+                    "hashrate_semantics": "fl4shminer_device_reported",
+                    "hashrate_source": "synthetic_test_fixture",
+                    "gpu_identity": identity,
+                    "provenance": {"source": "synthetic_test_fixture", "data_classification": "SYNTHETIC/UNVERIFIED"},
+                })
+
+            state = service.state()
+
+            self.assertEqual(state["monitor"]["hashrate_rollup_policy"]["windows_seconds"], {
+                "10m": 600, "30m": 1800, "60m": 3600, "24h": 86400,
+            })
+            device = next(item for item in state["monitor"]["devices"] if item["fleet_id"] == "fleet-dashboard")
+            rollups = device["hashrate_rollups"]
+            self.assertEqual(rollups["current"]["status"], "FRESH")
+            self.assertEqual(rollups["current"]["hashrate_ths"], 100.0)
+            self.assertEqual(rollups["windows"]["10m"]["mean_hashrate_ths"], 100.0)
+            self.assertEqual(rollups["windows"]["10m"]["status"], "COMPLETE")
+            self.assertEqual(state["monitor"]["fleet_hashrate_rollups"][0]["provider_scope_status"], "UNKNOWN")
+            self.assertIsNone(state["monitor"]["fleet_hashrate_rollups"][0]["windows"]["10m"]["fleet_time_weighted_average_hashrate_ths"])
+            self.assertFalse(state["actions"]["live_actions_enabled"])
+            self.assertFalse(rollups["actions_performed"])
+        finally:
+            service.close()
+
     def test_config_rejects_external_bind_prod_project_live_actions_and_bad_budget(self):
         for mutation in (
             {"host": "0.0.0.0"},

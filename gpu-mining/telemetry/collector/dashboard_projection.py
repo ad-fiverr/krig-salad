@@ -18,6 +18,7 @@ def project_device(
     binding: Mapping[str, Any] | None = None,
     action_context: Mapping[str, Any] | None = None,
     economic_summary: Mapping[str, Any] | None = None,
+    hashrate_rollups: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_track = normalize_v2_track(track)
     selected_evaluation = evaluation if isinstance(evaluation, Mapping) else normalized_track.get("last_evaluation")
@@ -52,6 +53,7 @@ def project_device(
     binding_record = dict(binding) if isinstance(binding, Mapping) else {}
     action_record = dict(action_context) if isinstance(action_context, Mapping) else {}
     economics = dict(economic_summary) if isinstance(economic_summary, Mapping) else {}
+    rollups = dict(hashrate_rollups) if isinstance(hashrate_rollups, Mapping) else {}
     return {
         "schema_version": "1.0",
         "track_id": normalized_track.get("track_id"),
@@ -75,6 +77,7 @@ def project_device(
         "gpu_floor_ths": evaluation.get("gpu_floor_ths"),
         "observed_window_hashrate_ths": evaluation.get("observed_window_hashrate_ths"),
         "sample_quality": dict(quality) if isinstance(quality, Mapping) else {},
+        "hashrate_rollups": rollups,
         "billing_status": "UNKNOWN",
         "profit_status": "UNKNOWN",
         "provider_observation": {
