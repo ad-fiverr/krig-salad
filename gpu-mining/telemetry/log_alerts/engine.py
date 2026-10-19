@@ -34,6 +34,7 @@ from .normalize import (
     normalize_log_entry,
 )
 from .startup_guard import StartupGuard
+from .startup_early_bridge import StartupEarlyBridge
 
 
 MAX_TELEGRAM_MESSAGE_CHARS = 8_192
@@ -56,6 +57,7 @@ class CycleResult:
     data_classification: str
     evidence: tuple[NormalizedLogEntry, ...]
     prepared_notifications: tuple[Mapping[str, Any], ...]
+    early_admission_events: tuple[Mapping[str, Any], ...] = ()
 
 
 def _parse_utc(value: str) -> datetime:
@@ -445,6 +447,7 @@ class LogAlertEnricher:
         secret_provider: Any = None,
         allowed_projects: Iterable[str] | None = None,
         identity_resolver: Callable[[NormalizedLogEntry], NormalizedLogEntry] | None = None,
+        startup_early_bridge: StartupEarlyBridge | None = None,
     ) -> None:
         if type(ledger) is not SQLiteAlertLedger:
             raise TypeError("a local SQLiteAlertLedger is required")
@@ -458,8 +461,11 @@ class LogAlertEnricher:
             raise TypeError("identity resolver must be callable")
         if identity_resolver is not None and type(transport) is not LiveSaladReadTransport:
             raise TypeError("provider identity fallback requires the live Salad adapter")
+        if startup_early_bridge is not None and type(startup_early_bridge) is not StartupEarlyBridge:
+            raise TypeError("startup early bridge must use the exact read-only bridge")
         self.allowed_projects = projects
         self.identity_resolver = identity_resolver
+        self.startup_early_bridge = startup_early_bridge or StartupEarlyBridge()
         self.transport = transport
         self.ledger = ledger
         if type(transport) is FixtureLogQueryTransport:
@@ -627,6 +633,14 @@ class LogAlertEnricher:
             ordered,
             maximum_seconds=self.limits.correlation_seconds,
         )
+        # Early evidence is a read-only projection. It is deliberately kept
+        # separate from alert candidates, notification delivery and ledger
+        # state. Provider resource labels alone cannot verify a GPU binding.
+        early_admission_events = tuple(
+            event.to_dict()
+            for entry in correlated
+            if (event := self.startup_early_bridge.inspect(entry)) is not None
+        )
         candidates: list[NormalizedLogEntry] = []
         for entry in correlated:
             alert = entry.alert
@@ -688,6 +702,7 @@ class LogAlertEnricher:
             data_classification=classification,
             evidence=ordered,
             prepared_notifications=tuple(prepared),
+            early_admission_events=early_admission_events,
         )
 
     def _scope_for_query(self, query: str) -> dict[str, str]:

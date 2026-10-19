@@ -892,6 +892,30 @@ class CentralFleetWatcherTests(unittest.TestCase):
             finally:
                 watcher.close()
 
+    def test_startup_fast_path_summary_is_separate_from_alerts_and_provider_identity(self):
+        item = _log_item(
+            ORGANIZATIONS[0], GROUPS[0], _instance_id(0, 0), "2026-10-13T12:00:05Z",
+            "GPU=NVIDIA GeForce RTX 4070 Ti Laptop GPU Pearl autotune hashrate = 143.41 TH/s",
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            watcher, _exchanges, telegram_calls, _provider = self.make_watcher(
+                temp, {ORGANIZATIONS[0]: [item]}, {},
+            )
+            try:
+                results = watcher.run_cycle(end_time_utc="2026-10-13T12:01:00Z")
+                result = next(row for row in results if row.organization_name == ORGANIZATIONS[0])
+                self.assertEqual(result.early_signal_count, 1)
+                self.assertEqual(result.early_unknown_count, 1)
+                self.assertEqual(result.early_under_floor_count, 0)
+                self.assertEqual(result.alerts_prepared, 0)
+                # The existing provider-identity resolver still performs its
+                # normal single scoped lookup for this instance. The startup
+                # projection adds no lookup or alert of its own.
+                self.assertEqual(result.group_lookups, 1)
+                self.assertEqual(telegram_calls, [])
+            finally:
+                watcher.close()
+
     def test_one_watcher_accepts_100_organization_targets_without_spawning_or_connecting(self):
         targets = [FleetTarget(f"fleet-{index:03d}", PROJECT) for index in range(100)]
         secret_provider = SyntheticSecretProvider()

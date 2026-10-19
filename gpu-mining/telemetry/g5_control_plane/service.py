@@ -18,10 +18,17 @@ from collector.auto_reallocation_gate import AutoReallocationGate, AutoReallocat
 from collector.continuous import ContinuousMonitor
 from collector.dashboard_projection import project_device, project_fleet
 from collector.device_guard import inspect_monitor_source, load_monitor_events
+from collector.fl4sh_early_autotune import (
+    EarlyEvaluationContext,
+    EarlyObservation,
+    EarlyPolicy,
+)
 from collector.guard_store import GuardStore
 from collector.guards import HashGuardPolicy
 from collector.reallocation_controller import ReallocationController, ReallocationPolicy
 from collector.salad_action_policy import SaladAction, SaladActionPolicy
+from collector.startup_admission import StartupAdmissionEngine
+from collector.startup_latency import polling_comparison, reaction_exposure_comparison
 from collector.v2_adapters import normalize_v2_evaluation
 
 from .config import G5Config, GROUPS
@@ -121,6 +128,8 @@ class G5ControlPlaneService:
         self._bindings: dict[str, dict[str, Any]] = {}
         self._fleet_records: list[dict[str, Any]] = []
         self._controller_decisions: dict[str, dict[str, Any]] = {}
+        self.startup_admission_engine = StartupAdmissionEngine()
+        self._last_startup_preview: dict[str, Any] | None = None
         self.reallocation_controller = ReallocationController(
             ReallocationPolicy(
                 allowed_targets=(),
@@ -533,6 +542,126 @@ class G5ControlPlaneService:
             )
             return dict(result)
 
+    def preview_startup_admission(
+        self,
+        observation: EarlyObservation,
+        context: EarlyEvaluationContext | None = None,
+        *,
+        source_evidence: Mapping[str, Any] | None = None,
+        policy_evidence: Mapping[str, Any] | None = None,
+        generation_evidence: Mapping[str, Any] | None = None,
+        provider_binding: Mapping[str, Any] | None = None,
+        provider_revalidation: Mapping[str, Any] | None = None,
+        budget_evidence: Mapping[str, Any] | None = None,
+        allocation_history: Mapping[str, Any] | None = None,
+        fleet_id: str = "unknown",
+        now_utc: str | None = None,
+    ) -> dict[str, Any]:
+        """Evaluate the separate startup fast path and preview the closed G5 gate.
+
+        This method is in-memory only: it does not write audit/ledger/cursor
+        state, submit an action, or enable the existing simulation control.
+        """
+        if type(observation) is not EarlyObservation:
+            raise TypeError("startup observation must use the approved exact evidence type")
+        if context is not None and type(context) is not EarlyEvaluationContext:
+            raise TypeError("startup context must use the approved exact evidence type")
+        timestamp = now_utc or _now_utc()
+        parsed_now = datetime.fromisoformat(timestamp[:-1] + "+00:00" if timestamp.endswith("Z") else timestamp)
+        if parsed_now.tzinfo is None or parsed_now.utcoffset() is None:
+            raise ValueError("startup preview time must include a timezone")
+        floors = _early_gpu_floor_registry(self.config.gpu_floors_ths)
+        policy = EarlyPolicy(
+            self.monitor.policy_hash,
+            floors,
+            margin_ths=0.0,
+        )
+        active = context or EarlyEvaluationContext()
+        policy_conflict = active.policy is not None and (
+            type(active.policy) is not EarlyPolicy
+            or active.policy.policy_hash != policy.policy_hash
+            or dict(active.policy.floors_ths) != dict(policy.floors_ths)
+        )
+        active = EarlyEvaluationContext(
+            policy=policy,
+            bindings=active.bindings,
+            association_records=active.association_records,
+            calibrations=active.calibrations,
+            now_utc=parsed_now,
+            allow_synthetic_calibration_for_test=active.allow_synthetic_calibration_for_test,
+            allow_synthetic_binding_evidence_for_test=active.allow_synthetic_binding_evidence_for_test,
+        )
+        decision = self.startup_admission_engine.evaluate(
+            observation,
+            active,
+            contradictory_evidence=policy_conflict,
+        )
+        gate_review: dict[str, Any] | None = None
+        if decision.state == "EARLY_UNDER_FLOOR":
+            # The existing gate is deliberately instantiated closed for this
+            # preview. Its disabled simulation switch guarantees a blocker
+            # before reservation; it cannot write the durable action ledger.
+            gate = AutoReallocationGate(
+                self.action_ledger,
+                policy_hash=self.monitor.policy_hash,
+                gpu_floors_ths=floors,
+                limits=AutoReallocationLimits(),
+                hard_budget_cap_usd=min(float(self.config.hard_budget_usd), 30.0),
+                maximum_evidence_age_seconds=(
+                    self.config.maximum_sample_gap_seconds
+                    + self.config.reevaluation_interval_seconds * self.config.consecutive_bad_windows
+                ),
+                simulation_enabled=False,
+            )
+            gate_review = gate.assess_early(
+                decision.to_dict(),
+                source_evidence=source_evidence or {},
+                policy_evidence=policy_evidence or {},
+                generation_evidence=generation_evidence or {},
+                provider_binding=provider_binding or {},
+                provider_revalidation=provider_revalidation or {},
+                budget_evidence=budget_evidence or {},
+                allocation_history=allocation_history or {},
+                fleet_id=fleet_id,
+                now_utc=timestamp,
+                kill_switch_engaged=self._kill_switch_engaged,
+                auto_armed=False,
+                live_actions_enabled=False,
+                g5_authorized=False,
+            )
+        safe_gate = self._safe_startup_gate_summary(gate_review)
+        summary = {
+            "mode": "STARTUP_FAST_PATH",
+            "state": decision.state,
+            "reason": decision.reason if re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", decision.reason) else "UNKNOWN",
+            "cause": "LOW_AUTOTUNE" if decision.state == "EARLY_UNDER_FLOOR" else "UNKNOWN",
+            "signal_type": decision.signal_type,
+            "device_index": decision.device_index,
+            "gpu_key": decision.gpu_key,
+            "estimate_ths": decision.estimate_ths,
+            "predicted_lower_ths": decision.predicted_lower_ths,
+            "predicted_upper_ths": decision.predicted_upper_ths,
+            "floor_ths": decision.floor_ths,
+            "policy_hash": self.monitor.policy_hash,
+            "action_gate": safe_gate,
+            "actions_performed": False,
+            "request_submitted": False,
+            "live_action_eligible": False,
+        }
+        with self._lock:
+            self._last_startup_preview = dict(summary)
+        return summary
+
+    @staticmethod
+    def _safe_startup_gate_summary(result: Mapping[str, Any] | None) -> dict[str, Any]:
+        if result is None:
+            return {"status": "NOT_EVALUATED", "blockers": [], "actions_performed": False}
+        status = result.get("status")
+        status = status if status in {"BLOCKED", "CANDIDATE"} else "UNKNOWN"
+        blockers = result.get("blockers", [])
+        safe_blockers = sorted({item for item in blockers if isinstance(item, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", item)}) if isinstance(blockers, list) else []
+        return {"status": status, "blockers": safe_blockers, "actions_performed": False}
+
     def register_binding_evidence(self, track_id: str, result: Mapping[str, Any]) -> None:
         if not isinstance(track_id, str) or not track_id or not isinstance(result, Mapping):
             raise ValueError("binding evidence key and result are required")
@@ -879,6 +1008,27 @@ class G5ControlPlaneService:
                         },
                     },
                     "devices": devices,
+                },
+                "startup_admission": {
+                    "mode": "STARTUP_FAST_PATH_SEPARATE_FROM_ROLLING_DEGRADATION",
+                    "status": self._last_startup_preview.get("state", "NO_OBSERVATION")
+                    if self._last_startup_preview else "NO_OBSERVATION",
+                    "production_calibration_count": 0,
+                    "unmapped_or_uncalibrated_gpu_state": "EARLY_UNKNOWN",
+                    "rolling_guard_unchanged": True,
+                    "last_preview": dict(self._last_startup_preview) if self._last_startup_preview else None,
+                    "actions_performed": False,
+                    "request_submitted": False,
+                    "live_action_eligible": False,
+                },
+                "latency_model": {
+                    "polling_scenarios": polling_comparison((30, 15), organization_count=3),
+                    "reaction_exposure_scenarios": reaction_exposure_comparison(),
+                    "current_default_poll_seconds": 30,
+                    "polling_default_changed": False,
+                    "request_amplification_source": "watcher subqueries per organization cycle",
+                    "actual_request_rate_status": "UNKNOWN_UNTIL_WATCHER_MEASUREMENT",
+                    "cost_classification": "ESTIMATED_OPERATOR_RATE_NOT_VERIFIED_BILLING",
                 },
                 "reallocation_reviews": {
                     "mode": "DRY_RUN",

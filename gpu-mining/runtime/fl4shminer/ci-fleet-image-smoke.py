@@ -41,6 +41,7 @@ LOG_ALERT_MODULES = (
     "live_controller.py",
     "live_transport.py",
     "normalize.py",
+    "startup_early_bridge.py",
     "startup_guard.py",
 )
 
@@ -58,7 +59,13 @@ RUNTIME_INPUTS = (
 WATCHER_INPUTS = tuple(
     f"gpu-mining/telemetry/log_alerts/{name}" for name in LOG_ALERT_MODULES
 ) + (
+    "gpu-mining/telemetry/collector/fl4sh_early_autotune.py",
+    "gpu-mining/telemetry/collector/fl4shminer.py",
     "gpu-mining/telemetry/collector/g4a_salad_get.py",
+    "gpu-mining/telemetry/collector/gpu_identity.py",
+    "gpu-mining/telemetry/collector/models.py",
+    "gpu-mining/telemetry/collector/startup_admission.py",
+    "gpu-mining/telemetry/collector/work.py",
     "gpu-mining/g4c-live/live_secret_boundary.py",
 )
 
@@ -81,6 +88,12 @@ WORKFLOW_TRIGGERS = frozenset(
         "gpu-mining/runtime/fl4shminer/**",
         "gpu-mining/telemetry/log_alerts/**",
         "gpu-mining/telemetry/collector/g4a_salad_get.py",
+        "gpu-mining/telemetry/collector/fl4sh_early_autotune.py",
+        "gpu-mining/telemetry/collector/fl4shminer.py",
+        "gpu-mining/telemetry/collector/gpu_identity.py",
+        "gpu-mining/telemetry/collector/models.py",
+        "gpu-mining/telemetry/collector/startup_admission.py",
+        "gpu-mining/telemetry/collector/work.py",
         "gpu-mining/g4c-live/live_secret_boundary.py",
         ".github/workflows/build-fl4shminer.yml",
         ".github/fl4sh-publish-targets.json",
@@ -331,6 +344,13 @@ def check_workflow(root: Path) -> None:
         "gpu-mining/runtime/fl4shminer/README.md": True,
         "gpu-mining/telemetry/log_alerts/fleet_watcher.py": True,
         "gpu-mining/telemetry/collector/g4a_salad_get.py": True,
+        "gpu-mining/telemetry/collector/fl4sh_early_autotune.py": True,
+        "gpu-mining/telemetry/collector/fl4shminer.py": True,
+        "gpu-mining/telemetry/collector/gpu_identity.py": True,
+        "gpu-mining/telemetry/collector/models.py": True,
+        "gpu-mining/telemetry/collector/startup_admission.py": True,
+        "gpu-mining/telemetry/collector/work.py": True,
+        "gpu-mining/telemetry/collector/startup_latency.py": False,
         "gpu-mining/g4c-live/live_secret_boundary.py": True,
         ".github/workflows/build-fl4shminer.yml": True,
         ".github/fl4sh-publish-targets.json": True,
@@ -400,8 +420,17 @@ def check_image_tree(root: Path) -> None:
     if {entry.name for entry in telemetry.iterdir()} != {"log_alerts", "collector"}:
         fail("image contains telemetry outside the reviewed watcher package")
     collector = telemetry / "collector"
-    if {entry.name for entry in collector.iterdir()} != {"g4a_salad_get.py"}:
-        fail("image collector directory contains files beyond the exact G4A validator")
+    expected_collector = {
+        "fl4sh_early_autotune.py",
+        "fl4shminer.py",
+        "g4a_salad_get.py",
+        "gpu_identity.py",
+        "models.py",
+        "startup_admission.py",
+        "work.py",
+    }
+    if {entry.name for entry in collector.iterdir()} != expected_collector:
+        fail("image collector directory differs from the exact startup watcher import closure")
     g4c = root / "gpu-mining/g4c-live"
     if {entry.name for entry in g4c.iterdir()} != {"live_secret_boundary.py"}:
         fail("image G4C directory contains files beyond the approved secret boundary")

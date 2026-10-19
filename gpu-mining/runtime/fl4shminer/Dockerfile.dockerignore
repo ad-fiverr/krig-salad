@@ -28,8 +28,15 @@
 !gpu-mining/telemetry/log_alerts/live_controller.py
 !gpu-mining/telemetry/log_alerts/live_transport.py
 !gpu-mining/telemetry/log_alerts/normalize.py
+!gpu-mining/telemetry/log_alerts/startup_early_bridge.py
 !gpu-mining/telemetry/log_alerts/startup_guard.py
 !gpu-mining/telemetry/collector/
 !gpu-mining/telemetry/collector/g4a_salad_get.py
+!gpu-mining/telemetry/collector/fl4sh_early_autotune.py
+!gpu-mining/telemetry/collector/fl4shminer.py
+!gpu-mining/telemetry/collector/gpu_identity.py
+!gpu-mining/telemetry/collector/models.py
+!gpu-mining/telemetry/collector/startup_admission.py
+!gpu-mining/telemetry/collector/work.py
 !gpu-mining/g4c-live/
 !gpu-mining/g4c-live/live_secret_boundary.py

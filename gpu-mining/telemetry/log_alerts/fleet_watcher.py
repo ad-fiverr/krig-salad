@@ -45,6 +45,10 @@ class OrganizationCycleResult:
     identity_lookup_http_status: int | None = None
     delivery_states: tuple[str, ...] = ()
     query_failure_code: str | None = None
+    query_subqueries_seen: int = 0
+    early_signal_count: int = 0
+    early_unknown_count: int = 0
+    early_under_floor_count: int = 0
 
 
 class CentralFleetWatcher:
@@ -195,6 +199,10 @@ class CentralFleetWatcher:
                 identity_lookup_status=identity_lookup_status,
                 identity_lookup_http_status=lookup.access_denied_status,
                 delivery_states=delivery_states,
+                query_subqueries_seen=cycle.pages_seen,
+                early_signal_count=len(cycle.early_admission_events),
+                early_unknown_count=sum(item.get("state") == "EARLY_UNKNOWN" for item in cycle.early_admission_events),
+                early_under_floor_count=sum(item.get("state") == "EARLY_UNDER_FLOOR" for item in cycle.early_admission_events),
             )
         except Exception as exc:
             status = _safe_failure_state(exc)

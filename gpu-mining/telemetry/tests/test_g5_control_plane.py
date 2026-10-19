@@ -100,6 +100,26 @@ class G5ControlPlaneTests(unittest.TestCase):
         self.assertFalse(state["auto_reallocation_gate"]["simulation_enabled"])
         self.assertFalse(state["auto_reallocation_gate"]["live_action_eligible"])
         self.assertFalse(state["auto_reallocation_gate"]["dossier_created"])
+        self.assertEqual(state["startup_admission"]["mode"], "STARTUP_FAST_PATH_SEPARATE_FROM_ROLLING_DEGRADATION")
+        self.assertEqual(state["startup_admission"]["status"], "NO_OBSERVATION")
+        self.assertEqual(state["startup_admission"]["production_calibration_count"], 0)
+        self.assertEqual(state["startup_admission"]["unmapped_or_uncalibrated_gpu_state"], "EARLY_UNKNOWN")
+        self.assertTrue(state["startup_admission"]["rolling_guard_unchanged"])
+        self.assertFalse(state["startup_admission"]["actions_performed"])
+        self.assertFalse(state["startup_admission"]["request_submitted"])
+        self.assertFalse(state["startup_admission"]["live_action_eligible"])
+        self.assertEqual(state["latency_model"]["current_default_poll_seconds"], 30)
+        self.assertFalse(state["latency_model"]["polling_default_changed"])
+        self.assertEqual(state["latency_model"]["actual_request_rate_status"], "UNKNOWN_UNTIL_WATCHER_MEASUREMENT")
+        self.assertEqual(state["latency_model"]["cost_classification"], "ESTIMATED_OPERATOR_RATE_NOT_VERIFIED_BILLING")
+        self.assertEqual(
+            [row["poll_interval_seconds"] for row in state["latency_model"]["polling_scenarios"]],
+            [30, 15],
+        )
+        self.assertEqual(
+            state["latency_model"]["reaction_exposure_scenarios"]["180_seconds"]["estimated_exposure_usd"],
+            4.1283,
+        )
         self.assertEqual([row["container_group"] for row in state["salad"]["groups"]], list(GROUPS))
         self.assertTrue(all(row["instances"] == [] for row in state["salad"]["groups"]))
         self.assertEqual(sorted(self.service.guard_policy.gpu_floors_ths.values()), [120, 120, 209, 350])

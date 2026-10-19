@@ -653,6 +653,30 @@ class LogAlertNormalizerTests(unittest.TestCase):
 
 
 class LogAlertEngineTests(unittest.TestCase):
+    def test_startup_autotune_is_projected_as_unknown_without_alert_or_action(self):
+        raw_line = (
+            "GPU=NVIDIA GeForce RTX 4070 Ti Laptop GPU Pearl autotune hashrate = 143.41 TH/s"
+        )
+        enricher, _transport, ledger = make_enricher([
+            log_entry(text_log=raw_line, log_id="startup-autotune-synthetic"),
+        ])
+        try:
+            result = enricher.run_once(end_time_utc=END_TIME)
+            self.assertEqual(result.prepared_count, 0)
+            self.assertEqual(result.recognized_alerts, 0)
+            self.assertEqual(ledger.alert_count(), 0)
+            self.assertEqual(len(result.early_admission_events), 1)
+            event = result.early_admission_events[0]
+            self.assertEqual(event["state"], "EARLY_UNKNOWN")
+            self.assertEqual(event["cause"], "UNKNOWN")
+            self.assertEqual(event["gpu_key"], "RTX_4070_TI_LAPTOP")
+            self.assertEqual(event["estimate_ths"], 143.41)
+            self.assertFalse(event["actions_performed"])
+            self.assertFalse(event["request_submitted"])
+            self.assertNotIn(raw_line, str(event))
+        finally:
+            ledger.close()
+
     def test_exact_pool_timeout_is_normalized_and_raw_line_not_in_telegram_text(self):
         raw_line = (
             "2026/10/12 22:04:33 Pool connection failed: mining.authorize response timeout; "
