@@ -22,7 +22,15 @@ sys.path.insert(0, str(TELEMETRY_ROOT))
 sys.path.insert(0, str(G4C_ROOT))
 sys.path.insert(0, str(G4C_ROOT / "tests"))
 
-from g5_control_plane.config import FLOORS, G5Config, G5ConfigError, GROUPS, load_config
+from g5_control_plane.config import (
+    FLOORS,
+    PEARL_STARTUP_FLOORS,
+    PEARL_STARTUP_FLOORS_ENVIRONMENT,
+    G5Config,
+    G5ConfigError,
+    GROUPS,
+    load_config,
+)
 from g5_control_plane.app import LIVE_GET_TERMINAL_CONFIRMATION, build_service, main, run_manual_live_get
 from g5_control_plane.server import create_server
 from g5_control_plane.service import G5ControlPlaneService
@@ -422,11 +430,178 @@ class G5ControlPlaneTests(unittest.TestCase):
         config_path = TELEMETRY_ROOT / "g5-live-config.example.json"
         config = load_config(config_path)
         self.assertEqual(dict(config.gpu_floors_ths), FLOORS)
+        self.assertEqual(dict(config.pearl_startup_floors_ths), {key: float(value) for key, value in PEARL_STARTUP_FLOORS.items()})
+        self.assertEqual(
+            config.source_for("pearl_startup_floors_ths.RTX_5080_LAPTOP"),
+            "DEFAULTS",
+        )
+        self.assertEqual(len(config.pearl_startup_floor_catalog_hash), 64)
         self.assertFalse(config.live_get_enabled)
         self.assertFalse(config.live_actions_enabled)
         self.assertFalse(config.live_spend_authorized)
         self.assertFalse(config.auto_reallocate)
         self.assertTrue(config.kill_switch_engaged)
+
+    def test_pearl_startup_catalog_accepts_exact_normalized_keys_and_tracks_sources(self):
+        config_path = TELEMETRY_ROOT / "g5-live-config.example.json"
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+        data["pearl_startup_floors_ths"] = {
+            "RTX_4070_TI": 101,
+            "RTX_4070_TI_LAPTOP": 102,
+            "RTX_5080": 103,
+            "RTX_5080_LAPTOP": 104,
+            "RTX_5090": 105,
+            "RTX_5090_LAPTOP": 106,
+            "RTX_5070_TI_LAPTOP": 107,
+            "A100_SXM4_80GB": 108,
+            "L40S": 109,
+            "H100_SXM": 110,
+            "GTX_4070_TI": 111,
+        }
+        data["gpu_floors_ths"] = FLOORS
+        with tempfile.TemporaryDirectory(prefix="g5-pearl-catalog-") as temp:
+            path = Path(temp) / "config.json"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            config = load_config(path, environ={
+                PEARL_STARTUP_FLOORS_ENVIRONMENT: json.dumps({
+                    "RTX_5080_DESKTOP": 208,
+                    "RTX_5070_TI": 99,
+                }),
+            })
+
+        self.assertEqual(config.pearl_startup_floors_ths["RTX_4070_TI"], 101)
+        self.assertEqual(config.pearl_startup_floors_ths["RTX_4070_TI_LAPTOP"], 102)
+        self.assertEqual(config.pearl_startup_floors_ths["RTX_5080"], 103)
+        self.assertEqual(config.pearl_startup_floors_ths["RTX_5080_LAPTOP"], 104)
+        self.assertEqual(config.pearl_startup_floors_ths["RTX_5090"], 105)
+        self.assertEqual(config.pearl_startup_floors_ths["RTX_5090_LAPTOP"], 106)
+        self.assertEqual(config.pearl_startup_floors_ths["RTX_5070_TI_LAPTOP"], 107)
+        self.assertEqual(config.pearl_startup_floors_ths["RTX_5080_DESKTOP"], 208)
+        self.assertEqual(config.pearl_startup_floors_ths["RTX_5070_TI"], 99)
+        self.assertEqual(config.pearl_startup_floors_ths["A100_SXM4_80GB"], 108)
+        self.assertEqual(config.pearl_startup_floors_ths["L40S"], 109)
+        self.assertEqual(config.pearl_startup_floors_ths["H100_SXM"], 110)
+        self.assertEqual(config.pearl_startup_floors_ths["GTX_4070_TI"], 111)
+        self.assertEqual(config.source_for("pearl_startup_floors_ths.RTX_5080_LAPTOP"), "JSON")
+        self.assertEqual(config.source_for("pearl_startup_floors_ths.RTX_5070_TI"), "ENV")
+        self.assertEqual(config.source_for("pearl_startup_floors_ths.RTX_5090_DESKTOP"), "DEFAULTS")
+        self.assertEqual(config.source_for("pearl_startup_floors_ths.A100_SXM4_80GB"), "JSON")
+        self.assertEqual(dict(config.gpu_floors_ths), {key: float(value) for key, value in FLOORS.items()})
+        self.assertEqual(len(config.pearl_startup_floor_catalog_hash), 64)
+
+    def test_legacy_gpu_floor_json_and_environment_overrides_remain_effective_for_pearl(self):
+        config_path = TELEMETRY_ROOT / "g5-live-config.example.json"
+        base = json.loads(config_path.read_text(encoding="utf-8"))
+        legacy_key = "RTX 5080|laptop|salad_json_log_gpu_class_name"
+
+        json_config = json.loads(json.dumps(base))
+        json_config["gpu_floors_ths"][legacy_key] = 110
+        with tempfile.TemporaryDirectory(prefix="g5-legacy-pearl-json-") as temp:
+            path = Path(temp) / "config.json"
+            path.write_text(json.dumps(json_config), encoding="utf-8")
+            loaded_json = load_config(path, environ={})
+
+            explicit_pearl_config = json.loads(json.dumps(json_config))
+            explicit_pearl_config["pearl_startup_floors_ths"] = {"RTX_5080_LAPTOP": 105}
+            explicit_path = Path(temp) / "explicit.json"
+            explicit_path.write_text(json.dumps(explicit_pearl_config), encoding="utf-8")
+            specific_override = load_config(explicit_path, environ={})
+
+        env_config = load_config(None, environ={
+            "SALAD_G5_GPU_FLOOR_RTX_5080_LAPTOP_THS": "115",
+        })
+        direct_config = G5Config(gpu_floors_ths={**FLOORS, legacy_key: 125})
+
+        self.assertEqual(loaded_json.gpu_floors_ths[legacy_key], 110)
+        self.assertEqual(loaded_json.pearl_startup_floors_ths["RTX_5080_LAPTOP"], 110)
+        self.assertEqual(loaded_json.source_for("pearl_startup_floors_ths.RTX_5080_LAPTOP"), "LEGACY_JSON")
+        self.assertEqual(env_config.pearl_startup_floors_ths["RTX_5080_LAPTOP"], 115)
+        self.assertEqual(env_config.source_for("pearl_startup_floors_ths.RTX_5080_LAPTOP"), "LEGACY_ENV")
+        self.assertEqual(direct_config.pearl_startup_floors_ths["RTX_5080_LAPTOP"], 125)
+        self.assertEqual(direct_config.source_for("pearl_startup_floors_ths.RTX_5080_LAPTOP"), "PYTHON")
+        self.assertEqual(specific_override.pearl_startup_floors_ths["RTX_5080_LAPTOP"], 105)
+        self.assertEqual(specific_override.source_for("pearl_startup_floors_ths.RTX_5080_LAPTOP"), "JSON")
+
+    def test_pearl_startup_catalog_rejects_ambiguous_invalid_and_conflicting_entries(self):
+        config_path = TELEMETRY_ROOT / "g5-live-config.example.json"
+        base = json.loads(config_path.read_text(encoding="utf-8"))
+        for key, floor in (
+            ("rtx_5080_laptop", 110),
+            ("RTX_4070_TI_LAPTOP_LAPTOP", 110),
+            ("RTX_4070_TI_DESKTOP_LAPTOP", 110),
+            ("RTX_4070_TI_NOTEBOOK", 110),
+            ("RTX_MODEL", 110),
+            ("RTX_4070_TI", True),
+            ("RTX_4070_TI", "110"),
+            ("RTX_4070_TI", 0),
+            ("RTX_4070_TI", -1),
+            ("RTX_4070_TI", float("inf")),
+            ("RTX_4070_TI", 10001),
+            ("NVIDIA_A100", 110),
+            ("GPU_L40S", 110),
+            ("A100_NOTEBOOK", 110),
+            ("A100_LAPTOP_DESKTOP", 110),
+            ("UNKNOWN_GPU_1", 110),
+        ):
+            with self.subTest(key=key, floor=floor):
+                data = json.loads(json.dumps(base))
+                data["pearl_startup_floors_ths"] = {key: floor}
+                with tempfile.TemporaryDirectory(prefix="g5-invalid-pearl-") as temp:
+                    path = Path(temp) / "config.json"
+                    path.write_text(json.dumps(data), encoding="utf-8")
+                    with self.assertRaises(G5ConfigError):
+                        load_config(path, environ={})
+
+        with tempfile.TemporaryDirectory(prefix="g5-pearl-source-conflict-") as temp:
+            path = Path(temp) / "config.json"
+            data = json.loads(json.dumps(base))
+            data["pearl_startup_floors_ths"] = {"RTX_5080_LAPTOP": 111}
+            path.write_text(json.dumps(data), encoding="utf-8")
+            with self.assertRaises(G5ConfigError):
+                load_config(path, environ={
+                    PEARL_STARTUP_FLOORS_ENVIRONMENT: '{"RTX_5080_LAPTOP":112}',
+                })
+
+        with tempfile.TemporaryDirectory(prefix="g5-pearl-duplicate-json-") as temp:
+            path = Path(temp) / "config.json"
+            path.write_text(
+                '{"pearl_startup_floors_ths":{"RTX_4070_TI":100,"RTX_4070_TI":101}}',
+                encoding="utf-8",
+            )
+            with self.assertRaises(G5ConfigError):
+                load_config(path, environ={})
+
+        for env_value in (
+            "not-json",
+            "[]",
+            '{"RTX_4070_TI":NaN}',
+            '{"RTX_4070_TI":100,"RTX_4070_TI":101}',
+            " " * 16_385,
+        ):
+            with self.subTest(env_value_kind=env_value[:20]):
+                with self.assertRaises(G5ConfigError):
+                    load_config(None, environ={PEARL_STARTUP_FLOORS_ENVIRONMENT: env_value})
+
+    def test_pearl_startup_catalog_hash_changes_with_any_floor_without_changing_monitor_contract(self):
+        first = G5Config()
+        changed = G5Config(pearl_startup_floors_ths={**dict(PEARL_STARTUP_FLOORS), "RTX_5070_TI": 99})
+        self.assertNotEqual(first.pearl_startup_floor_catalog_hash, changed.pearl_startup_floor_catalog_hash)
+        first_service = G5ControlPlaneService(first)
+        changed_service = G5ControlPlaneService(changed)
+        try:
+            self.assertEqual(first_service.monitor.policy_hash, changed_service.monitor.policy_hash)
+            self.assertEqual(first_service.guard_policy.gpu_floors_ths, changed_service.guard_policy.gpu_floors_ths)
+            first_startup = first_service.state()["startup_admission"]
+            changed_startup = changed_service.state()["startup_admission"]
+            self.assertNotEqual(first_startup["floor_catalog_hash"], changed_startup["floor_catalog_hash"])
+            changed_entries = {item["identity_key"]: item for item in changed_startup["floor_catalog"]}
+            self.assertEqual(
+                changed_entries["RTX_5070_TI"],
+                {"identity_key": "RTX_5070_TI", "floor_ths": 99.0, "source": "PYTHON"},
+            )
+        finally:
+            first_service.close()
+            changed_service.close()
 
     def test_operational_config_precedence_and_independent_gpu_form_factors(self):
         default_config = load_config(None, environ={})

@@ -575,7 +575,9 @@ class G5ControlPlaneService:
         parsed_now = datetime.fromisoformat(timestamp[:-1] + "+00:00" if timestamp.endswith("Z") else timestamp)
         if parsed_now.tzinfo is None or parsed_now.utcoffset() is None:
             raise ValueError("startup preview time must include a timezone")
-        floors = _early_gpu_floor_registry(self.config.gpu_floors_ths)
+        # Startup Pearl floors use their own exact canonical registry. The
+        # continuous Device hashRate guard retains gpu_floors_ths unchanged.
+        floors = dict(self.config.pearl_startup_floors_ths)
         policy = EarlyPolicy(
             self.monitor.policy_hash,
             floors,
@@ -656,6 +658,12 @@ class G5ControlPlaneService:
             "predicted_lower_ths": decision.predicted_lower_ths,
             "predicted_upper_ths": decision.predicted_upper_ths,
             "floor_ths": decision.floor_ths,
+            "floor_source": (
+                self.config.source_for(f"pearl_startup_floors_ths.{decision.gpu_key}")
+                if decision.gpu_key in self.config.pearl_startup_floors_ths
+                else "NO_FLOOR_CONFIGURED"
+            ),
+            "floor_catalog_hash": self.config.pearl_startup_floor_catalog_hash,
             "policy_hash": self.monitor.policy_hash,
             "action_gate": safe_gate,
             "recovery_policy": recovery.to_dict(),
@@ -1111,6 +1119,15 @@ class G5ControlPlaneService:
                     "unmapped_or_uncalibrated_gpu_state": "EARLY_UNKNOWN",
                     "rolling_guard_unchanged": True,
                     "last_preview": dict(self._last_startup_preview) if self._last_startup_preview else None,
+                    "floor_catalog_hash": self.config.pearl_startup_floor_catalog_hash,
+                    "floor_catalog": [
+                        {
+                            "identity_key": key,
+                            "floor_ths": value,
+                            "source": self.config.source_for(f"pearl_startup_floors_ths.{key}"),
+                        }
+                        for key, value in sorted(self.config.pearl_startup_floors_ths.items())
+                    ],
                     "actions_performed": False,
                     "request_submitted": False,
                     "live_action_eligible": False,

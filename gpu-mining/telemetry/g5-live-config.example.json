@@ -24,6 +24,7 @@
     "RTX 5090|desktop|salad_json_log_gpu_class_name": 350,
     "RTX 5080|desktop|salad_json_log_gpu_class_name": 209
   },
+  "pearl_startup_floors_ths": {},
   "salad_hourly_price_usd_estimate": null,
   "monitor": {
     "warmup_seconds": 90,

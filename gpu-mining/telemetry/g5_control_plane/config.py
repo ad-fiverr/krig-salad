@@ -8,6 +8,7 @@ there; this build remains offline and local-only.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import json
 import math
 import os
@@ -25,6 +26,26 @@ FLOORS = {
     "RTX 5080|laptop|salad_json_log_gpu_class_name": 120,
     "RTX 5090|desktop|salad_json_log_gpu_class_name": 350,
     "RTX 5080|desktop|salad_json_log_gpu_class_name": 209,
+}
+# These four exact identities retain the historical, explicitly accepted G5
+# floors. New startup identities require an explicit JSON or environment entry.
+PEARL_STARTUP_FLOORS = {
+    "RTX_5090_LAPTOP": 120,
+    "RTX_5080_LAPTOP": 120,
+    "RTX_5090_DESKTOP": 350,
+    "RTX_5080_DESKTOP": 209,
+}
+PEARL_STARTUP_FLOORS_ENVIRONMENT = "SALAD_G5_PEARL_STARTUP_FLOORS_JSON"
+_PEARL_GPU_KEY_RE = re.compile(r"[A-Z0-9]+(?:_[A-Z0-9]+)*\Z")
+_FORM_FACTOR_TOKENS = frozenset({"LAPTOP", "DESKTOP", "NOTEBOOK", "MOBILE"})
+_NON_MODEL_GPU_TOKENS = frozenset({"NVIDIA", "GEFORCE", "GPU", "UNKNOWN", "SERIES", "FAMILY"})
+_MAX_PEARL_FLOOR_ENTRIES = 128
+_MAX_PEARL_REGISTRY_JSON_CHARS = 16_384
+LEGACY_GPU_FLOOR_TO_PEARL_KEY = {
+    "RTX 5090|laptop|salad_json_log_gpu_class_name": "RTX_5090_LAPTOP",
+    "RTX 5080|laptop|salad_json_log_gpu_class_name": "RTX_5080_LAPTOP",
+    "RTX 5090|desktop|salad_json_log_gpu_class_name": "RTX_5090_DESKTOP",
+    "RTX 5080|desktop|salad_json_log_gpu_class_name": "RTX_5080_DESKTOP",
 }
 
 MONITOR_DEFAULTS: dict[str, int | float] = {
@@ -91,6 +112,88 @@ def _validate_floors(value: Any) -> dict[str, float]:
     return floors
 
 
+def _valid_pearl_gpu_key(key: Any) -> bool:
+    """Accept exact canonical GPU keys emitted by the Fl4sh identity normalizer."""
+    if not isinstance(key, str) or len(key) > 128 or _PEARL_GPU_KEY_RE.fullmatch(key) is None:
+        return False
+    tokens = key.split("_")
+    if not tokens:
+        return False
+    if tokens[-1] in {"LAPTOP", "DESKTOP"}:
+        model_tokens = tokens[:-1]
+    else:
+        model_tokens = tokens
+    if (
+        not model_tokens
+        or any(token in _FORM_FACTOR_TOKENS | _NON_MODEL_GPU_TOKENS for token in model_tokens)
+        or (tokens[0] == "RTX" and len(model_tokens) < 2)
+    ):
+        return False
+    return any(any(char.isdigit() for char in token) for token in model_tokens)
+
+
+def _legacy_pearl_floor_source(source: str, *, floor: float, default_floor: float) -> str | None:
+    """Map an existing G5 floor source into Pearl only when it is an actual override."""
+    if source == "ENV":
+        return "LEGACY_ENV"
+    if source == "JSON" and floor != default_floor:
+        return "LEGACY_JSON"
+    if source == "PYTHON" and floor != default_floor:
+        return "PYTHON"
+    return None
+
+
+def _validate_pearl_startup_floors(value: Any) -> dict[str, float]:
+    if not isinstance(value, Mapping):
+        raise G5ConfigError("pearl_startup_floors_ths must be a JSON object")
+    if len(value) > _MAX_PEARL_FLOOR_ENTRIES:
+        raise G5ConfigError("Pearl startup floor registry exceeds the entry limit")
+    floors: dict[str, float] = {}
+    seen_casefolded: set[str] = set()
+    for key, floor in value.items():
+        if not _valid_pearl_gpu_key(key):
+            raise G5ConfigError("Pearl startup floor identity is not a canonical exact GPU model key")
+        folded = key.casefold()
+        if folded in seen_casefolded:
+            raise G5ConfigError("Pearl startup floor registry contains duplicate identity aliases")
+        seen_casefolded.add(folded)
+        parsed = _finite_positive(floor, "pearl_startup_floors_ths entry")
+        if parsed > 10_000:
+            raise G5ConfigError("Pearl startup floor exceeds the supported numeric limit")
+        floors[key] = parsed
+    return floors
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise G5ConfigError("configuration JSON contains duplicate object keys")
+        result[key] = value
+    return result
+
+
+def _parse_pearl_registry_environment(raw: str) -> dict[str, float]:
+    if not isinstance(raw, str) or not raw or len(raw) > _MAX_PEARL_REGISTRY_JSON_CHARS:
+        raise G5ConfigError("Pearl startup floor environment registry is empty or exceeds its size limit")
+    try:
+        value = json.loads(raw, object_pairs_hook=_reject_duplicate_json_keys)
+    except (json.JSONDecodeError, G5ConfigError):
+        raise G5ConfigError("Pearl startup floor environment registry is invalid JSON") from None
+    return _validate_pearl_startup_floors(value)
+
+
+def pearl_startup_floor_catalog_hash(floors: Mapping[str, float]) -> str:
+    """Return a deterministic catalog fingerprint, not a GPU-binding claim."""
+    validated = _validate_pearl_startup_floors(floors)
+    payload = json.dumps(
+        [[key, format(value, ".17g")] for key, value in sorted(validated.items())],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()
+
+
 def _validated_monitor(values: Mapping[str, Any]) -> dict[str, int | float]:
     monitor: dict[str, int | float] = {}
     for key, default in MONITOR_DEFAULTS.items():
@@ -143,6 +246,7 @@ class G5Config:
     project: str = PROJECT
     container_groups: tuple[str, ...] = GROUPS
     gpu_floors_ths: Mapping[str, float] = field(default_factory=lambda: dict(FLOORS))
+    pearl_startup_floors_ths: Mapping[str, float] | None = None
     warmup_seconds: int = 90
     expected_sample_interval_seconds: int = 10
     hash_window_seconds: int = 120
@@ -197,6 +301,26 @@ class G5Config:
         if not floors:
             raise G5ConfigError("at least one verified GPU floor must be configured")
         object.__setattr__(self, "gpu_floors_ths", MappingProxyType(floors))
+        inherited_pearl_sources: dict[str, str] = {}
+        if self.pearl_startup_floors_ths is None:
+            pearl_floors = dict(PEARL_STARTUP_FLOORS)
+            supplied_sources = dict(self.value_sources or {})
+            for legacy_key, pearl_key in LEGACY_GPU_FLOOR_TO_PEARL_KEY.items():
+                source = str(supplied_sources.get(f"gpu_floors_ths.{legacy_key}", "PYTHON"))
+                inherited_source = _legacy_pearl_floor_source(
+                    source,
+                    floor=floors[legacy_key],
+                    default_floor=FLOORS[legacy_key],
+                )
+                if inherited_source is not None:
+                    pearl_floors[pearl_key] = floors[legacy_key]
+                    inherited_pearl_sources[pearl_key] = inherited_source
+        else:
+            pearl_floors = dict(self.pearl_startup_floors_ths)
+        pearl_floors = _validate_pearl_startup_floors(pearl_floors)
+        if not pearl_floors:
+            raise G5ConfigError("at least one exact Pearl startup floor must be configured")
+        object.__setattr__(self, "pearl_startup_floors_ths", MappingProxyType(pearl_floors))
         monitor = _validated_monitor({key: getattr(self, key) for key in MONITOR_DEFAULTS})
         for key, value in monitor.items():
             object.__setattr__(self, key, value)
@@ -217,19 +341,42 @@ class G5Config:
                 for key, value in floors.items()
             }
             sources.update({
+                f"pearl_startup_floors_ths.{key}": (
+                    inherited_pearl_sources.get(
+                        key,
+                        "DEFAULTS" if key in PEARL_STARTUP_FLOORS and value == PEARL_STARTUP_FLOORS[key]
+                        else "PYTHON",
+                    )
+                )
+                for key, value in pearl_floors.items()
+            })
+            sources.update({
                 key: ("DEFAULTS" if value == MONITOR_DEFAULTS[key] else "PYTHON")
                 for key, value in monitor.items()
             })
             sources["salad_hourly_price_usd_estimate"] = "DEFAULTS" if self.salad_hourly_price_usd_estimate is None else "PYTHON"
             object.__setattr__(self, "value_sources", MappingProxyType(sources))
-        elif any(origin not in {"DEFAULTS", "JSON", "ENV", "PYTHON"} for origin in self.value_sources.values()):
+        elif any(origin not in {"DEFAULTS", "JSON", "ENV", "PYTHON", "LEGACY_JSON", "LEGACY_ENV"} for origin in self.value_sources.values()):
             raise G5ConfigError("configuration source labels are invalid")
         else:
-            object.__setattr__(self, "value_sources", MappingProxyType(dict(self.value_sources)))
+            sources = dict(self.value_sources)
+            for key, value in pearl_floors.items():
+                sources.setdefault(
+                    f"pearl_startup_floors_ths.{key}",
+                    inherited_pearl_sources.get(
+                        key,
+                        "DEFAULTS" if key in PEARL_STARTUP_FLOORS and value == PEARL_STARTUP_FLOORS[key] else "PYTHON",
+                    ),
+                )
+            object.__setattr__(self, "value_sources", MappingProxyType(sources))
 
     def source_for(self, name: str) -> str:
         assert self.value_sources is not None
         return str(self.value_sources.get(name, "DEFAULTS"))
+
+    @property
+    def pearl_startup_floor_catalog_hash(self) -> str:
+        return pearl_startup_floor_catalog_hash(self.pearl_startup_floors_ths)
 
 
 def _parse(value: Mapping[str, Any], *, environ: Mapping[str, str] | None = None) -> G5Config:
@@ -251,6 +398,15 @@ def _parse(value: Mapping[str, Any], *, environ: Mapping[str, str] | None = None
             raise G5ConfigError("GPU floor identity must exactly match a supported verified model/form-factor/source key")
         floors[key] = floor
         sources[f"gpu_floors_ths.{key}"] = "JSON"
+    raw_pearl_floors = value.get("pearl_startup_floors_ths", {})
+    if not isinstance(raw_pearl_floors, Mapping):
+        raise G5ConfigError("pearl_startup_floors_ths must be a JSON object")
+    pearl_floors = dict(PEARL_STARTUP_FLOORS)
+    pearl_sources: dict[str, str] = {
+        key: "DEFAULTS" for key in PEARL_STARTUP_FLOORS
+    }
+    explicit_json_pearl_floors = _validate_pearl_startup_floors(raw_pearl_floors)
+    explicit_json_pearl_keys = set(explicit_json_pearl_floors)
     monitor_values: dict[str, Any] = dict(MONITOR_DEFAULTS)
     for key in MONITOR_DEFAULTS:
         if key in monitor_json:
@@ -262,6 +418,11 @@ def _parse(value: Mapping[str, Any], *, environ: Mapping[str, str] | None = None
     sources["salad_hourly_price_usd_estimate"] = "JSON" if "salad_hourly_price_usd_estimate" in value else "DEFAULTS"
 
     env = os.environ if environ is None else environ
+    env_pearl_floors: dict[str, float] = {}
+    if PEARL_STARTUP_FLOORS_ENVIRONMENT in env:
+        env_pearl_floors = _parse_pearl_registry_environment(env[PEARL_STARTUP_FLOORS_ENVIRONMENT])
+        if explicit_json_pearl_keys.intersection(env_pearl_floors):
+            raise G5ConfigError("Pearl startup floor identity is set by multiple explicit sources")
     for env_name, floor_key in FLOOR_ENVIRONMENT.items():
         if env_name in env:
             floors[floor_key] = _environment_number(env[env_name], env_name, integer=False)
@@ -276,6 +437,31 @@ def _parse(value: Mapping[str, Any], *, environ: Mapping[str, str] | None = None
         sources["salad_hourly_price_usd_estimate"] = "ENV"
 
     floors = _validate_floors(floors)
+    # Preserve the historical G5 contract: the effective legacy floors also
+    # governed Pearl startup admission. The dedicated Pearl catalog is a more
+    # specific override and therefore wins when explicitly configured.
+    for legacy_key, pearl_key in LEGACY_GPU_FLOOR_TO_PEARL_KEY.items():
+        source = sources[f"gpu_floors_ths.{legacy_key}"]
+        inherited_source = _legacy_pearl_floor_source(
+            source,
+            floor=float(floors[legacy_key]),
+            default_floor=FLOORS[legacy_key],
+        )
+        if inherited_source is not None:
+            pearl_floors[pearl_key] = floors[legacy_key]
+            pearl_sources[pearl_key] = inherited_source
+    for key, floor in explicit_json_pearl_floors.items():
+        pearl_floors[key] = floor
+        pearl_sources[key] = "JSON"
+    for key, floor in env_pearl_floors.items():
+        pearl_floors[key] = floor
+        pearl_sources[key] = "ENV"
+
+    pearl_floors = _validate_pearl_startup_floors(pearl_floors)
+    sources.update({
+        f"pearl_startup_floors_ths.{key}": source
+        for key, source in pearl_sources.items()
+    })
     monitor_values = _validated_monitor(monitor_values)
     raw_sources = value.get("local_telemetry_sources", [])
     if not isinstance(raw_sources, list):
@@ -288,6 +474,7 @@ def _parse(value: Mapping[str, Any], *, environ: Mapping[str, str] | None = None
         project=scope.get("project", PROJECT),
         container_groups=tuple(scope.get("container_groups", GROUPS)),
         gpu_floors_ths=floors,
+        pearl_startup_floors_ths=pearl_floors,
         **monitor_values,
         salad_hourly_price_usd_estimate=price,
         value_sources=sources,
@@ -310,8 +497,11 @@ def load_config(path: str | Path | None = None, *, environ: Mapping[str, str] | 
     if path is not None:
         source = Path(path)
         try:
-            loaded = json.loads(source.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            loaded = json.loads(
+                source.read_text(encoding="utf-8"),
+                object_pairs_hook=_reject_duplicate_json_keys,
+            )
+        except (OSError, json.JSONDecodeError, G5ConfigError):
             raise G5ConfigError("G5 configuration is unreadable or invalid JSON") from None
         if not isinstance(loaded, Mapping):
             raise G5ConfigError("G5 configuration must be a JSON object")

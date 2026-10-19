@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 
@@ -31,7 +32,7 @@ from collector.startup_recovery_policy import StartupCause, StartupRecoveryPolic
 from log_alerts.contract import DATA_CLASSIFICATION, PROVIDER_OBSERVED  # noqa: E402
 from log_alerts.normalize import normalize_log_entry  # noqa: E402
 from log_alerts.startup_early_bridge import StartupEarlyBridge, normalize_observed_gpu_key  # noqa: E402
-from g5_control_plane.config import G5Config  # noqa: E402
+from g5_control_plane.config import G5Config, load_config  # noqa: E402
 from g5_control_plane.service import G5ControlPlaneService  # noqa: E402
 
 
@@ -197,6 +198,132 @@ class StartupAdmissionEngineTests(unittest.TestCase):
             self.assertFalse(preview["recovery_policy"]["actions_performed"])
         finally:
             service.close()
+
+    def test_control_plane_uses_exact_configured_pearl_identity_and_reports_provenance(self):
+        service = G5ControlPlaneService(
+            G5Config(pearl_startup_floors_ths={"RTX_5070_TI": 100}),
+        )
+        try:
+            observation, context = make_evidence(
+                gpu_key="RTX_5070_TI",
+                floors={"RTX_5080_LAPTOP": 120.0},
+                policy_hash=service.monitor.policy_hash,
+            )
+            context = replace(context, policy=None)
+            preview = service.preview_startup_admission(
+                observation, context, now_utc=NOW.isoformat().replace("+00:00", "Z"),
+            )
+            self.assertEqual(preview["state"], "EARLY_UNDER_FLOOR")
+            self.assertEqual(preview["floor_ths"], 100)
+            self.assertEqual(preview["floor_source"], "PYTHON")
+            self.assertEqual(preview["floor_catalog_hash"], service.config.pearl_startup_floor_catalog_hash)
+            self.assertEqual(preview["policy_hash"], service.monitor.policy_hash)
+            self.assertFalse(preview["actions_performed"])
+            self.assertFalse(preview["request_submitted"])
+            self.assertFalse(preview["live_action_eligible"])
+        finally:
+            service.close()
+
+    def test_neutral_gpu_floor_never_falls_back_to_laptop_or_desktop(self):
+        service = G5ControlPlaneService(
+            G5Config(pearl_startup_floors_ths={"RTX_4070_TI": 100}),
+        )
+        try:
+            observation, context = make_evidence(
+                gpu_key="RTX_4070_TI_LAPTOP",
+                floors={"RTX_4070_TI": 100.0},
+                policy_hash=service.monitor.policy_hash,
+            )
+            context = replace(context, policy=None)
+            preview = service.preview_startup_admission(
+                observation, context, now_utc=NOW.isoformat().replace("+00:00", "Z"),
+            )
+            self.assertEqual(preview["state"], "EARLY_UNKNOWN")
+            self.assertEqual(preview["reason"], "FLOOR_UNCONFIGURED")
+            self.assertIsNone(preview["floor_ths"])
+            self.assertEqual(preview["floor_source"], "NO_FLOOR_CONFIGURED")
+            self.assertFalse(preview["actions_performed"])
+            self.assertFalse(preview["request_submitted"])
+        finally:
+            service.close()
+
+    def test_legacy_json_and_environment_floor_overrides_drive_pearl_startup(self):
+        config_path = TELEMETRY_ROOT / "g5-live-config.example.json"
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+        data["gpu_floors_ths"]["RTX 5080|laptop|salad_json_log_gpu_class_name"] = 110
+        with tempfile.TemporaryDirectory(prefix="g5-startup-legacy-floor-") as temp:
+            path = Path(temp) / "config.json"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            json_config = load_config(path, environ={})
+
+        env_config = load_config(None, environ={
+            "SALAD_G5_GPU_FLOOR_RTX_5080_LAPTOP_THS": "115",
+        })
+        for config, expected_floor, expected_source in (
+            (json_config, 110, "LEGACY_JSON"),
+            (env_config, 115, "LEGACY_ENV"),
+        ):
+            with self.subTest(source=expected_source):
+                service = G5ControlPlaneService(config)
+                try:
+                    observation, context = make_evidence(
+                        gpu_key="RTX_5080_LAPTOP",
+                        floors={"RTX_5080_LAPTOP": 120.0},
+                        policy_hash=service.monitor.policy_hash,
+                    )
+                    context = replace(context, policy=None)
+                    preview = service.preview_startup_admission(
+                        observation, context, now_utc=NOW.isoformat().replace("+00:00", "Z"),
+                    )
+                    self.assertEqual(preview["state"], "EARLY_UNDER_FLOOR")
+                    self.assertEqual(preview["floor_ths"], expected_floor)
+                    self.assertEqual(preview["floor_source"], expected_source)
+                    self.assertFalse(preview["actions_performed"])
+                    self.assertFalse(preview["request_submitted"])
+                finally:
+                    service.close()
+
+    def test_non_rtx_exact_gpu_keys_are_configurable_without_family_fallback(self):
+        service = G5ControlPlaneService(
+            G5Config(pearl_startup_floors_ths={"A100_SXM4_80GB": 100}),
+        )
+        try:
+            observation, context = make_evidence(
+                gpu_key="A100_SXM4_80GB",
+                floors={"RTX_5080_LAPTOP": 120.0},
+                policy_hash=service.monitor.policy_hash,
+            )
+            context = replace(context, policy=None)
+            exact = service.preview_startup_admission(
+                observation, context, now_utc=NOW.isoformat().replace("+00:00", "Z"),
+            )
+            self.assertEqual(exact["state"], "EARLY_UNDER_FLOOR")
+            self.assertEqual(exact["floor_ths"], 100)
+            self.assertEqual(exact["floor_source"], "PYTHON")
+            self.assertFalse(exact["actions_performed"])
+        finally:
+            service.close()
+
+        no_fallback = G5ControlPlaneService(
+            G5Config(pearl_startup_floors_ths={"A100_SXM4_80GB": 100}),
+        )
+        try:
+            observation, context = make_evidence(
+                gpu_key="A100_SXM4_80GB_PCIE",
+                floors={"A100_SXM4_80GB": 100.0},
+                policy_hash=no_fallback.monitor.policy_hash,
+            )
+            context = replace(context, policy=None)
+            preview = no_fallback.preview_startup_admission(
+                observation, context, now_utc=NOW.isoformat().replace("+00:00", "Z"),
+            )
+            self.assertEqual(preview["state"], "EARLY_UNKNOWN")
+            self.assertEqual(preview["reason"], "FLOOR_UNCONFIGURED")
+            self.assertIsNone(preview["floor_ths"])
+            self.assertEqual(preview["floor_source"], "NO_FLOOR_CONFIGURED")
+            self.assertFalse(preview["actions_performed"])
+        finally:
+            no_fallback.close()
 
     def test_control_plane_exposes_configured_read_only_startup_escalation(self):
         policy = StartupRecoveryPolicy(startup_timeout_seconds=120, escalation_interval_seconds=600)
