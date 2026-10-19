@@ -28,6 +28,7 @@ from collector.guard_store import GuardStore
 from collector.guards import HashGuardPolicy
 from collector.reallocation_controller import ReallocationController, ReallocationPolicy
 from collector.salad_action_policy import SaladAction, SaladActionPolicy
+from collector.salad_billing_cost import operator_reaction_cost_scenarios
 from collector.startup_admission import StartupAdmissionEngine
 from collector.startup_recovery_policy import StartupCause, StartupRecoveryPolicy
 from collector.startup_latency import polling_comparison, reaction_exposure_comparison
@@ -1031,7 +1032,31 @@ class G5ControlPlaneService:
             fleets = []
             for record in self._fleet_records:
                 device_rows = [row for row in devices if row.get("fleet_id") == record.get("fleet_id")]
-                fleets.append(project_fleet(record, device_projections=device_rows))
+                fleets.append(project_fleet(
+                    record,
+                    device_projections=device_rows,
+                    cost_accounting=record.get("salad_cost_accounting") if isinstance(record.get("salad_cost_accounting"), Mapping) else None,
+                ))
+            fleet_cost_summaries = [
+                {
+                    "organization": item["salad_cost_reconciliation"].get("organization"),
+                    "project": item["salad_cost_reconciliation"].get("project"),
+                    "fleet_id": item.get("fleet_id"),
+                    "billing_account_id": item["salad_cost_reconciliation"].get("billing_account_id"),
+                    "status": item["salad_cost_reconciliation"].get("status", "UNKNOWN"),
+                    "estimated_cost_status": item["salad_cost_reconciliation"].get("estimated_cost_status", "UNKNOWN"),
+                    "estimated_accumulated_cost_usd": item["salad_cost_reconciliation"].get("estimated_accumulated_cost_usd"),
+                    "verified_billing_status": item["salad_cost_reconciliation"].get("verified_billing_status", "UNKNOWN"),
+                    "verified_billed_cost_usd": item["salad_cost_reconciliation"].get("verified_billed_cost_usd"),
+                    "reconciliation_status": item["salad_cost_reconciliation"].get("reconciliation_status", "UNKNOWN"),
+                }
+                for item in fleets
+            ]
+            cost_status = (
+                "UNKNOWN" if not fleet_cost_summaries
+                else "COMPLETE" if all(item["status"] == "PROVISIONAL" and item["estimated_cost_status"] == "PROVISIONAL_COMPLETE" for item in fleet_cost_summaries)
+                else "PARTIAL"
+            )
             return {
                 "schema_version": "1.0",
                 "mode": "offline_local",
@@ -1094,6 +1119,7 @@ class G5ControlPlaneService:
                 "latency_model": {
                     "polling_scenarios": polling_comparison((30, 15), organization_count=3),
                     "reaction_exposure_scenarios": reaction_exposure_comparison(),
+                    "operator_cost_scenarios": operator_reaction_cost_scenarios(),
                     "current_default_poll_seconds": 30,
                     "polling_default_changed": False,
                     "request_amplification_source": "watcher subqueries per organization cycle",
@@ -1119,6 +1145,12 @@ class G5ControlPlaneService:
                         "classification": "OPERATOR_ESTIMATE_NOT_VERIFIED_BILLING",
                         "billing_verified": False,
                         "spend_authorized": False,
+                    },
+                    "salad_cost_reconciliation": {
+                        "status": cost_status,
+                        "live_billing_read_status": "NOT_ELIGIBLE_UNTIL_VERIFIED",
+                        "fleets": fleet_cost_summaries,
+                        "actions_performed": False,
                     },
                 },
                 "fleets": fleets,

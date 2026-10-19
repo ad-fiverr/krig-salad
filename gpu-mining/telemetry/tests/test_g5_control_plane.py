@@ -174,6 +174,76 @@ class G5ControlPlaneTests(unittest.TestCase):
         finally:
             service.close()
 
+    def test_dashboard_exposes_scoped_cost_estimate_without_promoting_billing(self):
+        service = G5ControlPlaneService(G5Config())
+        try:
+            service.register_fleet_record({
+                "fleet_id": "billing-fleet",
+                "worker_id": "billing-worker",
+                "assignments": [],
+                "salad_cost_accounting": {
+                    "organization": "adrianfiverr",
+                    "project": "miners",
+                    "fleet_id": "billing-fleet",
+                    "billing_account_id": "billing-account-1",
+                    "window_start_utc": "2026-10-18T12:00:00Z",
+                    "window_end_utc": "2026-10-18T13:00:00Z",
+                    "lifecycle_events": [
+                        {
+                            "event_id": "billing-run-start",
+                            "source": "provider_lifecycle",
+                            "source_reference": "fixture-start",
+                            "assignment_id": "assignment-1",
+                            "machine_id": "machine-1",
+                            "instance_id": "instance-1",
+                            "gpu_model": "RTX_5080_LAPTOP",
+                            "state": "RUNNING",
+                            "occurred_at_utc": "2026-10-18T12:00:00Z",
+                        },
+                        {
+                            "event_id": "billing-run-stop",
+                            "source": "provider_lifecycle",
+                            "source_reference": "fixture-stop",
+                            "assignment_id": "assignment-1",
+                            "machine_id": "machine-1",
+                            "instance_id": "instance-1",
+                            "gpu_model": "RTX_5080_LAPTOP",
+                            "state": "STOPPED",
+                            "occurred_at_utc": "2026-10-18T12:10:00Z",
+                        },
+                    ],
+                    "quoted_rates": [{
+                        "quote_id": "quote-1",
+                        "organization": "adrianfiverr",
+                        "project": "miners",
+                        "fleet_id": "billing-fleet",
+                        "billing_account_id": "billing-account-1",
+                        "gpu_model": "RTX_5080_LAPTOP",
+                        "usd_per_hour": "0.417",
+                        "effective_from_utc": "2026-10-18T12:00:00Z",
+                        "effective_until_utc": "2026-10-18T13:00:00Z",
+                        "rate_classification": "QUOTED",
+                        "source_reference": "synthetic-quote",
+                        "source_timestamp_utc": "2026-10-18T11:59:00Z",
+                    }],
+                    "billing_evidence": [],
+                },
+            })
+            state = service.state()
+            fleet = next(item for item in state["fleets"] if item["fleet_id"] == "billing-fleet")
+            cost = fleet["salad_cost_reconciliation"]
+            self.assertEqual(cost["estimated_exposure_seconds"], "600")
+            self.assertEqual(cost["estimated_accumulated_cost_usd"], "0.0695")
+            self.assertEqual(cost["estimated_classification"], "ESTIMATED")
+            self.assertEqual(cost["verified_billing_status"], "UNKNOWN")
+            self.assertIsNone(cost["verified_billed_cost_usd"])
+            self.assertEqual(state["economics"]["salad_cost_reconciliation"]["live_billing_read_status"], "NOT_ELIGIBLE_UNTIL_VERIFIED")
+            self.assertEqual(state["latency_model"]["operator_cost_scenarios"]["scenarios"]["180_seconds"]["estimated_cost_usd"], "4.1283")
+            self.assertFalse(state["actions"]["auto_reallocate"])
+            self.assertFalse(cost["actions_performed"])
+        finally:
+            service.close()
+
     def test_config_rejects_external_bind_prod_project_live_actions_and_bad_budget(self):
         for mutation in (
             {"host": "0.0.0.0"},

@@ -7,6 +7,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .fleet import summarize_fleet
+from .salad_billing_cost import build_cost_reconciliation, unknown_cost_reconciliation
 from .v2_adapters import normalize_v2_evaluation, normalize_v2_track
 
 
@@ -111,7 +112,12 @@ def project_device(
     }
 
 
-def project_fleet(record: Mapping[str, Any], *, device_projections: list[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+def project_fleet(
+    record: Mapping[str, Any],
+    *,
+    device_projections: list[Mapping[str, Any]] | None = None,
+    cost_accounting: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Use V1/V2 fleet accounting; BTC remains at shared-worker scope."""
     accounting = summarize_fleet(record)
     stages = accounting["worker_btc_revenue"]
@@ -130,6 +136,11 @@ def project_fleet(record: Mapping[str, Any], *, device_projections: list[Mapping
         projected_window["observed_net_profit_over_billed_cost_fraction"] = str(fraction) if fraction is not None else None
         projected_window["observed_net_profit_over_billed_cost_status"] = "VERIFIED" if fraction is not None else "UNKNOWN"
         net_windows.append(projected_window)
+    cost_projection = (
+        build_cost_reconciliation(cost_accounting)
+        if isinstance(cost_accounting, Mapping)
+        else unknown_cost_reconciliation()
+    )
     return {
         "schema_version": "1.0",
         "fleet_id": accounting["fleet_id"],
@@ -155,5 +166,6 @@ def project_fleet(record: Mapping[str, Any], *, device_projections: list[Mapping
         "net_profit_by_compatible_window": net_windows,
         "economic_reconciliation_status": accounting["economic_reconciliation_status"],
         "profit_status": "VERIFIED" if accounting["economic_reconciliation_status"] == "RECONCILED" else "UNKNOWN",
+        "salad_cost_reconciliation": cost_projection,
         "actions_performed": False,
     }
