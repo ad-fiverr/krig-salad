@@ -222,4 +222,3 @@ def sanitize_live_instance_list(
     evidence["reallocation_enabled"] = False
     evidence["sanitized_observation_sha256"] = _canonical_hash(evidence)
     return evidence
-

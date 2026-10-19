@@ -117,4 +117,3 @@ def request_for_group(container_group: str) -> RequestSpec:
         if spec.container_group == container_group:
             return spec
     raise PilotScopeError("container group is outside the approved allowlist")
-

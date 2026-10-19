@@ -650,4 +650,3 @@ class LiveSaladReadSession:
         # can occur after request bytes reached the provider; reopening then
         # refuses the next slot until external reconciliation.
         del group
-

@@ -77,4 +77,3 @@ class OfflineFixtureTransport:
                 transport_error="synthetic_fixture_missing",
             ),
         )
-

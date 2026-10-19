@@ -108,4 +108,3 @@ def validate_request(request: RestrictedGET) -> RestrictedGET:
     if request != expected:
         raise LivePolicyError("request differs from the fixed allowlisted contract")
     return expected
-

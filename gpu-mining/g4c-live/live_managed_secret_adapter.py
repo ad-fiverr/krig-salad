@@ -90,4 +90,3 @@ class ManagedSecretAdapter(SecretProvider):
             raise SecretAccessBlocked("managed secret acquisition is blocked") from None
         except Exception:
             raise SecretAccessBlocked("managed secret acquisition failed") from None
-

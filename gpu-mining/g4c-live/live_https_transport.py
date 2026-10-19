@@ -458,5 +458,3 @@ class ProductionSaladTransport:
             if response is not None:
                 response.close()
             connection.close()
-
-

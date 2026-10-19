@@ -665,4 +665,3 @@ class BrokerLedger:
             raise LedgerUnavailable("ledger snapshot is unavailable") from exc
         finally:
             connection.close()
-

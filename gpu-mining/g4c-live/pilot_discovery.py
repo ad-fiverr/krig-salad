@@ -260,4 +260,3 @@ def replay_discovery_fixtures(
         "actions_performed": False,
         "reallocation_enabled": False,
     }
-

@@ -451,4 +451,3 @@ class OfflineBroker:
             "actions_performed": False,
             "reallocation_enabled": False,
         }
-
