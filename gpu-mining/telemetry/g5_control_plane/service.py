@@ -28,6 +28,7 @@ from collector.guards import HashGuardPolicy
 from collector.reallocation_controller import ReallocationController, ReallocationPolicy
 from collector.salad_action_policy import SaladAction, SaladActionPolicy
 from collector.startup_admission import StartupAdmissionEngine
+from collector.startup_recovery_policy import StartupCause, StartupRecoveryPolicy
 from collector.startup_latency import polling_comparison, reaction_exposure_comparison
 from collector.v2_adapters import normalize_v2_evaluation
 
@@ -128,7 +129,9 @@ class G5ControlPlaneService:
         self._bindings: dict[str, dict[str, Any]] = {}
         self._fleet_records: list[dict[str, Any]] = []
         self._controller_decisions: dict[str, dict[str, Any]] = {}
-        self.startup_admission_engine = StartupAdmissionEngine()
+        self.startup_admission_engine = StartupAdmissionEngine(
+            StartupRecoveryPolicy.from_env()
+        )
         self._last_startup_preview: dict[str, Any] | None = None
         self.reallocation_controller = ReallocationController(
             ReallocationPolicy(
@@ -596,6 +599,15 @@ class G5ControlPlaneService:
             active,
             contradictory_evidence=policy_conflict,
         )
+        recovery_cause = (
+            StartupCause.LOW_AUTOTUNE
+            if decision.state == "EARLY_UNDER_FLOOR"
+            else StartupCause.UNKNOWN
+        )
+        recovery = self.startup_admission_engine.classify_recovery(
+            recovery_cause,
+            admission_decision=decision if recovery_cause is StartupCause.LOW_AUTOTUNE else None,
+        )
         gate_review: dict[str, Any] | None = None
         if decision.state == "EARLY_UNDER_FLOOR":
             # The existing gate is deliberately instantiated closed for this
@@ -644,6 +656,7 @@ class G5ControlPlaneService:
             "floor_ths": decision.floor_ths,
             "policy_hash": self.monitor.policy_hash,
             "action_gate": safe_gate,
+            "recovery_policy": recovery.to_dict(),
             "actions_performed": False,
             "request_submitted": False,
             "live_action_eligible": False,
@@ -1021,6 +1034,7 @@ class G5ControlPlaneService:
                     "request_submitted": False,
                     "live_action_eligible": False,
                 },
+                "startup_recovery_policy": self.startup_admission_engine.recovery_policy.to_dict(),
                 "latency_model": {
                     "polling_scenarios": polling_comparison((30, 15), organization_count=3),
                     "reaction_exposure_scenarios": reaction_exposure_comparison(),

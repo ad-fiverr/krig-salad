@@ -16,6 +16,10 @@ from typing import Any, Mapping
 from collector.fl4sh_early_autotune import EarlyEvaluationContext, EarlyObservation
 from collector.fl4shminer import _classify
 from collector.startup_admission import StartupAdmissionEngine
+from collector.startup_recovery_policy import (
+    StartupCause,
+    StartupRecoveryDecision,
+)
 
 from .contract import DATA_CLASSIFICATION, PROVIDER_OBSERVED, canonical_utc
 from .normalize import MAX_TEXT_LOG_CHARS, NormalizedLogEntry
@@ -77,6 +81,7 @@ class StartupEarlyEvent:
     floor_ths: float | None
     event_time_utc: str
     data_classification: str
+    recovery: StartupRecoveryDecision
     actions_performed: bool = False
     request_submitted: bool = False
 
@@ -92,6 +97,7 @@ class StartupEarlyEvent:
             "floor_ths": self.floor_ths,
             "event_time_utc": self.event_time_utc,
             "data_classification": self.data_classification,
+            "recovery_policy": self.recovery.to_dict(),
             "actions_performed": False,
             "request_submitted": False,
         }
@@ -119,25 +125,33 @@ class StartupEarlyBridge:
         if entry.cuda_signal == "CUDA_DRIVER_INCOMPATIBLE":
             return self._event(
                 state="STARTUP_UNQUALIFIED", reason="CUDA_DRIVER_VERSION_INSUFFICIENT",
-                cause="CUDA_INCOMPATIBLE", event_time=event_time,
+                cause=StartupCause.CUDA_INCOMPATIBLE, event_time=event_time,
                 classification=entry.data_classification,
             )
         if entry.alert is not None and entry.alert.event_type in {"POOL_CONNECTION_FAILED", "POOL_CONNECTION_UNSTABLE"}:
             if entry.alert.fields.get("reason") == "MINING_AUTHORIZE_RESPONSE_TIMEOUT":
                 return self._event(
                     state="STARTUP_NON_GPU_CAUSE", reason="POOL_AUTH_TIMEOUT",
-                    cause="POOL_AUTH_TIMEOUT", event_time=event_time,
+                    cause=StartupCause.POOL_AUTH_TIMEOUT, event_time=event_time,
                     classification=entry.data_classification,
                 )
         if entry.alert is not None and entry.alert.event_type == "MINER_STARTUP_HASHRATE_TIMEOUT":
             reason = entry.alert.fields.get("reason")
             cause = {
-                "NO_POSITIVE_DEVICE_HASHRATE": "NO_POSITIVE_HASHRATE",
-                "MINER_EXITED_BEFORE_HASHRATE": "PROCESS_EXIT",
-            }.get(reason, "UNKNOWN")
+                "NO_POSITIVE_DEVICE_HASHRATE": StartupCause.NO_POSITIVE_HASHRATE,
+                "MINER_EXITED_BEFORE_HASHRATE": StartupCause.PROCESS_EXIT,
+            }.get(reason, StartupCause.UNKNOWN)
+            elapsed = entry.alert.fields.get("startup_timeout_seconds", 0)
             return self._event(
-                state="STARTUP_NON_GPU_CAUSE", reason=cause, cause=cause,
+                state="STARTUP_NON_GPU_CAUSE", reason=cause.value, cause=cause,
                 event_time=event_time, classification=entry.data_classification,
+                elapsed_seconds=elapsed if type(elapsed) is int else 0,
+            )
+        if entry.cuda_signal == "MINER_EXIT_STATUS_1":
+            return self._event(
+                state="STARTUP_NON_GPU_CAUSE", reason="PROCESS_EXIT",
+                cause=StartupCause.PROCESS_EXIT, event_time=event_time,
+                classification=entry.data_classification,
             )
 
         message = self._message(entry)
@@ -171,11 +185,15 @@ class StartupEarlyBridge:
         )
         decision = self.engine.evaluate(observation, context)
         reason = decision.reason if _SAFE_REASON_RE.fullmatch(decision.reason) else "UNSAFE_DECISION_REASON"
-        cause = "LOW_AUTOTUNE" if decision.state == "EARLY_UNDER_FLOOR" else "UNKNOWN"
+        cause = StartupCause.LOW_AUTOTUNE if decision.state == "EARLY_UNDER_FLOOR" else StartupCause.UNKNOWN
+        recovery = self.engine.classify_recovery(
+            cause,
+            admission_decision=decision if cause is StartupCause.LOW_AUTOTUNE else None,
+        )
         return StartupEarlyEvent(
             state=decision.state,
             reason=reason,
-            cause=cause,
+            cause=cause.value,
             signal_type=signal_type,
             device_index=device_index,
             gpu_key=gpu_key,
@@ -183,6 +201,7 @@ class StartupEarlyBridge:
             floor_ths=decision.floor_ths,
             event_time_utc=event_time,
             data_classification=entry.data_classification,
+            recovery=recovery,
         )
 
     @staticmethod
@@ -203,15 +222,23 @@ class StartupEarlyBridge:
         distinct = set(candidates)
         return candidates[0] if len(distinct) == 1 else None
 
-    @staticmethod
-    def _event(*, state: str, reason: str, cause: str, event_time: str,
-               classification: str) -> StartupEarlyEvent:
-        if cause not in CAUSE_CODES:
-            cause = "UNKNOWN"
+    def _event(
+        self,
+        *,
+        state: str,
+        reason: str,
+        cause: StartupCause,
+        event_time: str,
+        classification: str,
+        elapsed_seconds: int | float = 0,
+    ) -> StartupEarlyEvent:
+        if cause.value not in CAUSE_CODES:
+            cause = StartupCause.UNKNOWN
+        recovery = self.engine.classify_recovery(cause, elapsed_seconds=elapsed_seconds)
         return StartupEarlyEvent(
             state=state,
             reason=reason if _SAFE_REASON_RE.fullmatch(reason) else "UNKNOWN",
-            cause=cause,
+            cause=cause.value,
             signal_type=None,
             device_index=None,
             gpu_key=None,
@@ -219,4 +246,5 @@ class StartupEarlyBridge:
             floor_ths=None,
             event_time_utc=event_time,
             data_classification=classification,
+            recovery=recovery,
         )

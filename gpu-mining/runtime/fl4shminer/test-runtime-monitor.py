@@ -2453,7 +2453,7 @@ class ProductiveReadinessTests(unittest.TestCase):
                 self.assertNotEqual(MONITOR.main(["--check-readiness", "--miner-pid", "78"]), 0)
                 self.assertEqual(MONITOR.main(["--check-readiness", "--miner-pid", "0"]), 64)
 
-    def test_startup_watchdog_fails_closed_without_positive_device_hashrate(self) -> None:
+    def test_startup_watchdog_alerts_once_without_terminating_a_late_productive_child(self) -> None:
         environment = os.environ.copy()
         environment.update({
             "FL4SH_MONITOR_ENABLED": "1",
@@ -2462,25 +2462,116 @@ class ProductiveReadinessTests(unittest.TestCase):
             "SALAD_G5_MAXIMUM_SAMPLE_GAP_SECONDS": "5",
             "SALAD_G5_EXPECTED_SAMPLE_INTERVAL_SECONDS": "5",
         })
+        child_code = (
+            "import time; time.sleep(1.3); "
+            "print('Device [1] hashRate: 12.5 TH/s', flush=True); time.sleep(0.2)"
+        )
         completed = subprocess.run(
             [
                 sys.executable,
                 str(ROOT / "fl4sh-runtime-monitor.py"),
-                "--", sys.executable, "-c", "import time; time.sleep(10)",
+                "--", sys.executable, "-c", child_code,
             ],
             env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=10,
+            timeout=6,
             check=False,
         )
-        self.assertEqual(completed.returncode, 70, completed.stderr.decode("utf-8", "replace"))
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", "replace"))
         output = completed.stdout.decode("utf-8", "replace")
         self.assertIn("state=STARTUP_HASHRATE_TIMEOUT", output)
         self.assertIn("reason=NO_POSITIVE_DEVICE_HASHRATE", output)
         self.assertIn("actions_performed=false", output)
+        self.assertEqual(output.count("state=STARTUP_HASHRATE_TIMEOUT"), 1)
+        self.assertIn("Device [1] hashRate: 12.5 TH/s", output)
         self.assertNotIn("api_key", output.lower())
         self.assertFalse(os.path.exists(MONITOR.READINESS_PATH))
+
+    def test_pool_timeout_and_network_reset_do_not_stop_startup_retries(self) -> None:
+        scenarios = (
+            (
+                "pool",
+                f"import time; print({POOL_CONNECTION_FAILED_WITHOUT_TIMESTAMP!r}, flush=True); "
+                "time.sleep(1.3); print('POOL_RETRY_CONTINUED', flush=True); "
+                "print('Device [1] hashRate: 12.5 TH/s', flush=True)",
+                "state=POOL_CONNECTION_FAILED",
+            ),
+            (
+                "network",
+                "import time; print('network connection reset; retrying', flush=True); "
+                "time.sleep(1.3); print('NETWORK_RETRY_CONTINUED', flush=True); "
+                "print('Device [1] hashRate: 12.5 TH/s', flush=True)",
+                "NETWORK_RETRY_CONTINUED",
+            ),
+        )
+        for name, child_code, expected in scenarios:
+            with self.subTest(name=name):
+                environment = os.environ.copy()
+                environment.update({
+                    "FL4SH_MONITOR_ENABLED": "1",
+                    "FL4SH_MONITOR_PROFILE": "RTX_5090_LAPTOP",
+                    "FL4SH_STARTUP_HASHRATE_TIMEOUT_SECONDS": "1",
+                    "SALAD_G5_MAXIMUM_SAMPLE_GAP_SECONDS": "5",
+                    "SALAD_G5_EXPECTED_SAMPLE_INTERVAL_SECONDS": "5",
+                })
+                completed = subprocess.run(
+                    [sys.executable, str(ROOT / "fl4sh-runtime-monitor.py"), "--", sys.executable, "-c", child_code],
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=6,
+                    check=False,
+                )
+                output = completed.stdout.decode("utf-8", "replace")
+                self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", "replace"))
+                self.assertIn("state=STARTUP_HASHRATE_TIMEOUT", output)
+                self.assertIn(expected, output)
+                self.assertNotIn("state=REALLOCATE_RECOMMENDED", output)
+
+    def test_child_exit_70_is_preserved_without_timeout_attribution(self) -> None:
+        environment = os.environ.copy()
+        environment.update({
+            "FL4SH_MONITOR_ENABLED": "1",
+            "FL4SH_MONITOR_PROFILE": "RTX_5090_LAPTOP",
+            "FL4SH_STARTUP_HASHRATE_TIMEOUT_SECONDS": "30",
+        })
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / "fl4sh-runtime-monitor.py"), "--", sys.executable, "-c", "raise SystemExit(70)"],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=6,
+            check=False,
+        )
+        output = completed.stdout.decode("utf-8", "replace")
+        self.assertEqual(completed.returncode, 70)
+        self.assertNotIn("state=STARTUP_HASHRATE_TIMEOUT", output)
+        self.assertNotIn("state=STARTUP_HASHRATE_FAILED", output)
+
+    def test_autotune_only_after_timeout_does_not_restore_positive_device_hashrate(self) -> None:
+        environment = os.environ.copy()
+        environment.update({
+            "FL4SH_MONITOR_ENABLED": "1",
+            "FL4SH_MONITOR_PROFILE": "RTX_5090_LAPTOP",
+            "FL4SH_STARTUP_HASHRATE_TIMEOUT_SECONDS": "1",
+        })
+        child_code = (
+            "import time; time.sleep(1.3); "
+            "print('GPU=NVIDIA GeForce RTX 5090 Laptop GPU Pearl autotune hashrate = 90 TH/s', flush=True)"
+        )
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / "fl4sh-runtime-monitor.py"), "--", sys.executable, "-c", child_code],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=6,
+            check=False,
+        )
+        output = completed.stdout.decode("utf-8", "replace")
+        self.assertEqual(completed.returncode, 70)
+        self.assertIn("state=STARTUP_HASHRATE_TIMEOUT", output)
+        self.assertIn("state=STARTUP_HASHRATE_FAILED", output)
 
     def test_clean_miner_exit_before_hashrate_is_not_healthy(self) -> None:
         environment = os.environ.copy()

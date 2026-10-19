@@ -65,6 +65,7 @@ WATCHER_INPUTS = tuple(
     "gpu-mining/telemetry/collector/gpu_identity.py",
     "gpu-mining/telemetry/collector/models.py",
     "gpu-mining/telemetry/collector/startup_admission.py",
+    "gpu-mining/telemetry/collector/startup_recovery_policy.py",
     "gpu-mining/telemetry/collector/work.py",
     "gpu-mining/g4c-live/live_secret_boundary.py",
 )
@@ -93,6 +94,7 @@ WORKFLOW_TRIGGERS = frozenset(
         "gpu-mining/telemetry/collector/gpu_identity.py",
         "gpu-mining/telemetry/collector/models.py",
         "gpu-mining/telemetry/collector/startup_admission.py",
+        "gpu-mining/telemetry/collector/startup_recovery_policy.py",
         "gpu-mining/telemetry/collector/work.py",
         "gpu-mining/g4c-live/live_secret_boundary.py",
         ".github/workflows/build-fl4shminer.yml",
@@ -349,6 +351,7 @@ def check_workflow(root: Path) -> None:
         "gpu-mining/telemetry/collector/gpu_identity.py": True,
         "gpu-mining/telemetry/collector/models.py": True,
         "gpu-mining/telemetry/collector/startup_admission.py": True,
+        "gpu-mining/telemetry/collector/startup_recovery_policy.py": True,
         "gpu-mining/telemetry/collector/work.py": True,
         "gpu-mining/telemetry/collector/startup_latency.py": False,
         "gpu-mining/g4c-live/live_secret_boundary.py": True,
@@ -427,6 +430,7 @@ def check_image_tree(root: Path) -> None:
         "gpu_identity.py",
         "models.py",
         "startup_admission.py",
+        "startup_recovery_policy.py",
         "work.py",
     }
     if {entry.name for entry in collector.iterdir()} != expected_collector:
@@ -434,6 +438,70 @@ def check_image_tree(root: Path) -> None:
     g4c = root / "gpu-mining/g4c-live"
     if {entry.name for entry in g4c.iterdir()} != {"live_secret_boundary.py"}:
         fail("image G4C directory contains files beyond the approved secret boundary")
+
+
+def check_simulated_image_tree(source_root: Path) -> None:
+    """Run image-mode import checks against only the files the Dockerfile packages."""
+    with tempfile.TemporaryDirectory(prefix="fl4sh-packaged-image-smoke-") as temporary:
+        image_root = Path(temporary) / "fl4shminer"
+        image_root.mkdir()
+        runtime_prefix = Path("gpu-mining/runtime/fl4shminer")
+        for relative in COPY_INPUTS:
+            source = source_root / relative
+            target = (
+                image_root / Path(relative).name
+                if Path(relative).is_relative_to(runtime_prefix)
+                else image_root / relative
+            )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+
+        # The source smoke does not build or run Fl4shMiner. This inert marker
+        # occupies the pinned artifact path required by the installed inventory.
+        (image_root / "fl4shminer").write_bytes(b"synthetic inert artifact marker")
+        child_environment = {
+            key: os.environ[key]
+            for key in ("PATH", "SYSTEMROOT", "WINDIR", "PATHEXT", "TEMP", "TMP")
+            if key in os.environ
+        }
+        child_environment["PYTHONPATH"] = str(image_root / "gpu-mining/telemetry")
+        child_environment["PYTHONNOUSERSITE"] = "1"
+        for key in (
+            "SALAD_API_KEY",
+            "SALAD_API_TOKEN",
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_CHAT_ID",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "FIREBASE_CONFIG",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+        ):
+            child_environment.pop(key, None)
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(image_root / "ci-fleet-image-smoke.py"),
+                    "--image",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                stdin=subprocess.DEVNULL,
+                cwd=image_root,
+                env=child_environment,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            fail("simulated packaged-image smoke did not terminate safely")
+        if (
+            result.returncode != 0
+            or "CENTRAL_WATCHER_IMPORT_OK" not in result.stdout
+            or "STARTUP_RECOVERY_IMPORT_OK" not in result.stdout
+        ):
+            fail("simulated packaged-image import closure failed")
 
 
 def block_external_boundaries() -> None:
@@ -463,11 +531,16 @@ def check_imports_and_inert_startup(root: Path, *, image: bool) -> None:
     live_cli = importlib.import_module("log_alerts.live_cli")
     importlib.import_module("log_alerts.fleet_watcher")
     importlib.import_module("log_alerts.list_instances_lookup")
+    importlib.import_module("log_alerts.startup_early_bridge")
     transport = importlib.import_module("log_alerts.live_transport")
+    recovery_policy = importlib.import_module("collector.startup_recovery_policy")
     from collector.g4a_salad_get import normalize_instance_list_response
 
     if not callable(normalize_instance_list_response):
         fail("G4A instance response normalizer is unavailable")
+    expected_recovery_policy = telemetry_path / "collector/startup_recovery_policy.py"
+    if Path(recovery_policy.__file__).resolve() != expected_recovery_policy.resolve():
+        fail("startup recovery policy did not resolve from the packaged tree")
     if transport.PRODUCTION_NETWORK_ALLOWED is not False:
         fail("Salad HTTPS transport is not disabled by default")
     boundary_path = (mining_root / "g4c-live/live_secret_boundary.py").resolve()
@@ -618,6 +691,7 @@ def check_imports_and_inert_startup(root: Path, *, image: bool) -> None:
         ):
             fail("default-off watcher module CLI did not block before live access")
     print("CENTRAL_WATCHER_IMPORT_OK")
+    print("STARTUP_RECOVERY_IMPORT_OK")
     print(f"SECRET_BOUNDARY_PATH_OK path={boundary_path.as_posix()}")
     print("WATCHER_DEFAULT_OFF_OFFLINE_OK")
     if image:
@@ -640,6 +714,8 @@ def main() -> int:
         check_dockerfile_manifest(root)
         check_workflow(root)
         check_source_boundaries(root, image=False)
+        check_simulated_image_tree(root)
+        print("SIMULATED_PACKAGED_IMAGE_IMPORT_CLOSURE_OK")
     else:
         check_image_tree(root)
         check_source_boundaries(root, image=True)

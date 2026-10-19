@@ -27,6 +27,7 @@ from collector.fl4sh_early_autotune import (  # noqa: E402
     monitor_policy_evidence_sha256,
 )
 from collector.startup_admission import StartupAdmissionEngine  # noqa: E402
+from collector.startup_recovery_policy import StartupCause, StartupRecoveryPolicy  # noqa: E402
 from log_alerts.contract import DATA_CLASSIFICATION, PROVIDER_OBSERVED  # noqa: E402
 from log_alerts.normalize import normalize_log_entry  # noqa: E402
 from log_alerts.startup_early_bridge import StartupEarlyBridge, normalize_observed_gpu_key  # noqa: E402
@@ -181,6 +182,22 @@ class StartupAdmissionEngineTests(unittest.TestCase):
             self.assertEqual(service.action_ledger.snapshot(), ledger_before)
             self.assertEqual(service.store.audit(), audit_before)
             self.assertEqual(service.state()["startup_admission"]["last_preview"], preview)
+            self.assertEqual(preview["recovery_policy"]["state"], "EARLY_UNDER_FLOOR")
+            self.assertTrue(preview["recovery_policy"]["gpu_floor_action_candidate"])
+            self.assertFalse(preview["recovery_policy"]["actions_performed"])
+        finally:
+            service.close()
+
+    def test_control_plane_exposes_configured_read_only_startup_escalation(self):
+        policy = StartupRecoveryPolicy(startup_timeout_seconds=120, escalation_interval_seconds=600)
+        service = G5ControlPlaneService(G5Config())
+        try:
+            service.startup_admission_engine = StartupAdmissionEngine(policy)
+            view = service.state()["startup_recovery_policy"]
+            self.assertEqual(view["startup_timeout_seconds"], 120)
+            self.assertEqual(view["escalation_interval_seconds"], 600)
+            self.assertEqual(view["timeout_action"], "OBSERVE_AND_NOTIFY")
+            self.assertFalse(view["pool_network_gpu_floor_action"])
         finally:
             service.close()
 
@@ -229,6 +246,42 @@ class StartupEarlyBridgeTests(unittest.TestCase):
         self.assertEqual(event.state, "EARLY_UNKNOWN")
         self.assertEqual(event.data_classification, PROVIDER_OBSERVED)
         self.assertFalse(event.actions_performed)
+
+    def test_pool_timeout_is_handed_to_controller_without_gpu_floor_candidate(self):
+        entry = synthetic_log(
+            "Pool connection failed: mining.authorize response timeout; "
+            "reconnecting; retrying in 10s"
+        )
+        event = StartupEarlyBridge().inspect(entry)
+        self.assertIsNotNone(event)
+        projection = event.to_dict()
+        self.assertEqual(projection["cause"], StartupCause.POOL_AUTH_TIMEOUT.value)
+        self.assertEqual(projection["recovery_policy"]["disposition"], "PRESERVE_POOL_RETRIES_AND_NOTIFY")
+        self.assertFalse(projection["recovery_policy"]["gpu_floor_action_candidate"])
+        self.assertFalse(projection["recovery_policy"]["actions_performed"])
+
+    def test_startup_timeout_is_observational_and_clean_exit_is_distinct(self):
+        timeout = synthetic_log(
+            "FL4SH_MONITOR state=STARTUP_HASHRATE_TIMEOUT "
+            "reason=NO_POSITIVE_DEVICE_HASHRATE startup_timeout_seconds=180 "
+            f"policy_hash={POLICY_HASH} actions_performed=false"
+        )
+        timeout_event = StartupEarlyBridge().inspect(timeout)
+        self.assertEqual(timeout_event.cause, StartupCause.NO_POSITIVE_HASHRATE.value)
+        self.assertEqual(timeout_event.recovery.state, "STARTUP_TIMEOUT")
+        self.assertEqual(timeout_event.recovery.disposition, "NOTIFY_CONTROLLER_AND_CONTINUE")
+        self.assertFalse(timeout_event.recovery.gpu_floor_action_candidate)
+
+        clean_exit = synthetic_log(
+            "FL4SH_MONITOR state=STARTUP_HASHRATE_FAILED "
+            "reason=MINER_EXITED_BEFORE_HASHRATE startup_timeout_seconds=180 "
+            f"policy_hash={POLICY_HASH} actions_performed=false"
+        )
+        exit_event = StartupEarlyBridge().inspect(clean_exit)
+        self.assertEqual(exit_event.cause, StartupCause.PROCESS_EXIT.value)
+        self.assertEqual(exit_event.recovery.state, "STARTUP_FAILED")
+        self.assertEqual(exit_event.recovery.disposition, "RECORD_ACTUAL_PROCESS_EXIT")
+        self.assertFalse(exit_event.recovery.gpu_floor_action_candidate)
 
 
 if __name__ == "__main__":

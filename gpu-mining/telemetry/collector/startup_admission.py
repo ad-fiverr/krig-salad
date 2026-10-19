@@ -17,6 +17,11 @@ from .fl4sh_early_autotune import (
     ProviderBinding,
     evaluate_early_autotune,
 )
+from .startup_recovery_policy import (
+    StartupCause,
+    StartupRecoveryDecision,
+    StartupRecoveryPolicy,
+)
 
 
 # No empirical production calibration for RTX_4070_TI or other unreviewed
@@ -26,6 +31,27 @@ APPROVED_PRODUCTION_CALIBRATIONS: tuple[EarlyCalibration, ...] = ()
 
 class StartupAdmissionEngine:
     """Select exact typed evidence and run the existing pure early classifier."""
+
+    def __init__(self, recovery_policy: StartupRecoveryPolicy | None = None) -> None:
+        self.recovery_policy = recovery_policy or StartupRecoveryPolicy()
+        if type(self.recovery_policy) is not StartupRecoveryPolicy:
+            raise TypeError("startup admission requires the exact recovery policy")
+
+    def classify_recovery(
+        self,
+        cause: StartupCause | str,
+        *,
+        elapsed_seconds: int | float = 0,
+        admission_decision: EarlyDecision | None = None,
+        trusted_provider_evidence: bool = False,
+    ) -> StartupRecoveryDecision:
+        """Return read-only cause handling; the action gate remains authoritative."""
+        return self.recovery_policy.evaluate(
+            cause,
+            elapsed_seconds=elapsed_seconds,
+            admission_decision=admission_decision,
+            trusted_provider_evidence=trusted_provider_evidence,
+        )
 
     def evaluate(
         self,

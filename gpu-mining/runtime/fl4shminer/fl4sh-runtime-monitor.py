@@ -125,7 +125,6 @@ TELEGRAM_LABEL_ENV = "FL4SH_MONITOR_LABEL"
 STARTUP_HASHRATE_TIMEOUT_ENV = "FL4SH_STARTUP_HASHRATE_TIMEOUT_SECONDS"
 DEFAULT_STARTUP_HASHRATE_TIMEOUT_SECONDS = 180
 MAX_STARTUP_HASHRATE_TIMEOUT_SECONDS = 3600
-STARTUP_STOP_GRACE_SECONDS = 5
 READINESS_PATH = os.path.join(tempfile.gettempdir(), "fl4shminer-readiness.json")
 READINESS_MAX_BYTES = 4096
 
@@ -2112,7 +2111,6 @@ def run_supervisor(
     positive_hashrate_seen = False
     startup_timeout_reported = False
     readiness_failed = False
-    terminate_deadline: float | None = None
     monitor = Fl4shMonitor(config, start_monotonic=started_at)
     print(format_config(config, telegram_enabled=notifier_config.enabled), flush=True)
     event_queue: queue.Queue[tuple[str, bytes | None]] = queue.Queue(maxsize=256)
@@ -2250,14 +2248,13 @@ def run_supervisor(
         alert_coordinator.stdout_line(line_text, monitor)
 
     def safe_tick() -> None:
-        nonlocal last_monitor_error, startup_timeout_reported, terminate_deadline
+        nonlocal last_monitor_error, startup_timeout_reported
         now = monotonic()
         current_child = child_ref["child"]
         if current_child is not None and current_child.poll() is None:
             elapsed = max(0.0, now - started_at)
             if not positive_hashrate_seen and not startup_timeout_reported and elapsed >= config.startup_hashrate_timeout_seconds:
                 startup_timeout_reported = True
-                terminate_deadline = now + STARTUP_STOP_GRACE_SECONDS
                 _write_stream(
                     "stdout",
                     (
@@ -2269,9 +2266,6 @@ def run_supervisor(
                     open_streams,
                     write_lock,
                 )
-                _send_signal_to_child(current_child, signal.SIGTERM)
-            elif startup_timeout_reported and terminate_deadline is not None and now >= terminate_deadline:
-                _send_signal_to_child(current_child, signal.SIGKILL)
         try:
             emit(monitor.tick(now=now))
         except Exception as exc:  # The observer must not stop the miner.
@@ -2351,7 +2345,7 @@ def run_supervisor(
     return_code = child.wait()
     # Match the conventional shell status for signal-terminated children. In
     # particular, SIGKILL cannot be installed as a supervisor signal handler.
-    if startup_timeout_reported or readiness_failed:
+    if readiness_failed:
         return 70
     if not positive_hashrate_seen and return_code == 0:
         _write_stream(
