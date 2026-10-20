@@ -33,21 +33,59 @@ from g5_control_plane.config import (
 )
 from g5_control_plane.app import LIVE_GET_TERMINAL_CONFIRMATION, build_service, main, run_manual_live_get
 from g5_control_plane.server import create_server
-from g5_control_plane.service import G5ControlPlaneService
+from g5_control_plane.service import G5ControlPlaneService, _early_gpu_floor_registry
 from g5_control_plane.store import ControlPlaneStore
 from collector.action_ledger import ActionLedger
 from collector.auto_reallocation_gate import AutoReallocationLimits
 from collector.continuous import ContinuousMonitor
 from collector.guard_store import GuardStore
 from collector.gpu_identity import normalize_gpu_identity
-from collector.salad_action_policy import SaladAction
-from collector.salad_action_transport import SaladActionExecutor
+from collector.salad_action_policy import (
+    ActionCapabilityVerifier,
+    SaladAction,
+    SaladActionPolicy,
+    SignedActionCapability,
+)
+from collector.salad_action_transport import (
+    RestrictedSaladActionHTTPTransport,
+    SaladActionExecutor,
+    fixed_action_path,
+)
 from broker_ledger import BrokerLedger, LIVE_SALAD_GET, initialize_ledger
 from broker_offline import KillSwitch
 from live_broker_gate import LiveBrokerGate
 from live_broker_gate import LiveSaladReadSession
 from live_https_transport import LiveHTTPSTransport, LoopbackTLSConfig, ProductionSaladTransport
 from live_secret_boundary import InteractiveSecretProvider, SYNTHETIC_SECRET_VALUE, SyntheticSecretProvider
+
+
+def _signed_live_reallocation_capability(now_epoch: float, *, group: str, instance_id: str):
+    import uuid
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    target = {
+        "organization": "adrianfiverr", "project": "miners", "container_group": group,
+        "instance_id": instance_id, "assignment_id": "assignment-live-preview",
+        "deterioration_id": "offline-live-preview",
+    }
+    action = SaladAction.REALLOCATE_INSTANCE
+    route = fixed_action_path(action, target)
+    private = Ed25519PrivateKey.generate()
+    public_key = private.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    claims = {
+        "schema_version": 1, "audience": "salad-g5-control-plane",
+        "host": "api.salad.com", "organization": "adrianfiverr", "project": "miners",
+        "container_group": group, "action": action.value, "path": route,
+        "issued_at_epoch": now_epoch - 1, "expires_at_epoch": now_epoch + 60,
+        "nonce": str(uuid.uuid4()), "max_requests": 1,
+    }
+    payload = json.dumps(claims, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    capability = SignedActionCapability(payload, private.sign(payload))
+    return capability, ActionCapabilityVerifier(public_key)
 from test_live_broker_gate import GateLocalTLSServer
 
 
@@ -103,8 +141,9 @@ class G5ControlPlaneTests(unittest.TestCase):
         self.assertTrue(state["actions"]["kill_switch_engaged"])
         self.assertEqual(state["economics"]["profit_status"], "UNKNOWN")
         self.assertEqual(state["economics"]["budget"]["status"], "UNKNOWN")
-        self.assertEqual(state["auto_reallocation_gate"]["mode"], "OFFLINE_SIMULATION_ONLY")
+        self.assertEqual(state["auto_reallocation_gate"]["mode"], "OFF")
         self.assertEqual(state["auto_reallocation_gate"]["status"], "DISABLED")
+        self.assertFalse(state["auto_reallocation_gate"]["dispatch_enabled"])
         self.assertFalse(state["auto_reallocation_gate"]["simulation_enabled"])
         self.assertFalse(state["auto_reallocation_gate"]["live_action_eligible"])
         self.assertFalse(state["auto_reallocation_gate"]["dossier_created"])
@@ -282,6 +321,252 @@ class G5ControlPlaneTests(unittest.TestCase):
                     G5Config(**kwargs)
         with self.assertRaises(ValueError):
             create_server(self.service, host="0.0.0.0", port=8765)
+
+    def test_reallocation_admission_config_is_json_only_off_by_default_and_strict(self):
+        defaults = load_config(None, environ={
+            "SALAD_G5_REALLOCATION_ADMISSION_MODE": "LIVE",
+            "SALAD_G5_LIVE_ACTIONS_ENABLED": "true",
+        })
+        self.assertEqual(defaults.reallocation_admission_mode, "OFF")
+        self.assertIsNone(defaults.reallocation_admission_limits)
+        self.assertEqual(defaults.source_for("reallocation_admission_mode"), "DEFAULTS")
+        self.assertFalse(defaults.live_actions_enabled)
+
+        limits = {
+            "max_per_minute": 2, "max_per_day": 12, "cooldown_seconds": 900,
+            "max_per_assignment": 2, "max_per_fleet": 5,
+        }
+        with tempfile.TemporaryDirectory(prefix="g5-admission-config-") as temp:
+            path = Path(temp) / "g5.json"
+            path.write_text(json.dumps({
+                "actions": {
+                    "reallocation_admission_mode": "LIVE",
+                    "reallocation_admission_limits": limits,
+                    "kill_switch_engaged": False,
+                },
+            }), encoding="utf-8")
+            config = load_config(path, environ={"SALAD_G5_REALLOCATION_ADMISSION_MODE": "OFF"})
+            self.assertEqual(config.reallocation_admission_mode, "LIVE")
+            self.assertEqual(dict(config.reallocation_admission_limits), limits)
+            self.assertEqual(config.source_for("reallocation_admission_mode"), "JSON")
+            self.assertEqual(config.source_for("reallocation_admission_limits"), "JSON")
+            self.assertFalse(config.live_actions_enabled)
+            self.assertFalse(config.auto_reallocate)
+
+            invalid_documents = (
+                {"actions": {"reallocation_admission_mode": "live"}},
+                {"actions": {"reallocation_admission_mode": "LIVE", "reallocation_admission_limits": {"max_per_day": 1}}},
+                {"actions": {"reallocation_admission_mode": "LIVE", "reallocation_admission_limits": {**limits, "max_per_minute": True}}},
+                {"actions": {"reallocation_admission_mode": "LIVE", "reallocation_admission_limits": {**limits, "max_per_fleet": 100001}}},
+                {"actions": {"reallocation_admission_mode": "LIVE", "live_actions_enabled": True}},
+            )
+            for index, document in enumerate(invalid_documents):
+                with self.subTest(index=index):
+                    path.write_text(json.dumps(document), encoding="utf-8")
+                    with self.assertRaises(G5ConfigError):
+                        load_config(path, environ={})
+
+    def test_live_admission_service_preview_uses_backend_capability_but_never_dispatches(self):
+        now = datetime(2026, 10, 19, 12, 0, 0, tzinfo=timezone.utc)
+        limits = {
+            "max_per_minute": 2, "max_per_day": 12, "cooldown_seconds": 900,
+            "max_per_assignment": 2, "max_per_fleet": 5,
+        }
+        config = G5Config(
+            reallocation_admission_mode="LIVE",
+            reallocation_admission_limits=limits,
+            kill_switch_engaged=False,
+        )
+        provider_instance = "6bbd35d9-1199-41f6-8a21-316cb41d559f"
+        provider_machine = "56319ab3-d095-9359-b785-159fcf4b11c4"
+        capability, verifier = _signed_live_reallocation_capability(
+            now.timestamp(), group=GROUPS[0], instance_id=provider_instance,
+        )
+        ledger = ActionLedger(":memory:")
+        transport = RestrictedSaladActionHTTPTransport(
+            enabled=False,
+            authorization_capability=capability,
+            authorization_verifier=verifier,
+        )
+
+        class _NoReadSecretProvider:
+            read_attempts = 0
+
+            def read(self):
+                self.read_attempts += 1
+                raise AssertionError("admission preview must not acquire a Salad credential")
+
+        class _ClosedSwitch:
+            enabled = False
+
+        secret_provider = _NoReadSecretProvider()
+        executor = SaladActionExecutor(
+            policy=SaladActionPolicy(hard_budget_usd=30.0),
+            ledger=ledger,
+            transport=transport,
+            secret_provider=secret_provider,
+            kill_switch=_ClosedSwitch(),
+            clock=lambda: now.timestamp(),
+        )
+        service = G5ControlPlaneService(
+            config,
+            action_ledger=ledger,
+            action_executor=executor,
+            clock=lambda: now.timestamp(),
+        )
+        try:
+            policy_hash = service.monitor.policy_hash
+            floor_registry = _early_gpu_floor_registry(config.gpu_floors_ths)
+            observed = (now - timedelta(seconds=3)).isoformat().replace("+00:00", "Z")
+            now_text = now.isoformat().replace("+00:00", "Z")
+            identity = {
+                "organization_id": "adrianfiverr", "project_id": "miners",
+                "container_group_id": GROUPS[0], "instance_id": provider_instance,
+                "machine_id": provider_machine, "assignment_id": "assignment-live-preview",
+                "assignment_generation": "generation-live-preview", "device_index": 1,
+                "gpu_key": "RTX_5080_LAPTOP",
+            }
+            provider_identity = dict(identity)
+            assignment_identity = dict(identity)
+            source_hash = "a" * 64
+            source = {
+                "source": "FL4SHMINER_AUTOTUNE_LOG", "source_reference_sha256": source_hash,
+                "observed_at_utc": observed, "data_classification": "INDEPENDENT_WORKLOAD_EVIDENCE",
+            }
+            policy = {
+                "policy_hash": policy_hash, "gpu_floors_ths": floor_registry,
+                "data_classification": "APPROVED_POLICY",
+            }
+            generation = {
+                "status": "CURRENT", "policy_hash": policy_hash,
+                "assignment_id": identity["assignment_id"],
+                "assignment_generation": identity["assignment_generation"],
+                "observed_at_utc": observed,
+                "valid_from_utc": (now - timedelta(seconds=30)).isoformat().replace("+00:00", "Z"),
+                "valid_until_utc": (now + timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
+                "data_classification": "INDEPENDENT_GENERATION_EVIDENCE",
+            }
+            binding = {
+                "binding_status": "VERIFIED", "policy_hash": policy_hash,
+                "actions_authorized_by_binding": True,
+                "attestation_evidence_id": "offline-binding-proof",
+                "evidence_sha256": "b" * 64,
+                "valid_from_utc": (now - timedelta(seconds=30)).isoformat().replace("+00:00", "Z"),
+                "revalidated_at_utc": observed,
+                "valid_until_utc": (now + timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
+                "provider": provider_identity, "assignment": assignment_identity,
+                "data_classification": "INDEPENDENT_BINDING_ATTESTATION",
+            }
+            provider = {
+                **identity, "reported_state": "running", "observed_at_utc": observed,
+                "data_classification": "PROVIDER_OBSERVED",
+                "source_provenance": {
+                    "system": "salad_api", "host": "api.salad.com",
+                    "transport_tls_hostname_verified": True,
+                },
+            }
+            budget = {
+                "status": "VERIFIED", "currency": "USD",
+                "verified_spend_usd": 1.0, "verified_next_action_cost_usd": 0.1,
+                "pending_exposure_usd": 0.0, "maximum_exposure_usd": 1.1,
+                "spend_evidence_id": "offline-spend", "next_action_cost_evidence_id": "offline-cost",
+                "pending_exposure_evidence_id": "offline-pending", "maximum_exposure_evidence_id": "offline-cap",
+                "spend_observed_at_utc": observed, "next_action_cost_observed_at_utc": observed,
+                "valid_until_utc": (now + timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
+                "data_classification": "INDEPENDENT_FINANCIAL_EVIDENCE",
+            }
+            history = {
+                "history_known": True, "allocation_reallocation_count": 0,
+                "fleet_reallocation_count": 0, "last_reallocation_at_utc": None,
+                "observed_at_utc": observed,
+                "data_classification": "INDEPENDENT_ALLOCATION_HISTORY",
+            }
+            decision = {
+                "decision_version": 1, "state": "EARLY_UNDER_FLOOR",
+                "reason": "UPPER_BOUND_BELOW_THRESHOLD", "signal_type": "PEARL_AUTOTUNE",
+                "device_index": 1, "gpu_key": "RTX_5080_LAPTOP",
+                "estimate_ths": 100.0, "predicted_lower_ths": 96.0,
+                "predicted_upper_ths": 104.0, "floor_ths": floor_registry["RTX_5080_LAPTOP"],
+                "policy_hash": policy_hash, "assignment_id": identity["assignment_id"],
+                "assignment_generation": identity["assignment_generation"],
+                "actions_performed": False, "action_eligible": False,
+                "evaluated_at_utc": now_text, "source_reference_sha256": source_hash,
+                "calibration_status": "APPLIED_APPROVED_MEASURED_PAIRS",
+                "calibration_evidence_sha256": "c" * 64,
+            }
+            before_actions = ledger.snapshot()
+            before_simulations = ledger.auto_reallocation_simulation_snapshot()
+            result = service.preview_auto_reallocation(
+                "EARLY", trigger_evidence=decision, source_evidence=source,
+                policy_evidence=policy, generation_evidence=generation,
+                provider_binding=binding, provider_revalidation=provider,
+                budget_evidence=budget, allocation_history=history,
+                fleet_id="fleet-live-preview", now_utc=now_text,
+            )
+            self.assertEqual(result["status"], "LIVE_ADMISSION_ELIGIBLE", result)
+            self.assertTrue(result["live_action_eligible"])
+            self.assertTrue(result["admission_only"])
+            self.assertFalse(result["simulation_only"])
+            self.assertFalse(result["actions_performed"])
+            self.assertFalse(result["request_submitted"])
+            state = service.state()
+            self.assertEqual(state["auto_reallocation_gate"]["mode"], "LIVE")
+            self.assertEqual(state["auto_reallocation_gate"]["status"], "LIVE_ADMISSION_ONLY")
+            self.assertTrue(state["auto_reallocation_gate"]["live_action_eligible"])
+            self.assertFalse(state["auto_reallocation_gate"]["dispatch_enabled"])
+            self.assertFalse(state["actions"]["live_actions_enabled"])
+            self.assertFalse(state["actions"]["auto_reallocate"])
+            self.assertFalse(transport.enabled)
+
+            # The service was composed while this exact transport was disabled.
+            # A later enablement must be observed by the next LIVE preview.
+            transport.enabled = True
+            reenabled_transport_result = service.preview_auto_reallocation(
+                "EARLY", trigger_evidence=decision, source_evidence=source,
+                policy_evidence=policy, generation_evidence=generation,
+                provider_binding=binding, provider_revalidation=provider,
+                budget_evidence=budget, allocation_history=history,
+                fleet_id="fleet-live-preview", now_utc=now_text,
+            )
+            self.assertEqual(reenabled_transport_result["status"], "BLOCKED")
+            self.assertIn("LIVE_TRANSPORT_MUST_REMAIN_DISABLED", reenabled_transport_result["blockers"])
+            self.assertFalse(reenabled_transport_result["live_action_eligible"])
+            transport.enabled = False
+            eligible_again = service.preview_auto_reallocation(
+                "EARLY", trigger_evidence=decision, source_evidence=source,
+                policy_evidence=policy, generation_evidence=generation,
+                provider_binding=binding, provider_revalidation=provider,
+                budget_evidence=budget, allocation_history=history,
+                fleet_id="fleet-live-preview", now_utc=now_text,
+            )
+            self.assertEqual(eligible_again["status"], "LIVE_ADMISSION_ELIGIBLE", eligible_again)
+            service.set_kill_switch(True)
+            post_kill_state = service.state()["auto_reallocation_gate"]
+            self.assertFalse(post_kill_state["live_action_eligible"])
+            self.assertTrue(post_kill_state["reviews"]["EARLY"]["historical_live_action_eligible"])
+            self.assertFalse(post_kill_state["reviews"]["EARLY"]["live_action_eligible"])
+            self.assertFalse(post_kill_state["reviews"]["EARLY"]["eligibility_current"])
+            self.assertEqual(
+                post_kill_state["reviews"]["EARLY"]["eligibility_invalidation_reason"],
+                "SAFETY_CONTROL_CHANGED",
+            )
+            service.set_kill_switch(False)
+            self.assertFalse(service.state()["auto_reallocation_gate"]["live_action_eligible"])
+            self.assertEqual(secret_provider.read_attempts, 0)
+            self.assertEqual(ledger.snapshot(), before_actions)
+            self.assertEqual(ledger.auto_reallocation_simulation_snapshot(), before_simulations)
+
+            action_result = service.request_action(
+                "REALLOCATE_INSTANCE",
+                {"container_group": GROUPS[0], "instance_id": provider_instance,
+                 "assignment_id": identity["assignment_id"], "deterioration_id": "attempt"},
+            )
+            self.assertEqual(action_result["status"], "BLOCKED")
+            self.assertEqual(secret_provider.read_attempts, 0)
+            self.assertEqual(ledger.snapshot(), before_actions)
+            self.assertEqual(service.set_auto_reallocate(True)["status"], "BLOCKED")
+        finally:
+            service.close()
 
     def test_internal_auto_gate_preview_is_closed_and_never_creates_an_action_dossier(self):
         service = G5ControlPlaneService(G5Config())

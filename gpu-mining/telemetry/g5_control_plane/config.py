@@ -76,6 +76,11 @@ MONITOR_ENVIRONMENT = {
     "SALAD_G5_CONSECUTIVE_BAD_WINDOWS": "consecutive_bad_windows",
 }
 PRICE_ENVIRONMENT = "SALAD_G5_HOURLY_PRICE_USD_ESTIMATE"
+REALLOCATION_ADMISSION_MODES = frozenset({"OFF", "SIMULATION", "LIVE"})
+REALLOCATION_ADMISSION_LIMIT_KEYS = frozenset({
+    "max_per_minute", "max_per_day", "cooldown_seconds",
+    "max_per_assignment", "max_per_fleet",
+})
 
 
 class G5ConfigError(ValueError):
@@ -98,6 +103,19 @@ def _integer(value: Any, name: str, *, allow_zero: bool = False) -> int:
         qualifier = "non-negative" if allow_zero else "positive"
         raise G5ConfigError(f"{name} must be a {qualifier} integer")
     return value
+
+
+def _validate_reallocation_admission_limits(value: Any) -> dict[str, int] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != REALLOCATION_ADMISSION_LIMIT_KEYS:
+        raise G5ConfigError("reallocation admission limits must include every bounded quota and cooldown")
+    limits: dict[str, int] = {}
+    for key in sorted(REALLOCATION_ADMISSION_LIMIT_KEYS):
+        limits[key] = _integer(value[key], f"reallocation_admission_limits.{key}", allow_zero=key == "cooldown_seconds")
+        if limits[key] > 100_000:
+            raise G5ConfigError("reallocation admission limits exceed the supported numeric limit")
+    return limits
 
 
 def _validate_floors(value: Any) -> dict[str, float]:
@@ -261,6 +279,8 @@ class G5Config:
     live_actions_enabled: bool = False
     live_spend_authorized: bool = False
     auto_reallocate: bool = False
+    reallocation_admission_mode: str = "OFF"
+    reallocation_admission_limits: Mapping[str, int] | None = None
     hard_budget_usd: float = 30.0
     kill_switch_engaged: bool = True
     firebase_enabled: bool = False
@@ -297,6 +317,14 @@ class G5Config:
             raise G5ConfigError("all G5 feature and safety flags must be JSON booleans")
         if self.firebase_enabled or self.firebase_project_id != "demo-salad-miners":
             raise G5ConfigError("Firebase production is unavailable; only the local demo project is allowed")
+        if type(self.reallocation_admission_mode) is not str or self.reallocation_admission_mode not in REALLOCATION_ADMISSION_MODES:
+            raise G5ConfigError("reallocation admission mode must be OFF, SIMULATION, or LIVE")
+        admission_limits = _validate_reallocation_admission_limits(self.reallocation_admission_limits)
+        object.__setattr__(
+            self,
+            "reallocation_admission_limits",
+            MappingProxyType(admission_limits) if admission_limits is not None else None,
+        )
         floors = _validate_floors(self.gpu_floors_ths)
         if not floors:
             raise G5ConfigError("at least one verified GPU floor must be configured")
@@ -355,11 +383,15 @@ class G5Config:
                 for key, value in monitor.items()
             })
             sources["salad_hourly_price_usd_estimate"] = "DEFAULTS" if self.salad_hourly_price_usd_estimate is None else "PYTHON"
+            sources["reallocation_admission_mode"] = "DEFAULTS" if self.reallocation_admission_mode == "OFF" else "PYTHON"
+            sources["reallocation_admission_limits"] = "DEFAULTS" if admission_limits is None else "PYTHON"
             object.__setattr__(self, "value_sources", MappingProxyType(sources))
         elif any(origin not in {"DEFAULTS", "JSON", "ENV", "PYTHON", "LEGACY_JSON", "LEGACY_ENV"} for origin in self.value_sources.values()):
             raise G5ConfigError("configuration source labels are invalid")
         else:
             sources = dict(self.value_sources)
+            sources.setdefault("reallocation_admission_mode", "DEFAULTS" if self.reallocation_admission_mode == "OFF" else "PYTHON")
+            sources.setdefault("reallocation_admission_limits", "DEFAULTS" if admission_limits is None else "PYTHON")
             for key, value in pearl_floors.items():
                 sources.setdefault(
                     f"pearl_startup_floors_ths.{key}",
@@ -416,6 +448,12 @@ def _parse(value: Mapping[str, Any], *, environ: Mapping[str, str] | None = None
             sources[key] = "DEFAULTS"
     price = value.get("salad_hourly_price_usd_estimate")
     sources["salad_hourly_price_usd_estimate"] = "JSON" if "salad_hourly_price_usd_estimate" in value else "DEFAULTS"
+    sources["reallocation_admission_mode"] = (
+        "JSON" if "reallocation_admission_mode" in actions else "DEFAULTS"
+    )
+    sources["reallocation_admission_limits"] = (
+        "JSON" if "reallocation_admission_limits" in actions else "DEFAULTS"
+    )
 
     env = os.environ if environ is None else environ
     env_pearl_floors: dict[str, float] = {}
@@ -482,6 +520,8 @@ def _parse(value: Mapping[str, Any], *, environ: Mapping[str, str] | None = None
         live_actions_enabled=actions.get("live_actions_enabled", False),
         live_spend_authorized=actions.get("live_spend_authorized", False),
         auto_reallocate=actions.get("auto_reallocate", False),
+        reallocation_admission_mode=actions.get("reallocation_admission_mode", "OFF"),
+        reallocation_admission_limits=actions.get("reallocation_admission_limits"),
         hard_budget_usd=actions.get("hard_budget_usd", 30.0),
         kill_switch_engaged=actions.get("kill_switch_engaged", True),
         firebase_enabled=value.get("firebase_enabled", False),

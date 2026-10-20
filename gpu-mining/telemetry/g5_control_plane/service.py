@@ -1,4 +1,7 @@
-"""Backend service composing existing guard/economics code with G5 gates."""
+"""Backend service composing existing guard/economics code with G5 gates.
+
+Reallocation LIVE mode is admission-only; provider action dispatch stays disabled.
+"""
 
 from __future__ import annotations
 
@@ -27,7 +30,13 @@ from collector.fl4sh_early_autotune import (
 from collector.fleet_hashrate_rollups import MAXIMUM_SAMPLE_RECORDS_PER_TRACK, build_hashrate_rollups
 from collector.guard_store import GuardStore
 from collector.reallocation_controller import ReallocationController, ReallocationPolicy
-from collector.salad_action_policy import SaladAction, SaladActionPolicy
+from collector.salad_action_policy import (
+    ActionCapabilityVerifier,
+    SaladAction,
+    SaladActionPolicy,
+    SignedActionCapability,
+)
+from collector.salad_action_transport import RestrictedSaladActionHTTPTransport, SaladActionExecutor
 from collector.salad_billing_cost import operator_reaction_cost_scenarios
 from collector.startup_admission import StartupAdmissionEngine
 from collector.startup_recovery_policy import StartupCause, StartupRecoveryPolicy
@@ -106,6 +115,8 @@ class G5ControlPlaneService:
         self.monitor = ContinuousMonitor(self.guard_store, self.guard_policy)
         self.action_ledger = action_ledger or ActionLedger(":memory:")
         self._auto_gate_reviews: dict[str, dict[str, Any]] = {}
+        self._auto_gate_safety_revision = 0
+        self._auto_gate_reviews_invalidated: set[str] = set()
         self.action_policy = SaladActionPolicy(hard_budget_usd=config.hard_budget_usd)
         self.read_session = read_session
         self.offline_read_broker = offline_read_broker
@@ -172,17 +183,77 @@ class G5ControlPlaneService:
             self.store.close()
 
     def _build_auto_reallocation_gate(self) -> AutoReallocationGate:
+        if self._simulation_armed:
+            admission_mode = "SIMULATION"
+            limits = self._simulation_limits or AutoReallocationLimits()
+        else:
+            admission_mode = self.config.reallocation_admission_mode
+            raw_limits = self.config.reallocation_admission_limits
+            limits = (
+                AutoReallocationLimits(**dict(raw_limits))
+                if raw_limits is not None
+                else AutoReallocationLimits()
+            )
+        capability = None
+        verifier = None
+        transport_disabled = self._live_action_transport_is_disabled()
+        executor = self.action_executor
+        transport = getattr(executor, "transport", None)
+        if type(executor) is SaladActionExecutor and type(transport) is RestrictedSaladActionHTTPTransport:
+            candidate_capability = getattr(transport, "authorization_capability", None)
+            candidate_verifier = getattr(transport, "authorization_verifier", None)
+            capability = candidate_capability if type(candidate_capability) is SignedActionCapability else None
+            verifier = candidate_verifier if type(candidate_verifier) is ActionCapabilityVerifier else None
         return AutoReallocationGate(
             self.action_ledger,
             policy_hash=self.monitor.policy_hash,
             gpu_floors_ths=_early_gpu_floor_registry(self.config.gpu_floors_ths),
-            limits=self._simulation_limits or AutoReallocationLimits(),
+            limits=limits,
             hard_budget_cap_usd=min(float(self.config.hard_budget_usd), 30.0),
             maximum_evidence_age_seconds=(
                 self.config.maximum_sample_gap_seconds
                 + self.config.reevaluation_interval_seconds * self.config.consecutive_bad_windows
             ),
             simulation_enabled=self._simulation_armed,
+            admission_mode=admission_mode,
+            action_capability=capability,
+            action_capability_verifier=verifier,
+            live_transport_disabled=transport_disabled,
+        )
+
+    def _live_action_transport_is_disabled(self) -> bool:
+        """Read the current exact transport state; unknown transports fail closed."""
+        try:
+            executor = self.action_executor
+            transport = getattr(executor, "transport", None)
+            return (
+                type(executor) is SaladActionExecutor
+                and type(transport) is RestrictedSaladActionHTTPTransport
+                and transport.enabled is False
+            )
+        except Exception:
+            return False
+
+    def _current_live_admission_controls_allow(self) -> bool:
+        return (
+            self.auto_reallocation_gate.admission_mode == "LIVE"
+            and self.config.reallocation_admission_mode == "LIVE"
+            and self.auto_reallocation_gate.simulation_enabled is False
+            and self._simulation_armed is False
+            and self._auto_armed is False
+            and self._kill_switch_engaged is False
+            and self.config.live_actions_enabled is False
+            and self._live_action_transport_is_disabled()
+        )
+
+    def _auto_gate_review_is_currently_eligible(
+        self, trigger_kind: str, result: Mapping[str, Any],
+    ) -> bool:
+        return (
+            result.get("live_action_eligible") is True
+            and result.get("_safety_revision") == self._auto_gate_safety_revision
+            and trigger_kind not in self._auto_gate_reviews_invalidated
+            and self._current_live_admission_controls_allow()
         )
 
     def arm_auto_reallocation_simulation(self, limits: AutoReallocationLimits) -> dict[str, Any]:
@@ -192,6 +263,7 @@ class G5ControlPlaneService:
                 type(limits) is AutoReallocationLimits
                 and limits.complete()
                 and not self._kill_switch_engaged
+                and self.config.reallocation_admission_mode != "LIVE"
                 and self.config.live_actions_enabled is False
                 and self._auto_armed is False
             )
@@ -255,6 +327,7 @@ class G5ControlPlaneService:
                 + self.config.reevaluation_interval_seconds * self.config.consecutive_bad_windows
             ),
             simulation_enabled=armed,
+            admission_mode="SIMULATION",
         )
 
     def disarm_auto_reallocation_simulation(self) -> dict[str, Any]:
@@ -490,11 +563,19 @@ class G5ControlPlaneService:
     ) -> dict[str, Any]:
         """Run a non-executable gate preview; no web route calls this method."""
         with self._lock:
+            admission_mode = self.auto_reallocation_gate.admission_mode
+            if admission_mode == "LIVE":
+                # The transport is mutable. Refresh this exact-type check for
+                # every preview so a later enablement cannot reuse the startup
+                # snapshot captured when the service was constructed.
+                self.auto_reallocation_gate.live_transport_disabled = (
+                    self._live_action_transport_is_disabled()
+                )
             controls = {
                 "kill_switch_engaged": self._kill_switch_engaged,
-                # This input controls only the synthetic admission gate. The
-                # production auto-arm remains permanently false in this build.
-                "auto_armed": self._simulation_armed,
+                # SIMULATION uses its existing internal arm. LIVE admission is
+                # preview-only here and requires the real dispatch arm to stay off.
+                "auto_armed": self._simulation_armed if admission_mode == "SIMULATION" else self._auto_armed,
                 "live_actions_enabled": self.config.live_actions_enabled,
                 "g5_authorized": False,
             }
@@ -518,8 +599,13 @@ class G5ControlPlaneService:
                 return {"status": "BLOCKED", "blockers": ["TRIGGER_KIND_UNSUPPORTED"],
                         "actions_performed": False, "request_submitted": False,
                         "dossier_created": False, "live_action_eligible": False,
-                        "simulation_only": True}
-            self._auto_gate_reviews[trigger_kind] = result
+                        "simulation_only": admission_mode == "SIMULATION",
+                        "admission_only": admission_mode == "LIVE",
+                        "admission_mode": admission_mode}
+            stored_result = dict(result)
+            stored_result["_safety_revision"] = self._auto_gate_safety_revision
+            self._auto_gate_reviews[trigger_kind] = stored_result
+            self._auto_gate_reviews_invalidated.discard(trigger_kind)
             self.store.append_audit(
                 "AUTO_REALLOCATION_GATE_REVIEWED",
                 {
@@ -527,10 +613,13 @@ class G5ControlPlaneService:
                     "status": result.get("status"),
                     "blockers": result.get("blockers", []),
                     "policy_hash": self.monitor.policy_hash,
-                    "simulation_only": True,
+                    "admission_mode": admission_mode,
+                    "simulation_only": result.get("simulation_only") is True,
+                    "admission_only": result.get("admission_only") is True,
                     "actions_performed": False,
                     "request_submitted": False,
                     "dossier_created": False,
+                    "live_action_eligible": result.get("live_action_eligible") is True,
                 },
                 _now_utc(),
             )
@@ -1167,8 +1256,24 @@ class G5ControlPlaneService:
                 "fleets": fleets,
                 "actions": {"live_actions_enabled": False, "auto_reallocate": False, "auto_armed": self._auto_armed, "simulation_armed": self._simulation_armed, "kill_switch_engaged": self._kill_switch_engaged, "reallocation_enabled": False, "actions_performed": False},
                 "auto_reallocation_gate": {
-                    "mode": "OFFLINE_SIMULATION_ONLY",
-                    "status": "SIMULATION_ARMED" if self._simulation_armed else "DISABLED",
+                    "mode": self.auto_reallocation_gate.admission_mode,
+                    "configured_mode": self.config.reallocation_admission_mode,
+                    "mode_source": self.config.source_for("reallocation_admission_mode"),
+                    "status": (
+                        "LIVE_ADMISSION_ONLY"
+                        if self.auto_reallocation_gate.admission_mode == "LIVE"
+                        else "SIMULATION_ARMED" if self._simulation_armed
+                        else "SIMULATION_DISARMED" if self.auto_reallocation_gate.admission_mode == "SIMULATION"
+                        else "DISABLED"
+                    ),
+                    "admission_only": self.auto_reallocation_gate.admission_mode == "LIVE",
+                    "dispatch_enabled": False,
+                    "configured_limits": (
+                        dict(self.config.reallocation_admission_limits)
+                        if self.config.reallocation_admission_limits is not None
+                        else None
+                    ),
+                    "limits_source": self.config.source_for("reallocation_admission_limits"),
                     "simulation_enabled": self.auto_reallocation_gate.simulation_enabled,
                     "policy_hash": self.monitor.policy_hash,
                     "hard_budget_cap_usd": min(float(self.config.hard_budget_usd), 30.0),
@@ -1177,10 +1282,24 @@ class G5ControlPlaneService:
                             "status": result.get("status"),
                             "blockers": result.get("blockers", []),
                             "evidence_classification": result.get("evidence_classification", "UNKNOWN"),
+                            "admission_mode": result.get("admission_mode", self.auto_reallocation_gate.admission_mode),
+                            "simulation_only": result.get("simulation_only") is True,
+                            "admission_only": result.get("admission_only") is True,
                             "actions_performed": False,
                             "request_submitted": False,
                             "dossier_created": False,
-                            "live_action_eligible": False,
+                            "historical_live_action_eligible": result.get("live_action_eligible") is True,
+                            "live_action_eligible": self._auto_gate_review_is_currently_eligible(kind, result),
+                            "eligibility_current": (
+                                result.get("_safety_revision") == self._auto_gate_safety_revision
+                                and kind not in self._auto_gate_reviews_invalidated
+                            ),
+                            "eligibility_invalidation_reason": (
+                                "SAFETY_CONTROL_CHANGED"
+                                if result.get("_safety_revision") != self._auto_gate_safety_revision
+                                or kind in self._auto_gate_reviews_invalidated
+                                else None
+                            ),
                         }
                         for kind, result in sorted(self._auto_gate_reviews.items())
                     },
@@ -1189,7 +1308,10 @@ class G5ControlPlaneService:
                     "actions_performed": False,
                     "request_submitted": False,
                     "dossier_created": False,
-                    "live_action_eligible": False,
+                    "live_action_eligible": any(
+                        self._auto_gate_review_is_currently_eligible(kind, result)
+                        for kind, result in self._auto_gate_reviews.items()
+                    ),
                 },
             }
 
@@ -1243,6 +1365,8 @@ class G5ControlPlaneService:
             raise ValueError("kill switch command must be boolean")
         with self._lock:
             self._kill_switch_engaged = engaged
+            self._auto_gate_safety_revision += 1
+            self._auto_gate_reviews_invalidated.update(self._auto_gate_reviews)
             # Any change to this safety control closes the synthetic path. A
             # caller must explicitly re-arm after reviewing the new state.
             self._simulation_armed = False

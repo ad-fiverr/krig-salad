@@ -1,7 +1,8 @@
-"""Offline-only admission model for the SCRUM-101 early and steady-state paths.
+"""Admission model for early and steady-state reallocation recommendations.
 
-This module can reserve a local simulation record. It cannot construct a provider
-request, create an action dossier, or change the existing provider-action ledger.
+SIMULATION can reserve a local simulation record. LIVE evaluates read-only
+eligibility only. Neither mode constructs provider requests, creates action
+dossiers, or changes the provider-action ledger through this gate.
 """
 
 from __future__ import annotations
@@ -18,7 +19,16 @@ from typing import Any
 
 from .action_ledger import ActionLedger, _reject_secrets
 from .guard_store import canonical_utc
-from .salad_action_policy import APPROVED_GROUPS, APPROVED_ORGANIZATION, APPROVED_PROJECT, HARD_BUDGET_CAP_USD
+from .salad_action_policy import (
+    ActionCapabilityVerifier,
+    APPROVED_GROUPS,
+    APPROVED_ORGANIZATION,
+    APPROVED_PROJECT,
+    HARD_BUDGET_CAP_USD,
+    SaladAction,
+    SignedActionCapability,
+)
+from .salad_action_transport import fixed_action_path
 
 
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -34,6 +44,16 @@ _EARLY_FIELDS = frozenset({
 _APPROVED_CALIBRATION = "APPLIED_APPROVED_MEASURED_PAIRS"
 _SYNTHETIC_FIXTURE = "G5-SYNTHETIC-ACTION-PATH"
 _MAX_HARD_BUDGET = Decimal("30.00")
+_ADMISSION_MODES = frozenset({"OFF", "SIMULATION", "LIVE"})
+_LIVE_ACTION_STATES = frozenset({
+    "RESERVED", "SEND_STARTED", "ACCEPTED_PENDING", "RECONCILIATION_REQUIRED", "UNKNOWN",
+})
+_KNOWN_LEDGER_STATES = frozenset({
+    "DRY_RUN_RESERVED", "MOCK_ACCEPTED_PENDING", "MOCK_CONFIRMED", "BLOCKED",
+    "RECONCILIATION_REQUIRED", "UNKNOWN", "RESERVED", "SEND_STARTED",
+    "ACCEPTED_PENDING", "RECONCILED_OBSERVED_CHANGE",
+    "RECONCILED_SYNTHETIC_SIMULATION", "ABORTED_PRE_SEND",
+})
 
 
 def _finite_number(value: Any) -> float | None:
@@ -130,6 +150,10 @@ class AutoReallocationGate:
         hard_budget_cap_usd: Any = HARD_BUDGET_CAP_USD,
         maximum_evidence_age_seconds: int = 90,
         simulation_enabled: bool = False,
+        admission_mode: str = "SIMULATION",
+        action_capability: SignedActionCapability | None = None,
+        action_capability_verifier: ActionCapabilityVerifier | None = None,
+        live_transport_disabled: bool = False,
     ):
         if type(ledger) is not ActionLedger:
             raise TypeError("auto reallocation gate requires the local ActionLedger")
@@ -153,6 +177,14 @@ class AutoReallocationGate:
             raise ValueError("maximum evidence age must be positive")
         if type(simulation_enabled) is not bool:
             raise ValueError("simulation_enabled must be boolean")
+        if type(admission_mode) is not str or admission_mode not in _ADMISSION_MODES:
+            raise ValueError("admission mode must be OFF, SIMULATION, or LIVE")
+        if type(live_transport_disabled) is not bool:
+            raise ValueError("live transport state must be boolean")
+        if action_capability is not None and type(action_capability) is not SignedActionCapability:
+            raise TypeError("action capability must use the exact signed capability type")
+        if action_capability_verifier is not None and type(action_capability_verifier) is not ActionCapabilityVerifier:
+            raise TypeError("action capability verifier must use the exact verifier type")
         if limits is not None and type(limits) is not AutoReallocationLimits:
             raise TypeError("limits must be AutoReallocationLimits")
         self.ledger = ledger
@@ -162,6 +194,10 @@ class AutoReallocationGate:
         self.hard_budget_cap_usd = hard_cap
         self.maximum_evidence_age_seconds = maximum_evidence_age_seconds
         self.simulation_enabled = simulation_enabled
+        self.admission_mode = admission_mode
+        self.action_capability = action_capability
+        self.action_capability_verifier = action_capability_verifier
+        self.live_transport_disabled = live_transport_disabled
 
     def assess_early(
         self,
@@ -554,20 +590,110 @@ class AutoReallocationGate:
                 elif prior_action is not None and (now - prior_action).total_seconds() < int(self.limits.cooldown_seconds):
                     blockers.append("ASSIGNMENT_COOLDOWN_ACTIVE")
         if not self.limits.complete():
-            blockers.append("SIMULATION_QUOTAS_OR_COOLDOWN_UNCONFIGURED")
-        if self.simulation_enabled is not True:
-            blockers.append("SIMULATION_GATE_DISABLED")
+            blockers.append(
+                "LIVE_QUOTAS_OR_COOLDOWN_UNCONFIGURED"
+                if self.admission_mode == "LIVE"
+                else "SIMULATION_QUOTAS_OR_COOLDOWN_UNCONFIGURED"
+            )
         if type(kill_switch_engaged) is not bool or kill_switch_engaged:
             blockers.append("KILL_SWITCH_ACTIVE_OR_UNKNOWN")
-        if type(auto_armed) is not bool or not auto_armed:
-            blockers.append("AUTO_REALLOCATE_NOT_ARMED_FOR_SIMULATION")
-        if live_actions_enabled is not False or g5_authorized is not False:
-            blockers.append("LIVE_ACTION_PATH_MUST_REMAIN_DISABLED")
+
+        live_action_key: str | None = None
+        if self.admission_mode == "OFF":
+            blockers.append("ADMISSION_MODE_OFF")
+        elif self.admission_mode == "SIMULATION":
+            if self.simulation_enabled is not True:
+                blockers.append("SIMULATION_GATE_DISABLED")
+            if type(auto_armed) is not bool or not auto_armed:
+                blockers.append("AUTO_REALLOCATE_NOT_ARMED_FOR_SIMULATION")
+            if live_actions_enabled is not False or g5_authorized is not False:
+                blockers.append("LIVE_ACTION_PATH_MUST_REMAIN_DISABLED")
+        elif self.admission_mode == "LIVE":
+            if self.simulation_enabled is not False:
+                blockers.append("LIVE_ADMISSION_CONFLICTS_WITH_SIMULATION")
+            if type(auto_armed) is not bool or auto_armed:
+                blockers.append("AUTO_REALLOCATE_MUST_REMAIN_DISARMED")
+            if live_actions_enabled is not False or g5_authorized is not False:
+                blockers.append("LIVE_ACTION_DISPATCH_MUST_REMAIN_DISABLED")
+            if self.live_transport_disabled is not True:
+                blockers.append("LIVE_TRANSPORT_MUST_REMAIN_DISABLED")
+            if is_synthetic:
+                blockers.append("SYNTHETIC_EVIDENCE_CANNOT_AUTHORIZE_LIVE_ADMISSION")
+            if allocation_history.get("data_classification") != "INDEPENDENT_ALLOCATION_HISTORY":
+                blockers.append("INDEPENDENT_ALLOCATION_HISTORY_REQUIRED")
+            if type(self.action_capability) is not SignedActionCapability:
+                blockers.append("SIGNED_REALLOCATION_CAPABILITY_REQUIRED")
+            if type(self.action_capability_verifier) is not ActionCapabilityVerifier:
+                blockers.append("TRUSTED_REALLOCATION_CAPABILITY_VERIFIER_REQUIRED")
+            group = provider.get("container_group_id")
+            instance_id = provider.get("instance_id")
+            deterioration_id = trigger_facts.get("action_key")
+            if not self._text_id(deterioration_id):
+                deterioration_id = _digest(
+                    trigger_kind, trigger_facts, assignment_id, assignment_generation,
+                    source_reference_sha256, self.policy_hash,
+                )
+            live_target = {
+                "organization": provider.get("organization_id"),
+                "project": provider.get("project_id"),
+                "container_group": group,
+                "instance_id": instance_id,
+                "assignment_id": assignment_id,
+                "deterioration_id": deterioration_id,
+            }
+            try:
+                route = fixed_action_path(SaladAction.REALLOCATE_INSTANCE, live_target)
+                live_action_key = ActionLedger.live_key_for(
+                    action=SaladAction.REALLOCATE_INSTANCE.value,
+                    target=live_target,
+                )
+            except (TypeError, ValueError):
+                route = None
+                blockers.append("FIXED_REALLOCATION_TARGET_INVALID")
+            if route is not None and type(self.action_capability_verifier) is ActionCapabilityVerifier:
+                try:
+                    capability_valid = self.action_capability_verifier.verify(
+                        self.action_capability,
+                        action=SaladAction.REALLOCATE_INSTANCE,
+                        target=live_target,
+                        route=route,
+                        now_epoch=now.timestamp(),
+                    )
+                except Exception:
+                    capability_valid = False
+                if not capability_valid:
+                    blockers.append("SIGNED_REALLOCATION_CAPABILITY_INVALID")
+            if route is not None and live_action_key is not None:
+                blockers.extend(self._live_ledger_blockers(
+                    action_key=live_action_key,
+                    target=live_target,
+                    allocation_history=allocation_history,
+                    now=now,
+                ))
 
         blockers = sorted(set(blockers))
         if blockers:
             return self._blocked(trigger_kind, blockers, gpu_key=gpu_key, policy_hash=self.policy_hash,
                                  data_classification="SYNTHETIC/UNVERIFIED" if is_synthetic else "UNKNOWN")
+
+        if self.admission_mode == "LIVE":
+            result = self._result(
+                trigger_kind,
+                "LIVE_ADMISSION_ELIGIBLE",
+                gpu_key=gpu_key,
+                policy_hash=self.policy_hash,
+                data_classification="PROVIDER_EVIDENCE_PRESENT_ADMISSION_ONLY",
+                admission_mode="LIVE",
+                simulation_only=False,
+                live_action_eligible=True,
+            )
+            result.update({
+                "admission_only": True,
+                "actions_performed": False,
+                "request_submitted": False,
+                "dossier_created": False,
+            })
+            return result
 
         identity = {key: provider[key] for key in ("organization_id", "project_id", "container_group_id", "instance_id", "machine_id")}
         trigger_digest = _digest(trigger_kind, trigger_facts, identity, fleet_id)
@@ -616,6 +742,113 @@ class AutoReallocationGate:
             data_classification=payload["data_classification"],
         )
 
+    def _live_ledger_blockers(
+        self,
+        *,
+        action_key: str,
+        target: Mapping[str, Any],
+        allocation_history: Mapping[str, Any],
+        now: datetime,
+    ) -> list[str]:
+        """Read existing provider actions for LIVE admission without reserving or mutating."""
+        blockers: list[str] = []
+        try:
+            rows = self.ledger.snapshot()
+        except Exception:
+            return ["ACTION_LEDGER_UNAVAILABLE"]
+        if not isinstance(rows, list):
+            return ["ACTION_LEDGER_HISTORY_INVALID"]
+
+        minute_count = 0
+        daily_count = 0
+        assignment_count = 0
+        fleet_count = 0
+        latest_assignment_action: datetime | None = None
+        active_actions = {"START_GROUP", "STOP_GROUP", "REALLOCATE_INSTANCE"}
+        for row in rows:
+            if not isinstance(row, Mapping):
+                blockers.append("ACTION_LEDGER_HISTORY_INVALID")
+                continue
+            state = row.get("state")
+            recommendation = row.get("recommendation")
+            if state not in _KNOWN_LEDGER_STATES or not isinstance(recommendation, Mapping):
+                blockers.append("ACTION_LEDGER_HISTORY_INVALID")
+                continue
+            action = recommendation.get("action")
+            recorded_key = row.get("action_key")
+            if action not in active_actions:
+                blockers.append("ACTION_LEDGER_HISTORY_INVALID")
+                continue
+            if not self._text_id(recorded_key):
+                blockers.append("ACTION_LEDGER_HISTORY_INVALID")
+                continue
+            if state in _LIVE_ACTION_STATES:
+                blockers.append("UNRESOLVED_PROVIDER_ACTION_IN_LEDGER")
+            if recorded_key == action_key:
+                blockers.append("LIVE_IDEMPOTENCY_KEY_ALREADY_PRESENT")
+            if action != "REALLOCATE_INSTANCE":
+                continue
+
+            previous_target = recommendation.get("target")
+            if not isinstance(previous_target, Mapping):
+                blockers.append("ACTION_LEDGER_HISTORY_INVALID")
+                continue
+            if (
+                previous_target.get("organization") != APPROVED_ORGANIZATION
+                or previous_target.get("project") != APPROVED_PROJECT
+                or previous_target.get("container_group") not in APPROVED_GROUPS
+                or not self._text_id(previous_target.get("assignment_id"))
+            ):
+                blockers.append("ACTION_LEDGER_HISTORY_INVALID")
+                continue
+            created_at = _utc(row.get("created_at_utc"))
+            if created_at is None or created_at > now:
+                blockers.append("ACTION_LEDGER_TIME_INVALID")
+                continue
+            age = (now - created_at).total_seconds()
+            if age < 60:
+                minute_count += 1
+            if age < 86400:
+                daily_count += 1
+                if (
+                    previous_target.get("organization") == target.get("organization")
+                    and previous_target.get("project") == target.get("project")
+                ):
+                    fleet_count += 1
+                if previous_target.get("assignment_id") == target.get("assignment_id"):
+                    assignment_count += 1
+            if (
+                previous_target.get("assignment_id") == target.get("assignment_id")
+                and (latest_assignment_action is None or created_at > latest_assignment_action)
+            ):
+                # Cooldown is independently based on the newest known action;
+                # it is not reset by the daily quota's 24-hour counting window.
+                latest_assignment_action = created_at
+
+        if not self.limits.complete():
+            blockers.append("LIVE_QUOTAS_OR_COOLDOWN_UNCONFIGURED")
+            return sorted(set(blockers))
+        if minute_count >= int(self.limits.max_per_minute):
+            blockers.append("LIVE_MINUTE_QUOTA")
+        if daily_count >= int(self.limits.max_per_day):
+            blockers.append("LIVE_DAILY_QUOTA")
+        recorded_assignment_count = allocation_history.get("allocation_reallocation_count")
+        recorded_fleet_count = allocation_history.get("fleet_reallocation_count")
+        if type(recorded_assignment_count) is int:
+            assignment_count = max(assignment_count, recorded_assignment_count)
+        if type(recorded_fleet_count) is int:
+            fleet_count = max(fleet_count, recorded_fleet_count)
+        if assignment_count >= int(self.limits.max_per_assignment):
+            blockers.append("ASSIGNMENT_DAILY_QUOTA")
+        if fleet_count >= int(self.limits.max_per_fleet):
+            blockers.append("FLEET_DAILY_QUOTA")
+        prior_action = _utc(allocation_history.get("last_reallocation_at_utc"))
+        if latest_assignment_action is not None and (prior_action is None or latest_assignment_action > prior_action):
+            prior_action = latest_assignment_action
+        if prior_action is not None and (now - prior_action).total_seconds() < int(self.limits.cooldown_seconds):
+            blockers.append("ASSIGNMENT_COOLDOWN_ACTIVE")
+        return sorted(set(blockers))
+
     def _stale_or_future(self, value: datetime, now: datetime) -> bool:
         age = (now - value).total_seconds()
         return age < 0 or age > self.maximum_evidence_age_seconds
@@ -651,24 +884,30 @@ class AutoReallocationGate:
     @staticmethod
     def _result(trigger_kind: str, status: str, *, blockers: list[str] | None = None,
                 simulation_key: str | None = None, gpu_key: str | None = None,
-                policy_hash: str | None = None, data_classification: str = "UNKNOWN") -> dict[str, Any]:
+                policy_hash: str | None = None, data_classification: str = "UNKNOWN",
+                admission_mode: str = "SIMULATION", simulation_only: bool = True,
+                live_action_eligible: bool = False) -> dict[str, Any]:
         return {
             "schema_version": "1.0",
             "trigger_kind": trigger_kind,
             "status": status,
+            "admission_mode": admission_mode,
             "blockers": list(blockers or []),
             "simulation_id": simulation_key,
             "gpu_key": gpu_key,
             "policy_hash": policy_hash,
             "evidence_classification": data_classification,
-            "simulation_only": True,
+            "simulation_only": simulation_only,
             "actions_performed": False,
             "request_submitted": False,
             "dossier_created": False,
-            "live_action_eligible": False,
+            "live_action_eligible": live_action_eligible,
+            "admission_only": admission_mode == "LIVE",
         }
 
     def _blocked(self, trigger_kind: str, blockers: list[str], *, gpu_key: str | None = None,
                  policy_hash: str | None = None, data_classification: str = "UNKNOWN") -> dict[str, Any]:
         return self._result(trigger_kind, "BLOCKED", blockers=sorted(set(blockers)), gpu_key=gpu_key,
-                            policy_hash=policy_hash or self.policy_hash, data_classification=data_classification)
+                            policy_hash=policy_hash or self.policy_hash, data_classification=data_classification,
+                            admission_mode=self.admission_mode,
+                            simulation_only=self.admission_mode == "SIMULATION")

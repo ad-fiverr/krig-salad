@@ -15,8 +15,15 @@ sys.path.insert(0, str(TELEMETRY_ROOT))
 
 from collector.action_ledger import ActionLedger, VerifiedSyntheticSimulationObservation
 from collector.auto_reallocation_gate import AutoReallocationGate, AutoReallocationLimits
-from collector.salad_action_policy import APPROVED_GROUPS, APPROVED_ORGANIZATION, APPROVED_PROJECT
-from collector.salad_action_transport import SaladActionExecutor
+from collector.salad_action_policy import (
+    ActionCapabilityVerifier,
+    APPROVED_GROUPS,
+    APPROVED_ORGANIZATION,
+    APPROVED_PROJECT,
+    SaladAction,
+    SignedActionCapability,
+)
+from collector.salad_action_transport import SaladActionExecutor, fixed_action_path
 
 
 POLICY_HASH = "c" * 64
@@ -204,6 +211,77 @@ def _early(context: dict) -> dict:
         "calibration_status": "APPLIED_SYNTHETIC_TEST_ONLY",
         "calibration_evidence_sha256": CALIBRATION_HASH,
     }
+
+
+def _verified_live_admission_context(context: dict) -> dict:
+    """Use test-only values shaped like independently verified evidence."""
+    result = json.loads(json.dumps(context))
+    classifications = {
+        "source": "INDEPENDENT_WORKLOAD_EVIDENCE",
+        "policy": "APPROVED_POLICY",
+        "generation": "INDEPENDENT_GENERATION_EVIDENCE",
+        "binding": "INDEPENDENT_BINDING_ATTESTATION",
+        "provider": "PROVIDER_OBSERVED",
+        "budget": "INDEPENDENT_FINANCIAL_EVIDENCE",
+        "history": "INDEPENDENT_ALLOCATION_HISTORY",
+    }
+    for section, classification in classifications.items():
+        result[section].pop("synthetic_fixture_id", None)
+        result[section]["data_classification"] = classification
+    result["binding"].update({
+        "binding_status": "VERIFIED",
+        "actions_authorized_by_binding": True,
+        "attestation_evidence_id": "offline-test-attestation",
+        "evidence_sha256": "d" * 64,
+    })
+    result["provider"].update({
+        "source_provenance": {
+            "system": "salad_api",
+            "host": "api.salad.com",
+            "transport_tls_hostname_verified": True,
+        },
+        "reported_state": "running",
+    })
+    return result
+
+
+def _signed_reallocation_capability(now_epoch: float, *, group: str | None = None):
+    import json
+    import uuid
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    target = {
+        "organization": APPROVED_ORGANIZATION,
+        "project": APPROVED_PROJECT,
+        "container_group": group or APPROVED_GROUPS[0],
+        "instance_id": "6bbd35d9-1199-41f6-8a21-316cb41d559f",
+        "assignment_id": "assignment-a",
+        "deterioration_id": "offline-test-deterioration",
+    }
+    action = SaladAction.REALLOCATE_INSTANCE
+    route = fixed_action_path(action, target)
+    private = Ed25519PrivateKey.generate()
+    public_key = private.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    claims = {
+        "schema_version": 1,
+        "audience": "salad-g5-control-plane",
+        "host": "api.salad.com",
+        "organization": APPROVED_ORGANIZATION,
+        "project": APPROVED_PROJECT,
+        "container_group": target["container_group"],
+        "action": action.value,
+        "path": route,
+        "issued_at_epoch": now_epoch - 1,
+        "expires_at_epoch": now_epoch + 60,
+        "nonce": str(uuid.uuid4()),
+        "max_requests": 1,
+    }
+    payload = json.dumps(claims, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return SignedActionCapability(payload, private.sign(payload)), ActionCapabilityVerifier(public_key), target, claims["nonce"]
 
 
 def _assessment(context: dict) -> dict:
@@ -924,6 +1002,348 @@ class AutoReallocationGateTests(unittest.TestCase):
             self.assertFalse(closed_ledger.auto_reallocation_simulation_snapshot())
         finally:
             closed_ledger.close()
+
+    def test_live_admission_eligibility_is_preview_only_and_leaves_ledgers_unchanged(self):
+        context = _verified_live_admission_context(_synthetic_context())
+        decision = _early(context)
+        decision["calibration_status"] = "APPLIED_APPROVED_MEASURED_PAIRS"
+        capability, verifier, _, nonce = _signed_reallocation_capability(NOW.timestamp())
+        ledger_before = self.ledger.snapshot()
+        simulations_before = self.ledger.auto_reallocation_simulation_snapshot()
+        gate = AutoReallocationGate(
+            self.ledger,
+            policy_hash=POLICY_HASH,
+            gpu_floors_ths=FLOORS,
+            limits=AutoReallocationLimits(10, 20, 300, 3, 5),
+            admission_mode="LIVE",
+            action_capability=capability,
+            action_capability_verifier=verifier,
+            live_transport_disabled=True,
+        )
+        result = gate.assess_early(
+            decision,
+            source_evidence=context["source"],
+            policy_evidence=context["policy"],
+            generation_evidence=context["generation"],
+            provider_binding=context["binding"],
+            provider_revalidation=context["provider"],
+            budget_evidence=context["budget"],
+            allocation_history=context["history"],
+            fleet_id=context["fleet_id"],
+            now_utc=context["now_utc"],
+            kill_switch_engaged=False,
+            auto_armed=False,
+            live_actions_enabled=False,
+            g5_authorized=False,
+        )
+
+        self.assertEqual(result["status"], "LIVE_ADMISSION_ELIGIBLE")
+        self.assertEqual(result["admission_mode"], "LIVE")
+        self.assertFalse(result["simulation_only"])
+        self.assertTrue(result["admission_only"])
+        self.assertTrue(result["live_action_eligible"])
+        self.assertFalse(result["actions_performed"])
+        self.assertFalse(result["request_submitted"])
+        self.assertFalse(result["dossier_created"])
+        self.assertNotIn(nonce, json.dumps(result))
+        self.assertEqual(self.ledger.snapshot(), ledger_before)
+        self.assertEqual(self.ledger.auto_reallocation_simulation_snapshot(), simulations_before)
+
+    def test_off_admission_mode_never_marks_a_live_action_eligible(self):
+        context = _verified_live_admission_context(_synthetic_context())
+        decision = _early(context)
+        decision["calibration_status"] = "APPLIED_APPROVED_MEASURED_PAIRS"
+        gate = AutoReallocationGate(
+            self.ledger, policy_hash=POLICY_HASH, gpu_floors_ths=FLOORS,
+            limits=AutoReallocationLimits(10, 20, 300, 3, 5), admission_mode="OFF",
+        )
+        result = gate.assess_early(
+            decision,
+            source_evidence=context["source"], policy_evidence=context["policy"],
+            generation_evidence=context["generation"], provider_binding=context["binding"],
+            provider_revalidation=context["provider"], budget_evidence=context["budget"],
+            allocation_history=context["history"], fleet_id=context["fleet_id"],
+            now_utc=context["now_utc"], kill_switch_engaged=False, auto_armed=False,
+            live_actions_enabled=False, g5_authorized=False,
+        )
+        self.assertIn("ADMISSION_MODE_OFF", result["blockers"])
+        self.assertFalse(result["live_action_eligible"])
+        self.assertFalse(result["actions_performed"])
+        self.assertFalse(result["request_submitted"])
+        self.assertFalse(result["dossier_created"])
+
+
+    def test_live_admission_blocks_synthetic_missing_capability_and_enabled_transport(self):
+        context = _verified_live_admission_context(_synthetic_context())
+        decision = _early(context)
+        decision["calibration_status"] = "APPLIED_APPROVED_MEASURED_PAIRS"
+        common = {
+            "source_evidence": context["source"], "policy_evidence": context["policy"],
+            "generation_evidence": context["generation"], "provider_binding": context["binding"],
+            "provider_revalidation": context["provider"], "budget_evidence": context["budget"],
+            "allocation_history": context["history"], "fleet_id": context["fleet_id"],
+            "now_utc": context["now_utc"], "kill_switch_engaged": False,
+            "auto_armed": False, "live_actions_enabled": False, "g5_authorized": False,
+        }
+        capability, verifier, _, _ = _signed_reallocation_capability(NOW.timestamp())
+
+        no_capability = AutoReallocationGate(
+            self.ledger, policy_hash=POLICY_HASH, gpu_floors_ths=FLOORS,
+            limits=AutoReallocationLimits(10, 20, 300, 3, 5), admission_mode="LIVE",
+            live_transport_disabled=True,
+        ).assess_early(decision, **common)
+        self.assertIn("SIGNED_REALLOCATION_CAPABILITY_REQUIRED", no_capability["blockers"])
+
+        wrong_route_capability, verifier2, _, _ = _signed_reallocation_capability(
+            NOW.timestamp(), group=APPROVED_GROUPS[1],
+        )
+        wrong_route = AutoReallocationGate(
+            self.ledger, policy_hash=POLICY_HASH, gpu_floors_ths=FLOORS,
+            limits=AutoReallocationLimits(10, 20, 300, 3, 5), admission_mode="LIVE",
+            action_capability=wrong_route_capability, action_capability_verifier=verifier2,
+            live_transport_disabled=True,
+        ).assess_early(decision, **common)
+        self.assertIn("SIGNED_REALLOCATION_CAPABILITY_INVALID", wrong_route["blockers"])
+
+        enabled_transport = AutoReallocationGate(
+            self.ledger, policy_hash=POLICY_HASH, gpu_floors_ths=FLOORS,
+            limits=AutoReallocationLimits(10, 20, 300, 3, 5), admission_mode="LIVE",
+            action_capability=capability, action_capability_verifier=verifier,
+            live_transport_disabled=False,
+        ).assess_early(decision, **common)
+        self.assertIn("LIVE_TRANSPORT_MUST_REMAIN_DISABLED", enabled_transport["blockers"])
+
+        synthetic = _synthetic_context()
+        synthetic_decision = _early(synthetic)
+        synthetic_result = AutoReallocationGate(
+            self.ledger, policy_hash=POLICY_HASH, gpu_floors_ths=FLOORS,
+            limits=AutoReallocationLimits(10, 20, 300, 3, 5), admission_mode="LIVE",
+            action_capability=capability, action_capability_verifier=verifier,
+            live_transport_disabled=True,
+        ).assess_early(
+            synthetic_decision,
+            source_evidence=synthetic["source"], policy_evidence=synthetic["policy"],
+            generation_evidence=synthetic["generation"], provider_binding=synthetic["binding"],
+            provider_revalidation=synthetic["provider"], budget_evidence=synthetic["budget"],
+            allocation_history=synthetic["history"], fleet_id=synthetic["fleet_id"],
+            now_utc=synthetic["now_utc"], kill_switch_engaged=False, auto_armed=False,
+            live_actions_enabled=False, g5_authorized=False,
+        )
+        self.assertIn("SYNTHETIC_EVIDENCE_CANNOT_AUTHORIZE_LIVE_ADMISSION", synthetic_result["blockers"])
+
+    def test_live_admission_requires_limits_clear_kill_switch_and_dispatch_stays_off(self):
+        context = _verified_live_admission_context(_synthetic_context())
+        decision = _early(context)
+        decision["calibration_status"] = "APPLIED_APPROVED_MEASURED_PAIRS"
+        capability, verifier, _, _ = _signed_reallocation_capability(NOW.timestamp())
+        common = {
+            "source_evidence": context["source"], "policy_evidence": context["policy"],
+            "generation_evidence": context["generation"], "provider_binding": context["binding"],
+            "provider_revalidation": context["provider"], "budget_evidence": context["budget"],
+            "allocation_history": context["history"], "fleet_id": context["fleet_id"],
+            "now_utc": context["now_utc"], "kill_switch_engaged": False,
+            "auto_armed": False, "live_actions_enabled": False, "g5_authorized": False,
+        }
+        unconfigured = AutoReallocationGate(
+            self.ledger, policy_hash=POLICY_HASH, gpu_floors_ths=FLOORS,
+            admission_mode="LIVE", action_capability=capability,
+            action_capability_verifier=verifier, live_transport_disabled=True,
+        ).assess_early(decision, **common)
+        self.assertIn("LIVE_QUOTAS_OR_COOLDOWN_UNCONFIGURED", unconfigured["blockers"])
+
+        gate = AutoReallocationGate(
+            self.ledger, policy_hash=POLICY_HASH, gpu_floors_ths=FLOORS,
+            limits=AutoReallocationLimits(10, 20, 300, 3, 5), admission_mode="LIVE",
+            action_capability=capability, action_capability_verifier=verifier,
+            live_transport_disabled=True,
+        )
+        engaged = gate.assess_early(decision, **{**common, "kill_switch_engaged": True})
+        self.assertIn("KILL_SWITCH_ACTIVE_OR_UNKNOWN", engaged["blockers"])
+        armed = gate.assess_early(decision, **{**common, "auto_armed": True})
+        self.assertIn("AUTO_REALLOCATE_MUST_REMAIN_DISARMED", armed["blockers"])
+        dispatch_enabled = gate.assess_early(
+            decision, **{**common, "live_actions_enabled": True},
+        )
+        self.assertIn("LIVE_ACTION_DISPATCH_MUST_REMAIN_DISABLED", dispatch_enabled["blockers"])
+
+    def test_live_admission_enforces_daily_quota_from_read_only_action_history(self):
+        context = _verified_live_admission_context(_synthetic_context())
+        decision = _early(context)
+        decision["calibration_status"] = "APPLIED_APPROVED_MEASURED_PAIRS"
+        previous_target = {
+            "organization": APPROVED_ORGANIZATION, "project": APPROVED_PROJECT,
+            "container_group": APPROVED_GROUPS[0],
+            "instance_id": "6bbd35d9-1199-41f6-8a21-316cb41d559f",
+            "assignment_id": "previous-assignment", "deterioration_id": "previous-degradation",
+        }
+        prior_key = ActionLedger.live_key_for(action="REALLOCATE_INSTANCE", target=previous_target)
+        reservation = self.ledger.reserve_live(
+            prior_key, "REALLOCATE_INSTANCE", previous_target,
+            (NOW - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+        )
+        self.assertTrue(reservation["inserted"])
+        self.ledger.transition(
+            prior_key, "BLOCKED",
+            (NOW - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+        )
+        before = self.ledger.snapshot()
+        capability, verifier, _, _ = _signed_reallocation_capability(NOW.timestamp())
+        gate = AutoReallocationGate(
+            self.ledger, policy_hash=POLICY_HASH, gpu_floors_ths=FLOORS,
+            limits=AutoReallocationLimits(10, 1, 300, 3, 5), admission_mode="LIVE",
+            action_capability=capability, action_capability_verifier=verifier,
+            live_transport_disabled=True,
+        )
+        result = gate.assess_early(
+            decision,
+            source_evidence=context["source"], policy_evidence=context["policy"],
+            generation_evidence=context["generation"], provider_binding=context["binding"],
+            provider_revalidation=context["provider"], budget_evidence=context["budget"],
+            allocation_history=context["history"], fleet_id=context["fleet_id"],
+            now_utc=context["now_utc"], kill_switch_engaged=False, auto_armed=False,
+            live_actions_enabled=False, g5_authorized=False,
+        )
+        self.assertIn("LIVE_DAILY_QUOTA", result["blockers"])
+        self.assertEqual(self.ledger.snapshot(), before)
+
+    def test_live_admission_enforces_minute_assignment_fleet_quotas_and_cooldown(self):
+        context = _verified_live_admission_context(_synthetic_context())
+        decision = _early(context)
+        decision["calibration_status"] = "APPLIED_APPROVED_MEASURED_PAIRS"
+        provider = context["binding"]["provider"]
+        previous_target = {
+            "organization": APPROVED_ORGANIZATION,
+            "project": APPROVED_PROJECT,
+            "container_group": APPROVED_GROUPS[0],
+            "instance_id": provider["instance_id"],
+            "assignment_id": provider["assignment_id"],
+            "deterioration_id": "previous-degradation",
+        }
+        prior_key = ActionLedger.live_key_for(action="REALLOCATE_INSTANCE", target=previous_target)
+        prior_time = (NOW - timedelta(seconds=30)).isoformat().replace("+00:00", "Z")
+        reservation = self.ledger.reserve_live(
+            prior_key, "REALLOCATE_INSTANCE", previous_target, prior_time,
+        )
+        self.assertTrue(reservation["inserted"])
+        self.ledger.transition(prior_key, "BLOCKED", prior_time)
+        before = self.ledger.snapshot()
+        capability, verifier, _, _ = _signed_reallocation_capability(NOW.timestamp())
+        common = {
+            "source_evidence": context["source"], "policy_evidence": context["policy"],
+            "generation_evidence": context["generation"], "provider_binding": context["binding"],
+            "provider_revalidation": context["provider"], "budget_evidence": context["budget"],
+            "allocation_history": context["history"], "fleet_id": context["fleet_id"],
+            "now_utc": context["now_utc"], "kill_switch_engaged": False,
+            "auto_armed": False, "live_actions_enabled": False, "g5_authorized": False,
+        }
+        cases = (
+            (AutoReallocationLimits(1, 10, 0, 10, 10), "LIVE_MINUTE_QUOTA"),
+            (AutoReallocationLimits(10, 10, 0, 1, 10), "ASSIGNMENT_DAILY_QUOTA"),
+            (AutoReallocationLimits(10, 10, 0, 10, 1), "FLEET_DAILY_QUOTA"),
+            (AutoReallocationLimits(10, 10, 60, 10, 10), "ASSIGNMENT_COOLDOWN_ACTIVE"),
+        )
+        for limits, blocker in cases:
+            with self.subTest(blocker=blocker):
+                gate = AutoReallocationGate(
+                    self.ledger, policy_hash=POLICY_HASH, gpu_floors_ths=FLOORS,
+                    limits=limits, admission_mode="LIVE",
+                    action_capability=capability, action_capability_verifier=verifier,
+                    live_transport_disabled=True,
+                )
+                result = gate.assess_early(
+                    decision, **common,
+                )
+                self.assertIn(blocker, result["blockers"])
+        self.assertEqual(self.ledger.snapshot(), before)
+
+    def test_live_daily_assignment_and_fleet_quotas_ignore_ledger_actions_older_than_24_hours(self):
+        context = _verified_live_admission_context(_synthetic_context())
+        decision = _early(context)
+        decision["calibration_status"] = "APPLIED_APPROVED_MEASURED_PAIRS"
+        provider = context["binding"]["provider"]
+        previous_target = {
+            "organization": APPROVED_ORGANIZATION,
+            "project": APPROVED_PROJECT,
+            "container_group": APPROVED_GROUPS[0],
+            "instance_id": provider["instance_id"],
+            "assignment_id": provider["assignment_id"],
+            "deterioration_id": "old-degradation",
+        }
+        prior_key = ActionLedger.live_key_for(
+            action="REALLOCATE_INSTANCE", target=previous_target,
+        )
+        prior_time = (NOW - timedelta(hours=25)).isoformat().replace("+00:00", "Z")
+        self.assertTrue(self.ledger.reserve_live(
+            prior_key, "REALLOCATE_INSTANCE", previous_target, prior_time,
+        )["inserted"])
+        self.ledger.transition(prior_key, "BLOCKED", prior_time)
+
+        capability, verifier, _, _ = _signed_reallocation_capability(NOW.timestamp())
+        gate = AutoReallocationGate(
+            self.ledger,
+            policy_hash=POLICY_HASH,
+            gpu_floors_ths=FLOORS,
+            limits=AutoReallocationLimits(10, 10, 0, 1, 1),
+            admission_mode="LIVE",
+            action_capability=capability,
+            action_capability_verifier=verifier,
+            live_transport_disabled=True,
+        )
+        result = gate.assess_early(
+            decision,
+            source_evidence=context["source"],
+            policy_evidence=context["policy"],
+            generation_evidence=context["generation"],
+            provider_binding=context["binding"],
+            provider_revalidation=context["provider"],
+            budget_evidence=context["budget"],
+            allocation_history=context["history"],
+            fleet_id=context["fleet_id"],
+            now_utc=context["now_utc"],
+            kill_switch_engaged=False,
+            auto_armed=False,
+            live_actions_enabled=False,
+            g5_authorized=False,
+        )
+        self.assertEqual(result["status"], "LIVE_ADMISSION_ELIGIBLE", result)
+        self.assertNotIn("ASSIGNMENT_DAILY_QUOTA", result["blockers"])
+        self.assertNotIn("FLEET_DAILY_QUOTA", result["blockers"])
+        self.assertFalse(result["actions_performed"])
+        self.assertFalse(result["request_submitted"])
+
+    def test_live_admission_blocks_unresolved_ledger_action_without_mutating_it(self):
+        context = _verified_live_admission_context(_synthetic_context())
+        decision = _early(context)
+        decision["calibration_status"] = "APPLIED_APPROVED_MEASURED_PAIRS"
+        target = {
+            "organization": APPROVED_ORGANIZATION, "project": APPROVED_PROJECT,
+            "container_group": APPROVED_GROUPS[0],
+            "instance_id": "6bbd35d9-1199-41f6-8a21-316cb41d559f",
+            "assignment_id": "prior-assignment", "deterioration_id": "prior-degradation",
+        }
+        self.ledger.reserve_live(
+            ActionLedger.live_key_for(action="REALLOCATE_INSTANCE", target=target),
+            "REALLOCATE_INSTANCE", target, _time(),
+        )
+        before = self.ledger.snapshot()
+        capability, verifier, _, _ = _signed_reallocation_capability(NOW.timestamp())
+        gate = AutoReallocationGate(
+            self.ledger, policy_hash=POLICY_HASH, gpu_floors_ths=FLOORS,
+            limits=AutoReallocationLimits(10, 20, 300, 3, 5), admission_mode="LIVE",
+            action_capability=capability, action_capability_verifier=verifier,
+            live_transport_disabled=True,
+        )
+        result = gate.assess_early(
+            decision,
+            source_evidence=context["source"], policy_evidence=context["policy"],
+            generation_evidence=context["generation"], provider_binding=context["binding"],
+            provider_revalidation=context["provider"], budget_evidence=context["budget"],
+            allocation_history=context["history"], fleet_id=context["fleet_id"],
+            now_utc=context["now_utc"], kill_switch_engaged=False, auto_armed=False,
+            live_actions_enabled=False, g5_authorized=False,
+        )
+        self.assertIn("UNRESOLVED_PROVIDER_ACTION_IN_LEDGER", result["blockers"])
+        self.assertEqual(self.ledger.snapshot(), before)
 
 
 if __name__ == "__main__":
