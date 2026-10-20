@@ -125,6 +125,14 @@ if [[ "$mode" == --source ]]; then
     fail "Telegram configuration leaked to monitor output"
   fi
   "$python_bin" -B "$MONITOR_TESTS" || fail "runtime monitor unit tests failed"
+  for test_path in \
+    gpu-mining/telemetry/tests/test_auto_reallocation_gate.py \
+    gpu-mining/telemetry/tests/test_early_reallocation_dispatch.py \
+    gpu-mining/telemetry/tests/test_g5_control_plane.py; do
+    [[ -f "$REPO_ROOT/$test_path" ]] || fail "offline control-plane regression source is missing"
+    "$python_bin" -B "$REPO_ROOT/$test_path" ||
+      fail "offline control-plane regression failed: $(basename "$test_path")"
+  done
   if command -v ruby >/dev/null 2>&1; then
     ruby -e 'require "yaml"; doc = YAML.load_file(ARGV.fetch(0)); abort "workflow jobs missing" unless doc.is_a?(Hash) && doc["jobs"].is_a?(Hash)' \
       "$SCRIPT_DIR/../../../.github/workflows/build-fl4shminer.yml"

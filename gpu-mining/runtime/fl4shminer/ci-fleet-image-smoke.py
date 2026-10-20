@@ -76,7 +76,32 @@ WATCHER_INPUTS = tuple(
     "gpu-mining/g4c-live/live_secret_boundary.py",
 )
 
-COPY_INPUTS = frozenset(RUNTIME_INPUTS + WATCHER_INPUTS)
+CONTROL_PLANE_INPUTS = (
+    "gpu-mining/telemetry/collector/action_ledger.py",
+    "gpu-mining/telemetry/collector/auto_reallocation_gate.py",
+    "gpu-mining/telemetry/collector/continuous.py",
+    "gpu-mining/telemetry/collector/dashboard_projection.py",
+    "gpu-mining/telemetry/collector/device_guard.py",
+    "gpu-mining/telemetry/collector/early_reallocation_dispatch.py",
+    "gpu-mining/telemetry/collector/fleet.py",
+    "gpu-mining/telemetry/collector/fleet_hashrate_rollups.py",
+    "gpu-mining/telemetry/collector/guard_store.py",
+    "gpu-mining/telemetry/collector/live_contracts.py",
+    "gpu-mining/telemetry/collector/reallocation_controller.py",
+    "gpu-mining/telemetry/collector/salad_action_policy.py",
+    "gpu-mining/telemetry/collector/salad_action_transport.py",
+    "gpu-mining/telemetry/collector/salad_billing_cost.py",
+    "gpu-mining/telemetry/collector/salad_lifecycle.py",
+    "gpu-mining/telemetry/collector/startup_latency.py",
+    "gpu-mining/telemetry/collector/v2_adapters.py",
+    "gpu-mining/telemetry/g5_control_plane/app.py",
+    "gpu-mining/telemetry/g5_control_plane/server.py",
+    "gpu-mining/telemetry/g5_control_plane/service.py",
+    "gpu-mining/telemetry/g5_control_plane/store.py",
+)
+
+PACKAGED_TELEMETRY_INPUTS = WATCHER_INPUTS + CONTROL_PLANE_INPUTS
+COPY_INPUTS = frozenset(RUNTIME_INPUTS + PACKAGED_TELEMETRY_INPUTS)
 
 ALLOWED_DIRECTORIES = frozenset(
     {
@@ -104,9 +129,30 @@ WORKFLOW_TRIGGERS = frozenset(
         "gpu-mining/telemetry/collector/startup_admission.py",
         "gpu-mining/telemetry/collector/startup_recovery_policy.py",
         "gpu-mining/telemetry/collector/work.py",
+        "gpu-mining/telemetry/collector/action_ledger.py",
+        "gpu-mining/telemetry/collector/auto_reallocation_gate.py",
+        "gpu-mining/telemetry/collector/continuous.py",
+        "gpu-mining/telemetry/collector/dashboard_projection.py",
+        "gpu-mining/telemetry/collector/device_guard.py",
+        "gpu-mining/telemetry/collector/early_reallocation_dispatch.py",
+        "gpu-mining/telemetry/collector/fleet.py",
+        "gpu-mining/telemetry/collector/fleet_hashrate_rollups.py",
+        "gpu-mining/telemetry/collector/guard_store.py",
+        "gpu-mining/telemetry/collector/live_contracts.py",
+        "gpu-mining/telemetry/collector/reallocation_controller.py",
+        "gpu-mining/telemetry/collector/salad_action_policy.py",
+        "gpu-mining/telemetry/collector/salad_action_transport.py",
+        "gpu-mining/telemetry/collector/salad_billing_cost.py",
+        "gpu-mining/telemetry/collector/salad_lifecycle.py",
+        "gpu-mining/telemetry/collector/startup_latency.py",
+        "gpu-mining/telemetry/collector/v2_adapters.py",
         "gpu-mining/telemetry/g5_control_plane/__init__.py",
+        "gpu-mining/telemetry/g5_control_plane/app.py",
         "gpu-mining/telemetry/g5_control_plane/config.py",
+        "gpu-mining/telemetry/g5_control_plane/server.py",
+        "gpu-mining/telemetry/g5_control_plane/service.py",
         "gpu-mining/telemetry/g5_control_plane/startup_policy.py",
+        "gpu-mining/telemetry/g5_control_plane/store.py",
         "gpu-mining/g4c-live/live_secret_boundary.py",
         ".github/workflows/build-fl4shminer.yml",
         ".github/fl4sh-publish-targets.json",
@@ -122,18 +168,151 @@ BLOCKED_MODULE_ROOTS = frozenset(
     {
         "firebase",
         "firebase_admin",
-        "action_ledger",
         "firebase_sink",
-        "reallocation_controller",
-        "salad_action_policy",
-        "salad_action_transport",
         "salad_reallocation_adapter",
     }
+)
+
+WATCHER_ACTION_MODULE_PREFIXES = frozenset(
+    {
+        "collector.action_ledger",
+        "collector.auto_reallocation_gate",
+        "collector.early_reallocation_dispatch",
+        "collector.reallocation_controller",
+        "collector.salad_action_policy",
+        "collector.salad_action_transport",
+        "collector.salad_reallocation_adapter",
+    }
+)
+
+READ_ONLY_PACKAGE_INPUTS = frozenset(
+    item
+    for item in RUNTIME_INPUTS + WATCHER_INPUTS
+    if item != "gpu-mining/runtime/fl4shminer/ci-fleet-image-smoke.py"
 )
 
 
 def fail(message: str) -> None:
     raise SystemExit(f"ci-fleet-image-smoke: {message}")
+
+
+def _package_context(filename: str) -> str | None:
+    """Return the top-level package used for imports in packaged telemetry files."""
+    normalized = filename.replace("\\", "/")
+    for package in ("collector", "log_alerts", "g5_control_plane"):
+        marker = f"telemetry/{package}/"
+        if marker in normalized:
+            suffix = normalized.split(marker, 1)[1].split("/", 1)[0]
+            return package if suffix.endswith(".py") else f"{package}.{suffix}"
+    return None
+
+
+def _relative_import_base(package: str | None, level: int, module: str | None) -> str | None:
+    if package is None or level < 1:
+        return None
+    package_parts = package.split(".")
+    if level > len(package_parts):
+        return None
+    retained = package_parts[: len(package_parts) - level + 1]
+    if module:
+        retained.extend(module.split("."))
+    return ".".join(retained)
+
+
+def imported_module_names(
+    source: str,
+    *,
+    filename: str = "<source>",
+    package: str | None = None,
+) -> set[str]:
+    tree = ast.parse(source, filename=filename)
+    imported: set[str] = set()
+    package_context = package if package is not None else _package_context(filename)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            base = (
+                _relative_import_base(package_context, node.level, node.module)
+                if node.level
+                else node.module
+            )
+            if base:
+                imported.add(base)
+                for alias in node.names:
+                    if alias.name != "*":
+                        imported.add(f"{base}.{alias.name}")
+    return imported
+
+
+def matching_module_prefixes(
+    module_names: set[str], prefixes: frozenset[str],
+) -> list[str]:
+    return sorted(
+        prefix
+        for prefix in prefixes
+        if any(name == prefix or name.startswith(prefix + ".") for name in module_names)
+    )
+
+
+def check_action_import_boundary_regressions() -> None:
+    cases = (
+        ("import collector.action_ledger", "collector.action_ledger", None, None),
+        (
+            "from collector.action_ledger import ActionLedger",
+            "collector.action_ledger",
+            None,
+            None,
+        ),
+        (
+            "import collector.auto_reallocation_gate.internal",
+            "collector.auto_reallocation_gate",
+            None,
+            None,
+        ),
+        (
+            "from collector import action_ledger",
+            "collector.action_ledger",
+            None,
+            None,
+        ),
+        (
+            "from . import action_ledger",
+            "collector.action_ledger",
+            "gpu-mining/telemetry/collector/fl4shminer.py",
+            None,
+        ),
+        (
+            "from .action_ledger import ActionLedger",
+            "collector.action_ledger",
+            "gpu-mining/telemetry/collector/fl4shminer.py",
+            None,
+        ),
+    )
+    for source, expected, filename, package in cases:
+        imported = imported_module_names(
+            source,
+            filename=filename or "<source>",
+            package=package,
+        )
+        matched = matching_module_prefixes(imported, WATCHER_ACTION_MODULE_PREFIXES)
+        if expected not in matched:
+            fail("watcher action-import boundary regression was not detected")
+    allowed_imports = (
+        ("from collector.log_alerts import fleet_watcher", "<source>", None),
+        ("from collector import models", "<source>", None),
+        (
+            "from . import models",
+            "gpu-mining/telemetry/collector/fl4shminer.py",
+            None,
+        ),
+    )
+    for source, filename, package in allowed_imports:
+        if matching_module_prefixes(
+            imported_module_names(source, filename=filename, package=package),
+            WATCHER_ACTION_MODULE_PREFIXES,
+        ):
+            fail("watcher action-import boundary rejects an unrelated read-only module")
 
 
 def block_external_io(*_args: object, **_kwargs: object) -> None:
@@ -371,16 +550,25 @@ def check_workflow(root: Path) -> None:
         "gpu-mining/telemetry/collector/startup_admission.py": True,
         "gpu-mining/telemetry/collector/startup_recovery_policy.py": True,
         "gpu-mining/telemetry/collector/work.py": True,
+        "gpu-mining/telemetry/collector/action_ledger.py": True,
+        "gpu-mining/telemetry/collector/auto_reallocation_gate.py": True,
+        "gpu-mining/telemetry/collector/dashboard_projection.py": True,
+        "gpu-mining/telemetry/collector/early_reallocation_dispatch.py": True,
+        "gpu-mining/telemetry/collector/reallocation_controller.py": True,
+        "gpu-mining/telemetry/collector/salad_action_policy.py": True,
+        "gpu-mining/telemetry/collector/salad_action_transport.py": True,
         "gpu-mining/telemetry/g5_control_plane/__init__.py": True,
+        "gpu-mining/telemetry/g5_control_plane/app.py": True,
         "gpu-mining/telemetry/g5_control_plane/config.py": True,
+        "gpu-mining/telemetry/g5_control_plane/service.py": True,
         "gpu-mining/telemetry/g5_control_plane/startup_policy.py": True,
-        "gpu-mining/telemetry/collector/startup_latency.py": False,
+        "gpu-mining/telemetry/collector/startup_latency.py": True,
         "gpu-mining/g4c-live/live_secret_boundary.py": True,
         ".github/workflows/build-fl4shminer.yml": True,
         ".github/fl4sh-publish-targets.json": True,
         ".github/scripts/fl4sh_publish.py": True,
         ".github/scripts/test_fl4sh_publish.py": True,
-        "gpu-mining/telemetry/collector/continuous.py": False,
+        "gpu-mining/telemetry/collector/continuous.py": True,
         "gpu-mining/telemetry/tests/test_g4a_salad_get.py": False,
         "gpu-mining/tools/unrelated.py": False,
         "gpu-mining/runtime/krig/Dockerfile": False,
@@ -398,7 +586,7 @@ def check_source_boundaries(root: Path, *, image: bool) -> None:
     if image:
         source_paths = {
             *(Path(item).name for item in RUNTIME_INPUTS if item.endswith(".py")),
-            *WATCHER_INPUTS,
+            *PACKAGED_TELEMETRY_INPUTS,
         }
     else:
         source_paths = COPY_INPUTS
@@ -407,24 +595,32 @@ def check_source_boundaries(root: Path, *, image: bool) -> None:
         if path.suffix != ".py":
             continue
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+            imported = imported_module_names(
+                path.read_text(encoding="utf-8"), filename=relative,
+            )
         except (SyntaxError, UnicodeDecodeError) as exc:
             fail(f"Python source is invalid: {relative} ({type(exc).__name__})")
-        for node in ast.walk(tree):
-            imported: list[str] = []
-            if isinstance(node, ast.Import):
-                imported.extend(alias.name.split(".", 1)[0] for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                imported.append(node.module.split(".", 1)[0])
-            blocked = sorted(set(imported) & BLOCKED_MODULE_ROOTS)
-            if blocked:
-                fail(f"packaged source imports blocked module in {relative}: {blocked[0]}")
+        blocked = sorted({name.split(".", 1)[0] for name in imported} & BLOCKED_MODULE_ROOTS)
+        if blocked:
+            fail(f"packaged source imports blocked module in {relative}: {blocked[0]}")
+        if relative in READ_ONLY_PACKAGE_INPUTS:
+            action_imports = matching_module_prefixes(
+                imported, WATCHER_ACTION_MODULE_PREFIXES,
+            )
+            if action_imports:
+                fail(
+                    "read-only miner/watcher source imports the reallocation action path: "
+                    f"{relative} ({action_imports[0]})"
+                )
 
 
-def check_image_tree(root: Path) -> None:
+def check_image_tree(root: Path, *, include_control_plane: bool = False) -> None:
     if root.name != "fl4shminer":
         fail("image smoke must run from the installed /opt/fl4shminer directory")
-    missing = sorted(item for item in WATCHER_INPUTS if not (root / item).is_file())
+    telemetry_inputs = (
+        PACKAGED_TELEMETRY_INPUTS if include_control_plane else WATCHER_INPUTS
+    )
+    missing = sorted(item for item in telemetry_inputs if not (root / item).is_file())
     if missing:
         fail("installed watcher source is missing: " + ", ".join(missing))
     actual_files = {
@@ -432,7 +628,7 @@ def check_image_tree(root: Path) -> None:
         for item in root.rglob("*")
         if item.is_file() and "__pycache__" not in item.parts
     }
-    expected = set(WATCHER_INPUTS)
+    expected = set(telemetry_inputs)
     expected.update(Path(item).name for item in RUNTIME_INPUTS)
     expected.add("fl4shminer")
     if actual_files != expected:
@@ -441,25 +637,29 @@ def check_image_tree(root: Path) -> None:
         fail(f"installed image file inventory differs (missing={missing}, extra={extra})")
 
     telemetry = root / "gpu-mining/telemetry"
-    if {entry.name for entry in telemetry.iterdir()} != {"log_alerts", "collector", "g5_control_plane"}:
+    expected_telemetry_directories = {
+        Path(item).relative_to("gpu-mining/telemetry").parts[0]
+        for item in telemetry_inputs
+        if item.startswith("gpu-mining/telemetry/")
+    }
+    if {entry.name for entry in telemetry.iterdir()} != expected_telemetry_directories:
         fail("image contains telemetry outside the reviewed watcher package")
     collector = telemetry / "collector"
     expected_collector = {
-        "fl4sh_early_autotune.py",
-        "fl4shminer.py",
-        "g4a_salad_get.py",
-        "guards.py",
-        "gpu_identity.py",
-        "models.py",
-        "startup_admission.py",
-        "startup_recovery_policy.py",
-        "work.py",
+        Path(item).name
+        for item in telemetry_inputs
+        if item.startswith("gpu-mining/telemetry/collector/")
     }
     if {entry.name for entry in collector.iterdir()} != expected_collector:
         fail("image collector directory differs from the exact startup watcher import closure")
     g5_control_plane = telemetry / "g5_control_plane"
-    if {entry.name for entry in g5_control_plane.iterdir()} != {"__init__.py", "config.py", "startup_policy.py"}:
-        fail("image G5 package differs from the exact read-only startup policy loader")
+    expected_g5_control_plane = {
+        Path(item).name
+        for item in telemetry_inputs
+        if item.startswith("gpu-mining/telemetry/g5_control_plane/")
+    }
+    if {entry.name for entry in g5_control_plane.iterdir()} != expected_g5_control_plane:
+        fail("image G5 package differs from the exact offline control-plane inventory")
     g4c = root / "gpu-mining/g4c-live"
     if {entry.name for entry in g4c.iterdir()} != {"live_secret_boundary.py"}:
         fail("image G4C directory contains files beyond the approved secret boundary")
@@ -525,6 +725,8 @@ def check_simulated_image_tree(source_root: Path) -> None:
             result.returncode != 0
             or "CENTRAL_WATCHER_IMPORT_OK" not in result.stdout
             or "STARTUP_RECOVERY_IMPORT_OK" not in result.stdout
+            or "REALLOCATION_PACKAGE_IMPORT_OK" not in result.stdout
+            or "G5_ACTION_DEFAULT_CLOSED_OK" not in result.stdout
         ):
             fail("simulated packaged-image import closure failed")
 
@@ -654,10 +856,72 @@ def check_imports_and_inert_startup(root: Path, *, image: bool) -> None:
             fail("stale Fl4shMiner TH/s incorrectly satisfied productive readiness")
 
     loaded = set(sys.modules) - before_modules
-    for name in loaded:
-        root_name = name.split(".", 1)[0]
-        if root_name in BLOCKED_MODULE_ROOTS:
-            fail(f"watcher import pulled a blocked dependency: {root_name}")
+    blocked_loaded = sorted(
+        {name.split(".", 1)[0] for name in loaded} & BLOCKED_MODULE_ROOTS
+    )
+    if blocked_loaded:
+        fail(f"watcher import pulled a blocked dependency: {blocked_loaded[0]}")
+    action_loaded = matching_module_prefixes(
+        loaded, WATCHER_ACTION_MODULE_PREFIXES,
+    )
+    if action_loaded:
+        fail(f"read-only watcher import pulled an action module: {action_loaded[0]}")
+
+    # The central G5 control plane and its existing EARLY dispatcher are
+    # packaged for later separately authorized operation. Import and compose
+    # them only after proving the ordinary watcher path did not load actions.
+    try:
+        from dataclasses import replace
+
+        from collector.early_reallocation_dispatch import EarlyReallocationDispatcher
+        from collector.salad_action_transport import (
+            RestrictedSaladActionHTTPTransport,
+            SaladActionExecutor,
+        )
+        from g5_control_plane import app as g5_app
+        from g5_control_plane.config import load_config
+    except Exception as exc:
+        fail(f"packaged reallocation/control-plane import failed ({type(exc).__name__})")
+
+    if EarlyReallocationDispatcher.__module__ != "collector.early_reallocation_dispatch":
+        fail("EARLY dispatcher did not resolve from the packaged collector namespace")
+    with tempfile.TemporaryDirectory(prefix="fl4sh-g5-closed-smoke-") as temporary:
+        config = replace(load_config(environ={}), state_dir=temporary)
+        try:
+            service = g5_app.build_service(config)
+        except Exception as exc:
+            fail(f"offline G5 service composition failed ({type(exc).__name__})")
+        try:
+            executor = service.action_executor
+            if (
+                config.live_get_enabled
+                or config.live_actions_enabled
+                or config.live_spend_authorized
+                or config.auto_reallocate
+                or config.firebase_enabled
+                or not config.kill_switch_engaged
+                or config.reallocation_admission_mode != "OFF"
+            ):
+                fail("packaged G5 configuration did not remain offline and action-disabled")
+            if (
+                type(executor) is not SaladActionExecutor
+                or type(getattr(executor, "transport", None)) is not RestrictedSaladActionHTTPTransport
+                or executor.transport.enabled is not False
+                or type(getattr(executor, "secret_provider", None)) is not g5_app._NoCredentialSecretProvider
+                or executor.secret_provider.read_attempts != 0
+                or getattr(executor.kill_switch, "enabled", None) is not False
+            ):
+                fail("packaged G5 executor was not composed with permanently closed live controls")
+            if (
+                service._live_action_transport_is_disabled() is not True
+                or service.reallocation_controller.policy.action_enabled is not False
+                or service.reallocation_controller.policy.g5_authorized is not False
+                or service.auto_reallocation_gate.admission_mode != "OFF"
+                or service.action_ledger.snapshot()
+            ):
+                fail("packaged G5 service exposed an armed or persisted action state")
+        finally:
+            service.close()
 
     output = io.StringIO()
     provider_calls: list[str] = []
@@ -729,6 +993,8 @@ def check_imports_and_inert_startup(root: Path, *, image: bool) -> None:
     print("CENTRAL_WATCHER_IMPORT_OK")
     print("STARTUP_RECOVERY_IMPORT_OK")
     print("STARTUP_POLICY_READONLY_IMPORT_OK")
+    print("REALLOCATION_PACKAGE_IMPORT_OK")
+    print("G5_ACTION_DEFAULT_CLOSED_OK")
     print("ED25519_VERIFY_AND_REJECT_OK")
     print(f"SECRET_BOUNDARY_PATH_OK path={boundary_path.as_posix()}")
     print("WATCHER_DEFAULT_OFF_OFFLINE_OK")
@@ -778,11 +1044,12 @@ def main() -> int:
         check_sources_exist(root)
         check_dockerfile_manifest(root)
         check_workflow(root)
+        check_action_import_boundary_regressions()
         check_source_boundaries(root, image=False)
         check_simulated_image_tree(root)
         print("SIMULATED_PACKAGED_IMAGE_IMPORT_CLOSURE_OK")
     else:
-        check_image_tree(root)
+        check_image_tree(root, include_control_plane=True)
         check_source_boundaries(root, image=True)
     check_imports_and_inert_startup(root, image=args.image)
     print("fleet image smoke passed: exact source allowlist, G4A resolver, G4C identity, imports, and disabled/offline startup")
