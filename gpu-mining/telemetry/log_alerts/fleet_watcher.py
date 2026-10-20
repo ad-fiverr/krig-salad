@@ -10,6 +10,7 @@ from pathlib import Path
 import threading
 import time
 from typing import Any, Callable, Iterable, Mapping
+from types import MappingProxyType
 
 from collector.fl4sh_early_autotune import StartupPolicySnapshot
 
@@ -23,6 +24,7 @@ from .live_adapter import QUERY_FAILURE_CODES, LiveAdapterError, LiveQueryLimits
 from .live_capability import LiveRuntimeCapability
 from .live_transport import LiveSaladReadTransport, LiveTransportBlocked
 from .list_instances_lookup import ListInstancesLookup
+from .provider_binding_revalidation import ProviderBindingRevalidator
 from .startup_v2_attestation import StartupV2AttestationResolver
 
 
@@ -73,7 +75,9 @@ class CentralFleetWatcher:
         clock_utc: Callable[[], str] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         startup_policy_snapshot: StartupPolicySnapshot | None = None,
+        startup_policy_snapshots_for_test: Mapping[str, StartupPolicySnapshot] | None = None,
         startup_v2_attestation_resolver: StartupV2AttestationResolver | None = None,
+        startup_provider_binding_revalidators_for_test: Mapping[str, ProviderBindingRevalidator] | None = None,
     ) -> None:
         self.targets = validate_targets(targets)
         self.by_organization = targets_by_organization(self.targets)
@@ -93,11 +97,50 @@ class CentralFleetWatcher:
             raise TypeError("watcher support functions are invalid")
         if startup_policy_snapshot is not None and type(startup_policy_snapshot) is not StartupPolicySnapshot:
             raise TypeError("startup policy must be the exact read-only G5 snapshot")
+        if startup_policy_snapshots_for_test is not None:
+            if startup_policy_snapshot is not None or not isinstance(startup_policy_snapshots_for_test, Mapping):
+                raise ValueError("per-organization startup policy fixtures require an isolated test mapping")
+            policy_snapshots = dict(startup_policy_snapshots_for_test)
+            if set(policy_snapshots) != set(self.by_organization):
+                raise ValueError("per-organization startup policy fixtures must cover the exact watcher scope")
+            for organization, snapshot in policy_snapshots.items():
+                projects = self.by_organization[organization]
+                if (
+                    type(snapshot) is not StartupPolicySnapshot
+                    or snapshot.organization != organization
+                    or len(projects) != 1
+                    or snapshot.project != projects[0]
+                ):
+                    raise ValueError("per-organization startup policy scope must be exact")
+            if (
+                startup_v2_attestation_resolver is None
+                or type(startup_v2_attestation_resolver) is not StartupV2AttestationResolver
+                or not startup_v2_attestation_resolver.offline_test_only
+            ):
+                raise ValueError("per-organization startup policy fixtures require the offline V2 harness")
+            startup_policy_snapshots_for_test = MappingProxyType(policy_snapshots)
         if (
             startup_v2_attestation_resolver is not None
             and type(startup_v2_attestation_resolver) is not StartupV2AttestationResolver
         ):
             raise TypeError("startup binding must use the exact V2 attestation resolver")
+        if startup_provider_binding_revalidators_for_test is not None:
+            if not isinstance(startup_provider_binding_revalidators_for_test, Mapping):
+                raise TypeError("offline binding revalidators must be mapped per organization")
+            revalidators = dict(startup_provider_binding_revalidators_for_test)
+            for organization, revalidator in revalidators.items():
+                if (
+                    organization not in self.by_organization
+                    or type(revalidator) is not ProviderBindingRevalidator
+                    or not revalidator.offline_test_only
+                    or revalidator.organization_names != {organization}
+                    or any(
+                        target.project_name not in self.by_organization[organization]
+                        for target in revalidator.allowed_targets
+                    )
+                ):
+                    raise ValueError("offline binding revalidation scope must be exact and organization-isolated")
+            startup_provider_binding_revalidators_for_test = MappingProxyType(revalidators)
         self.query = query.strip()
         state_path = Path(state_dir).expanduser()
         if state_path.is_symlink():
@@ -112,7 +155,9 @@ class CentralFleetWatcher:
         self.clock_utc = clock_utc or (lambda: canonical_utc(datetime.now(timezone.utc)))
         self.monotonic = monotonic
         self.startup_policy_snapshot = startup_policy_snapshot
+        self.startup_policy_snapshots_for_test = startup_policy_snapshots_for_test
         self.startup_v2_attestation_resolver = startup_v2_attestation_resolver
+        self.startup_provider_binding_revalidators_for_test = startup_provider_binding_revalidators_for_test
         self._ledgers: dict[str, SQLiteAlertLedger] = {}
         # Keep the per-organization transport and scoped List Instances cache
         # for the lifetime of the watcher. Recreating the lookup each cycle
@@ -159,6 +204,19 @@ class CentralFleetWatcher:
                 and not offline
             ):
                 raise RuntimeError("synthetic startup attestation requires the offline transport")
+            if self.startup_policy_snapshots_for_test is not None and not offline:
+                raise RuntimeError("per-organization startup policy fixtures require the offline transport")
+            provider_binding_revalidator = (
+                self.startup_provider_binding_revalidators_for_test.get(organization)
+                if self.startup_provider_binding_revalidators_for_test is not None
+                else None
+            )
+            if provider_binding_revalidator is not None and (
+                not offline
+                or self.startup_v2_attestation_resolver is None
+                or not self.startup_v2_attestation_resolver.offline_test_only
+            ):
+                raise RuntimeError("provider binding revalidation requires the offline V2 harness")
             lookup = self._lookups.get(organization)
             if lookup is None:
                 lookup = ListInstancesLookup(
@@ -176,8 +234,13 @@ class CentralFleetWatcher:
             startup_bridge = self._startup_bridges.get(organization)
             if startup_bridge is None:
                 from .startup_early_bridge import StartupEarlyBridge
+                policy_snapshot = (
+                    self.startup_policy_snapshots_for_test[organization]
+                    if self.startup_policy_snapshots_for_test is not None
+                    else self.startup_policy_snapshot
+                )
                 startup_bridge = StartupEarlyBridge(
-                    policy_snapshot=self.startup_policy_snapshot,
+                    policy_snapshot=policy_snapshot,
                     startup_v2_attestation_resolver=self.startup_v2_attestation_resolver,
                     monotonic=self.monotonic,
                 )
@@ -191,6 +254,7 @@ class CentralFleetWatcher:
                 allowed_projects=projects,
                 identity_resolver=lookup.resolve_entry,
                 startup_early_bridge=startup_bridge,
+                startup_provider_binding_revalidator_for_test=provider_binding_revalidator,
                 monotonic=self.monotonic,
             )
             cycle = enricher.run_once(

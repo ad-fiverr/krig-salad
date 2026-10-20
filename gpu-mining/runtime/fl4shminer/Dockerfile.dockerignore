@@ -28,6 +28,7 @@
 !gpu-mining/telemetry/log_alerts/live_controller.py
 !gpu-mining/telemetry/log_alerts/live_transport.py
 !gpu-mining/telemetry/log_alerts/normalize.py
+!gpu-mining/telemetry/log_alerts/provider_binding_revalidation.py
 !gpu-mining/telemetry/log_alerts/startup_early_bridge.py
 !gpu-mining/telemetry/log_alerts/startup_guard.py
 !gpu-mining/telemetry/log_alerts/startup_v2_attestation.py

@@ -7,7 +7,7 @@ generation binding and empirical calibration the decision remains UNKNOWN.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import math
@@ -31,7 +31,13 @@ from collector.startup_recovery_policy import (
 
 from .contract import DATA_CLASSIFICATION, PROVIDER_OBSERVED, canonical_utc
 from .normalize import MAX_TEXT_LOG_CHARS, NormalizedLogEntry
-from .startup_v2_attestation import StartupV2AttestationResolver, StartupV2Resolution
+from .provider_binding_revalidation import ProviderBindingPreDispatchResult
+from .startup_v2_attestation import (
+    StartupV2AttestationResolver,
+    StartupV2ProofHandle,
+    StartupV2Resolution,
+    _startup_v2_proof_handle,
+)
 
 
 _GPU_NAME_RE = re.compile(
@@ -117,6 +123,12 @@ class StartupEarlyEvent:
     decision: str | None = None
     actions_performed: bool = False
     request_submitted: bool = False
+    provider_binding_revalidation: ProviderBindingPreDispatchResult | None = field(
+        default=None, repr=False, compare=False,
+    )
+    _provider_binding_proof_handle: StartupV2ProofHandle | None = field(
+        default=None, repr=False, compare=False,
+    )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -147,6 +159,25 @@ class StartupEarlyEvent:
             "event_time_utc": self.event_time_utc,
             "data_classification": self.data_classification,
             "recovery_policy": self.recovery.to_dict(),
+            "provider_binding_revalidation": (
+                self.provider_binding_revalidation.to_dict()
+                if type(self.provider_binding_revalidation) is ProviderBindingPreDispatchResult
+                else {
+                    "binding_status": "UNKNOWN",
+                    "revalidation_status": "REVALIDATION_BLOCKED",
+                    "reason": "SOURCE_UNAVAILABLE",
+                    "evidence_classification": "UNKNOWN",
+                    "event_evidence_ref_sha256": None,
+                    "assignment_evidence_ref_sha256": None,
+                    "device_evidence_ref_sha256": None,
+                    "policy_hash": None,
+                    "observed_at_utc": None,
+                    "revalidated_at_utc": None,
+                    "action_eligible": False,
+                    "actions_performed": False,
+                    "request_submitted": False,
+                }
+            ),
             "actions_performed": False,
             "request_submitted": False,
         }
@@ -592,6 +623,9 @@ class StartupEarlyBridge:
             response_to_decision_ms=round(response_elapsed, 3),
             classification_ms=round(local_elapsed, 3),
             decision=state,
+            _provider_binding_proof_handle=(
+                _startup_v2_proof_handle(resolution) if resolution is not None else None
+            ),
         )
 
     def _correlate_implicit_pearl_device(

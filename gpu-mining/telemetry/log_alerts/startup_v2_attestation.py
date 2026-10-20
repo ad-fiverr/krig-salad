@@ -9,7 +9,7 @@ offline tests and only alongside response evidence from the offline transport.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import re
@@ -47,6 +47,54 @@ _RESOLUTION_CODES = frozenset({
     "NO_VERIFIED_ATTESTATION",
     "PROVIDER_RESPONSE_EVIDENCE_INVALID",
 })
+_STARTUP_V2_PROOF_AUTHORITY = object()
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class StartupV2ProofHandle:
+    """Private typed handle emitted only after the V2 signature is verified.
+
+    It remains in-process and is never serialized to watcher output or logs.
+    """
+
+    binding: ProviderBinding
+    record: AssociationEvidenceRecord
+    attestation: StartupV2Attestation
+    response_evidence: Any
+    gpu_identity_response_evidence: Any
+    max_binding_age_seconds: int
+    _authority: object = field(repr=False, compare=False)
+
+    def __init__(
+        self,
+        *,
+        binding: ProviderBinding,
+        record: AssociationEvidenceRecord,
+        attestation: StartupV2Attestation,
+        response_evidence: Any,
+        gpu_identity_response_evidence: Any,
+        max_binding_age_seconds: int,
+        _authority: object,
+    ) -> None:
+        if (
+            _authority is not _STARTUP_V2_PROOF_AUTHORITY
+            or type(binding) is not ProviderBinding
+            or type(record) is not AssociationEvidenceRecord
+            or type(attestation) is not StartupV2Attestation
+            or type(max_binding_age_seconds) is not int
+            or not 1 <= max_binding_age_seconds <= 86400
+        ):
+            raise TypeError("verified V2 proof handle is unavailable")
+        object.__setattr__(self, "binding", binding)
+        object.__setattr__(self, "record", record)
+        object.__setattr__(self, "attestation", attestation)
+        object.__setattr__(self, "response_evidence", response_evidence)
+        object.__setattr__(self, "gpu_identity_response_evidence", gpu_identity_response_evidence)
+        object.__setattr__(self, "max_binding_age_seconds", max_binding_age_seconds)
+        object.__setattr__(self, "_authority", _authority)
+
+    def __repr__(self) -> str:
+        return "StartupV2ProofHandle(claims=[REDACTED], signatures=[REDACTED])"
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,12 +128,38 @@ class StartupV2Attestation:
 class StartupV2Resolution:
     context: EarlyEvaluationContext | None
     reason: str
+    _proof_handle: StartupV2ProofHandle | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.reason not in _RESOLUTION_CODES and self.reason != "ATTESTATION_VERIFIED":
             raise ValueError("INVALID_STARTUP_V2_RESULT")
         if self.context is not None and type(self.context) is not EarlyEvaluationContext:
             raise ValueError("INVALID_STARTUP_V2_CONTEXT")
+        if self._proof_handle is not None and (
+            type(self._proof_handle) is not StartupV2ProofHandle
+            or self.reason != "ATTESTATION_VERIFIED"
+            or self.context is None
+        ):
+            raise ValueError("INVALID_STARTUP_V2_PROOF_HANDLE")
+
+
+def _startup_v2_proof_handle(resolution: StartupV2Resolution) -> StartupV2ProofHandle | None:
+    """Private bridge accessor; public serializers must never expose this value."""
+    if (
+        type(resolution) is not StartupV2Resolution
+        or resolution.reason != "ATTESTATION_VERIFIED"
+        or type(resolution._proof_handle) is not StartupV2ProofHandle
+    ):
+        return None
+    return resolution._proof_handle
+
+
+def _is_startup_v2_proof_handle(handle: object) -> bool:
+    """Private exact-instance gate for proof handles passed across in-process code."""
+    return (
+        type(handle) is StartupV2ProofHandle
+        and handle._authority is _STARTUP_V2_PROOF_AUTHORITY
+    )
 
 
 def _safe_id(value: object) -> bool:
@@ -294,7 +368,16 @@ class StartupV2AttestationResolver:
             allow_synthetic_provider_log_evidence_for_test=synthetic,
             allow_synthetic_binding_evidence_for_test=synthetic,
         )
-        return StartupV2Resolution(context, "ATTESTATION_VERIFIED")
+        proof_handle = StartupV2ProofHandle(
+            binding=binding,
+            record=record,
+            attestation=attestation,
+            response_evidence=response_evidence,
+            gpu_identity_response_evidence=gpu_identity_response_evidence,
+            max_binding_age_seconds=policy.max_binding_age_seconds,
+            _authority=_STARTUP_V2_PROOF_AUTHORITY,
+        )
+        return StartupV2Resolution(context, "ATTESTATION_VERIFIED", proof_handle)
 
     def _response_status(self, evidence: Any, classification: str) -> str | None:
         from .live_transport import ProviderResponseEvidence

@@ -38,6 +38,10 @@ from .normalize import (
 )
 from .startup_guard import StartupGuard
 from .startup_early_bridge import StartupEarlyBridge
+from .provider_binding_revalidation import (
+    ProviderBindingPreDispatchResult,
+    ProviderBindingRevalidator,
+)
 
 
 MAX_TELEGRAM_MESSAGE_CHARS = 8_192
@@ -452,6 +456,7 @@ class LogAlertEnricher:
         identity_resolver: Callable[[NormalizedLogEntry], NormalizedLogEntry] | None = None,
         startup_early_bridge: StartupEarlyBridge | None = None,
         startup_evaluation_context_for_test: EarlyEvaluationContext | None = None,
+        startup_provider_binding_revalidator_for_test: ProviderBindingRevalidator | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if type(ledger) is not SQLiteAlertLedger:
@@ -487,7 +492,20 @@ class LogAlertEnricher:
                 raise TypeError("synthetic V2 attestations require the offline transport")
             if startup_evaluation_context_for_test is not None:
                 raise TypeError("V2 attestation evidence cannot be combined with fixture context")
+        if startup_provider_binding_revalidator_for_test is not None:
+            if (
+                type(startup_provider_binding_revalidator_for_test) is not ProviderBindingRevalidator
+                or not startup_provider_binding_revalidator_for_test.offline_test_only
+                or type(transport) is not LiveSaladReadTransport
+                or transport._offline_exchange is None
+                or v2_resolver is None
+                or not v2_resolver.offline_test_only
+                or startup_evaluation_context_for_test is not None
+                or startup_provider_binding_revalidator_for_test.organization_names != {approved_organization}
+            ):
+                raise TypeError("provider binding revalidation is restricted to the exact offline V2 harness")
         self.startup_evaluation_context_for_test = startup_evaluation_context_for_test
+        self.startup_provider_binding_revalidator_for_test = startup_provider_binding_revalidator_for_test
         self.monotonic = monotonic
         self.allowed_projects = projects
         self.identity_resolver = identity_resolver
@@ -670,16 +688,51 @@ class LogAlertEnricher:
         # separate from alert candidates, notification delivery and ledger
         # state. Provider resource labels alone cannot verify a GPU binding.
         watcher_ingested_at_utc = canonical_utc(datetime.now(timezone.utc))
-        early_admission_events = tuple(
-            event.to_dict()
-            for event in self.startup_early_bridge.process_entries(
-                correlated,
-                context=self.startup_evaluation_context_for_test,
-                response_received_monotonic=response_received_monotonic,
-                response_received_at_utc=response_received_at_utc,
-                watcher_ingested_at_utc=watcher_ingested_at_utc,
-            )
+        early_event_objects = self.startup_early_bridge.process_entries(
+            correlated,
+            context=self.startup_evaluation_context_for_test,
+            response_received_monotonic=response_received_monotonic,
+            response_received_at_utc=response_received_at_utc,
+            watcher_ingested_at_utc=watcher_ingested_at_utc,
         )
+        prepared_early_events = []
+        for event in early_event_objects:
+            proof_handle = event._provider_binding_proof_handle
+            revalidator = self.startup_provider_binding_revalidator_for_test
+            if (
+                event.state != "EARLY_UNDER_FLOOR"
+                or event.signal_type != "PEARL_AUTOTUNE"
+            ):
+                synthetic_proof = (
+                    proof_handle is not None
+                    and proof_handle.record.observation_reference.data_classification == "SYNTHETIC/UNVERIFIED"
+                )
+                binding_result = ProviderBindingPreDispatchResult(
+                    "UNKNOWN", "REVALIDATION_BLOCKED", "EVENT_NOT_ELIGIBLE",
+                    "SYNTHETIC/UNVERIFIED" if synthetic_proof else "UNKNOWN",
+                    event_evidence_ref_sha256=(
+                        proof_handle.record.evidence_sha256 if proof_handle is not None else None
+                    ),
+                    policy_hash=(proof_handle.binding.policy_hash if proof_handle is not None else None),
+                )
+            elif proof_handle is None:
+                binding_result = ProviderBindingPreDispatchResult(
+                    "UNKNOWN", "REVALIDATION_BLOCKED", "NO_VERIFIED_V2_PROOF", "UNKNOWN",
+                )
+            elif revalidator is None:
+                binding_result = ProviderBindingPreDispatchResult(
+                    "UNKNOWN", "REVALIDATION_BLOCKED", "SOURCE_UNAVAILABLE", "SYNTHETIC/UNVERIFIED",
+                    event_evidence_ref_sha256=proof_handle.record.evidence_sha256,
+                    policy_hash=proof_handle.binding.policy_hash,
+                )
+            else:
+                binding_result = revalidator.revalidate_pre_dispatch(
+                    proof_handle, now_utc=lambda: datetime.now(timezone.utc),
+                )
+            prepared_early_events.append(
+                replace(event, provider_binding_revalidation=binding_result).to_dict()
+            )
+        early_admission_events = tuple(prepared_early_events)
         candidates: list[NormalizedLogEntry] = []
         for entry in correlated:
             alert = entry.alert

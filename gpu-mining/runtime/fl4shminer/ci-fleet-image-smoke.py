@@ -41,6 +41,7 @@ LOG_ALERT_MODULES = (
     "live_controller.py",
     "live_transport.py",
     "normalize.py",
+    "provider_binding_revalidation.py",
     "startup_early_bridge.py",
     "startup_guard.py",
     "startup_v2_attestation.py",

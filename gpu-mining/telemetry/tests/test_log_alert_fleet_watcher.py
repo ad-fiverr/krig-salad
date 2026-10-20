@@ -47,6 +47,15 @@ from log_alerts.live_transport import (  # noqa: E402
     secret_boundary_types,
 )
 from log_alerts.normalize import normalize_provider_log_entry  # noqa: E402
+from log_alerts.provider_binding_revalidation import (  # noqa: E402
+    ExactSaladAssignmentTarget,
+    ExplicitBindingAllowlist,
+    ProviderBindingRevalidator,
+    SignedSyntheticProviderSnapshot,
+    SyntheticFreshProviderSource,
+    synthetic_snapshot_signature_payload,
+)
+from log_alerts.startup_early_bridge import StartupEarlyBridge  # noqa: E402
 from log_alerts.startup_v2_attestation import (  # noqa: E402
     StartupV2Attestation,
     StartupV2AttestationResolver,
@@ -54,7 +63,9 @@ from log_alerts.startup_v2_attestation import (  # noqa: E402
 )
 from collector.fl4sh_early_autotune import (  # noqa: E402
     AssociationEvidenceRecord,
+    EarlyPolicy,
     ProviderLogObservationReference,
+    _policy_floor_catalog_hash,
     association_evidence_sha256,
 )
 from g5_control_plane.config import G5Config, load_config  # noqa: E402
@@ -197,7 +208,7 @@ def _page(items: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
-def _signed_startup_resolver(items, snapshot, *, now, attested_valid_from=None):
+def _signed_startup_resolver(items, snapshot, *, now, attested_valid_from=None, signing_key=None):
     """Create an event-specific synthetic attestation from an offline response."""
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
@@ -256,7 +267,7 @@ def _signed_startup_resolver(items, snapshot, *, now, attested_valid_from=None):
         evidence_sha256="0" * 64,
     )
     record = replace(record, evidence_sha256=association_evidence_sha256(record))
-    private = Ed25519PrivateKey.generate()
+    private = signing_key or Ed25519PrivateKey.generate()
     public = private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
     attestation = StartupV2Attestation(
         schema_version=2,
@@ -274,6 +285,63 @@ def _signed_startup_resolver(items, snapshot, *, now, attested_valid_from=None):
         attestations=(attestation,),
         offline_test_only=True,
     )
+
+
+def _signed_synthetic_current_assignment(resolver, policy_snapshot, organization, project, group, now):
+    """Build one signed in-memory GET snapshot for watcher integration tests."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    record = resolver._attestations[0].record
+    reference = record.observation_reference
+    target = ExactSaladAssignmentTarget(
+        organization, project, group,
+        f"org-id-{organization}", f"project-id-{organization}", f"group-id-{group}",
+        tenant_id=f"tenant-{organization}", account_id=f"account-{organization}",
+    )
+    provider_exchange = OfflineSaladExchange(
+        lambda *_args: SaladTransportResponse(200, b'{"instances":[]}'),
+    )
+    provider_transport = LiveSaladReadTransport.for_offline_test(
+        policy=LiveLogQueryPolicy(organization), exchange=provider_exchange,
+    )
+    response = provider_transport.fetch_list_instances(
+        organization_name=organization, project_name=project, container_group_name=group,
+    )
+    values = {
+        "target": target,
+        "instance_id": reference.instance_id,
+        "machine_id": reference.machine_id,
+        "assignment_id": record.assignment_id,
+        "assignment_generation": record.assignment_generation,
+        "state": "RUNNING",
+        "observed_at_utc": datetime.now(timezone.utc),
+        "policy_hash": policy_snapshot.policy.policy_hash,
+        "tenant_id": target.tenant_id,
+        "account_id": target.account_id,
+        "request_method": "GET",
+        "request_path": f"/api/public/organizations/{organization}/projects/{project}/containers/{group}/instances",
+        "response_evidence": response.evidence,
+        "authority_id": "watcher-provider-authority",
+        "key_id": "watcher-provider-key",
+        "signature": b"\0" * 64,
+    }
+    unsigned = SignedSyntheticProviderSnapshot(**values)
+    private = Ed25519PrivateKey.generate()
+    public = private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    signed = replace(
+        unsigned,
+        signature=private.sign(synthetic_snapshot_signature_payload(unsigned)),
+    )
+    source = SyntheticFreshProviderSource(
+        target=target,
+        trusted_authorities={"watcher-provider-key": ("watcher-provider-authority", public)},
+        responses=((signed,),),
+    )
+    revalidator = ProviderBindingRevalidator(
+        allowlist=ExplicitBindingAllowlist((target,)), source=source,
+    )
+    return revalidator, source
 
 
 class CentralFleetWatcherTests(unittest.TestCase):
@@ -320,8 +388,10 @@ class CentralFleetWatcherTests(unittest.TestCase):
     def make_watcher(self, directory, items_by_org, instance_rows_by_scope, *, failing=None,
                      lookup_failing=None, query_responder=None, poll_seconds=30,
                      clock=None, monotonic=None, startup_policy_snapshot=None, targets=None,
+                     startup_policy_snapshots_for_test=None,
                      startup_v2_attestation_resolver=None, secret_provider_override=None,
-                     transport_factory_override=None):
+                     transport_factory_override=None,
+                     startup_provider_binding_revalidators_for_test=None):
         secret_provider = secret_provider_override or SyntheticSecretProvider()
         telegram = SyntheticTelegramSecretProvider().acquire()
         telegram_calls = []
@@ -376,7 +446,9 @@ class CentralFleetWatcherTests(unittest.TestCase):
             clock_utc=clock,
             monotonic=monotonic or (lambda: 0.0),
             startup_policy_snapshot=startup_policy_snapshot,
+            startup_policy_snapshots_for_test=startup_policy_snapshots_for_test,
             startup_v2_attestation_resolver=startup_v2_attestation_resolver,
+            startup_provider_binding_revalidators_for_test=startup_provider_binding_revalidators_for_test,
         )
         return watcher, exchanges, telegram_calls, secret_provider
 
@@ -1077,10 +1149,13 @@ class CentralFleetWatcherTests(unittest.TestCase):
     def _run_signed_v2_startup_watch(
         self, estimate_ths, *, include_attestation=True,
         attested_valid_from=None, omit_gpu_detection=False,
+        revalidate_provider_binding=False, include_second_organization=False,
+        floor_configured=True, clock_conflict=False, early_signal_override=None,
     ):
         now = datetime.now(timezone.utc).replace(microsecond=0)
         init_time = now - timedelta(seconds=4)
-        pearl_time = now - timedelta(seconds=3)
+        pearl_time = now + timedelta(seconds=30) if clock_conflict else now - timedelta(seconds=3)
+        request_end_time = now + timedelta(seconds=35) if clock_conflict else now
         init_text = "Device [1] NVIDIA GeForce RTX 5080 Laptop GPU: Initialized"
         pearl_text = (
             "GPU=NVIDIA GeForce RTX 5080 Laptop GPU Pearl autotune hashrate = "
@@ -1103,9 +1178,16 @@ class CentralFleetWatcherTests(unittest.TestCase):
             )
         finally:
             service.close()
+        if not floor_configured:
+            snapshot = replace(
+                snapshot,
+                policy=EarlyPolicy("c" * 64, {"RTX_5090_DESKTOP": 350.0}, margin_ths=0.0),
+                floor_sources={"RTX_5090_DESKTOP": "TEST"},
+                floor_catalog_hash=_policy_floor_catalog_hash({"RTX_5090_DESKTOP": 350.0}),
+            )
         if include_attestation:
             resolver = _signed_startup_resolver(
-                items, snapshot, now=now, attested_valid_from=attested_valid_from,
+                items, snapshot, now=request_end_time, attested_valid_from=attested_valid_from,
             )
         else:
             from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -1116,25 +1198,61 @@ class CentralFleetWatcherTests(unittest.TestCase):
                 attestations=(),
                 offline_test_only=True,
             )
+        binding_source = None
+        binding_revalidators = None
+        if revalidate_provider_binding:
+            if not include_attestation or not resolver._attestations:
+                raise ValueError("provider binding fixture requires one signed V2 attestation")
+            revalidator, binding_source = _signed_synthetic_current_assignment(
+                resolver, snapshot, organization, PROJECT, GROUPS[0], request_end_time,
+            )
+            binding_revalidators = {organization: revalidator}
         watch_items = items[1:] if omit_gpu_detection else items
         with tempfile.TemporaryDirectory() as temp:
             watcher, _exchanges, telegram_calls, _provider = self.make_watcher(
                 temp,
-                {organization: watch_items},
+                ({organization: watch_items, "fleet-bravo": []}
+                 if include_second_organization else {organization: watch_items}),
                 {},
                 startup_policy_snapshot=snapshot,
                 startup_v2_attestation_resolver=resolver,
-                targets=[FleetTarget(organization, PROJECT)],
+                targets=([FleetTarget(organization, PROJECT), FleetTarget("fleet-bravo", PROJECT)]
+                         if include_second_organization else [FleetTarget(organization, PROJECT)]),
+                startup_provider_binding_revalidators_for_test=binding_revalidators,
             )
             try:
-                rows = watcher.run_cycle(end_time_utc=now.strftime("%Y-%m-%dT%H:%M:%SZ"))
+                if early_signal_override is None:
+                    rows = watcher.run_cycle(end_time_utc=request_end_time.strftime("%Y-%m-%dT%H:%M:%SZ"))
+                else:
+                    original_process_entries = StartupEarlyBridge.process_entries
+
+                    def process_entries_with_signal_override(bridge, *args, **kwargs):
+                        events = original_process_entries(bridge, *args, **kwargs)
+                        return tuple(
+                            replace(event, signal_type=early_signal_override)
+                            if event.signal_type == "PEARL_AUTOTUNE" else event
+                            for event in events
+                        )
+
+                    with patch.object(
+                        StartupEarlyBridge, "process_entries", process_entries_with_signal_override,
+                    ):
+                        rows = watcher.run_cycle(
+                            end_time_utc=request_end_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        )
                 result = next(row for row in rows if row.organization_name == organization)
                 self.assertEqual(telegram_calls, [])
                 self.assertEqual(result.alerts_prepared, 0)
                 event = next(
                     item for item in result.startup_events
-                    if item.get("signal_type") == "PEARL_AUTOTUNE"
+                    if item.get("signal_type") is not None
                 )
+                if revalidate_provider_binding:
+                    if include_second_organization:
+                        bravo = next(row for row in rows if row.organization_name == "fleet-bravo")
+                        self.assertEqual(bravo.startup_events, ())
+                        self.assertEqual(binding_source.read_calls, 1)
+                    return result, event, binding_source
                 return result, event
             finally:
                 watcher.close()
@@ -1148,6 +1266,197 @@ class CentralFleetWatcherTests(unittest.TestCase):
         self.assertFalse(pearl["actions_performed"] or pearl["request_submitted"])
         self.assertEqual(result.early_unknown_count, 0)
         self.assertEqual(result.early_under_floor_count, 0)
+        self.assertEqual(
+            pearl["provider_binding_revalidation"]["revalidation_status"],
+            "REVALIDATION_BLOCKED",
+        )
+        self.assertEqual(pearl["provider_binding_revalidation"]["reason"], "EVENT_NOT_ELIGIBLE")
+        self.assertFalse(pearl["provider_binding_revalidation"]["action_eligible"])
+
+    def test_signed_pearl_event_gets_fresh_offline_binding_without_raw_ids_or_actions(self):
+        result, pearl, source = self._run_signed_v2_startup_watch(
+            100.0, revalidate_provider_binding=True,
+        )
+        self.assertEqual(pearl["state"], "EARLY_UNDER_FLOOR")
+        proof = pearl["provider_binding_revalidation"]
+        self.assertEqual(proof["binding_status"], "BOUND_EXACT")
+        self.assertEqual(proof["revalidation_status"], "REVALIDATED_MATCH_TEST_ONLY")
+        self.assertEqual(proof["evidence_classification"], "SYNTHETIC/UNVERIFIED")
+        self.assertIsNotNone(proof["event_evidence_ref_sha256"])
+        self.assertIsNotNone(proof["assignment_evidence_ref_sha256"])
+        self.assertIsNotNone(proof["device_evidence_ref_sha256"])
+        self.assertFalse(
+            proof["action_eligible"] or proof["actions_performed"] or proof["request_submitted"]
+        )
+        self.assertEqual(source.read_calls, 1)
+        self.assertEqual(result.alerts_prepared, 0)
+        self.assertEqual(result.early_under_floor_count, 1)
+        serialized = json.dumps(pearl, sort_keys=True)
+        for private_value in (
+            "offline-assignment-1", "offline-generation-1", "org-id-adrianfiverr",
+            "project-id-adrianfiverr", "group-id-fl4shminer",
+        ):
+            self.assertNotIn(private_value, serialized)
+
+    def test_non_under_floor_startup_event_does_not_read_binding_source(self):
+        _result, pearl, source = self._run_signed_v2_startup_watch(
+            160.47, revalidate_provider_binding=True,
+        )
+        proof = pearl["provider_binding_revalidation"]
+        self.assertEqual(pearl["state"], "EARLY_PASS")
+        self.assertEqual(proof["binding_status"], "UNKNOWN")
+        self.assertEqual(proof["reason"], "EVENT_NOT_ELIGIBLE")
+        self.assertEqual(proof["revalidation_status"], "REVALIDATION_BLOCKED")
+        self.assertEqual(source.read_calls, 0)
+        self.assertFalse(proof["action_eligible"] or proof["actions_performed"] or proof["request_submitted"])
+
+    def test_pearl_at_floor_does_not_read_binding_source(self):
+        _result, pearl, source = self._run_signed_v2_startup_watch(
+            120.0, revalidate_provider_binding=True,
+        )
+        self.assertEqual((pearl["signal_type"], pearl["state"]), ("PEARL_AUTOTUNE", "EARLY_PASS"))
+        self.assertEqual(pearl["reason"], "PEARL_AT_OR_ABOVE_FLOOR")
+        self.assertEqual(pearl["provider_binding_revalidation"]["reason"], "EVENT_NOT_ELIGIBLE")
+        self.assertEqual(source.read_calls, 0)
+
+    def test_missing_floor_does_not_read_binding_source(self):
+        _result, pearl, source = self._run_signed_v2_startup_watch(
+            100.0, revalidate_provider_binding=True, floor_configured=False,
+        )
+        self.assertEqual((pearl["signal_type"], pearl["state"]), ("PEARL_AUTOTUNE", "EARLY_UNKNOWN"))
+        self.assertEqual(pearl["reason"], "FLOOR_UNCONFIGURED")
+        self.assertEqual(pearl["provider_binding_revalidation"]["reason"], "EVENT_NOT_ELIGIBLE")
+        self.assertEqual(source.read_calls, 0)
+
+    def test_clock_conflict_does_not_read_binding_source(self):
+        _result, pearl, source = self._run_signed_v2_startup_watch(
+            100.0, revalidate_provider_binding=True, clock_conflict=True,
+        )
+        self.assertEqual((pearl["signal_type"], pearl["state"]), ("PEARL_AUTOTUNE", "EARLY_UNKNOWN"))
+        self.assertEqual(pearl["reason"], "CLOCK_INCONSISTENT")
+        self.assertEqual(pearl["provider_binding_revalidation"]["reason"], "EVENT_NOT_ELIGIBLE")
+        self.assertEqual(source.read_calls, 0)
+
+    def test_cuda_and_pool_signals_never_read_binding_source_even_if_state_is_under_floor(self):
+        for signal in ("CUDA_POOL_EQUIVALENT", "POOL_CONNECTION_FAILED"):
+            with self.subTest(signal=signal):
+                _result, event, source = self._run_signed_v2_startup_watch(
+                    100.0, revalidate_provider_binding=True, early_signal_override=signal,
+                )
+                self.assertEqual((event["signal_type"], event["state"]), (signal, "EARLY_UNDER_FLOOR"))
+                proof = event["provider_binding_revalidation"]
+                self.assertEqual(proof["reason"], "EVENT_NOT_ELIGIBLE")
+                self.assertEqual(proof["binding_status"], "UNKNOWN")
+                self.assertFalse(proof["action_eligible"] or proof["request_submitted"])
+                self.assertEqual(source.read_calls, 0)
+
+    def test_two_active_organizations_use_independent_startup_policy_and_binding(self):
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+
+        def org_items(organization, instance, machine, estimate):
+            init_time = now - timedelta(seconds=4)
+            pearl_time = now - timedelta(seconds=3)
+            values = [
+                _log_item(
+                    organization, GROUPS[0], instance, init_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "Device [1] NVIDIA GeForce RTX 5080 Laptop GPU: Initialized",
+                ),
+                _log_item(
+                    organization, GROUPS[0], instance, pearl_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "GPU=NVIDIA GeForce RTX 5080 Laptop GPU Pearl autotune hashrate = "
+                    f"{estimate:.2f} TH/s",
+                ),
+            ]
+            for item in values:
+                item["resource"]["labels"]["machine_id"] = machine
+            return values
+
+        alpha_org, bravo_org = "adrianfiverr", "fleet-bravo"
+        alpha_items = org_items(alpha_org, _instance_id(0, 0), _machine_id(0, 0, 0), 100.0)
+        bravo_items = org_items(bravo_org, _instance_id(1, 0), _machine_id(1, 0, 0), 110.0)
+        service = G5ControlPlaneService(G5Config())
+        try:
+            base_snapshot = replace(
+                service.startup_policy_snapshot(),
+                organization=alpha_org,
+                project=PROJECT,
+                loaded_at_utc=(now - timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            )
+        finally:
+            service.close()
+        bravo_snapshot = replace(
+            base_snapshot,
+            organization=bravo_org,
+            policy=EarlyPolicy("b" * 64, {"RTX_5080_LAPTOP": 115.0}, margin_ths=0.0),
+            floor_sources={"RTX_5080_LAPTOP": "TEST"},
+            floor_catalog_hash=_policy_floor_catalog_hash({"RTX_5080_LAPTOP": 115.0}),
+        )
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        signing_key = Ed25519PrivateKey.generate()
+        alpha_resolver = _signed_startup_resolver(
+            alpha_items, base_snapshot, now=now, signing_key=signing_key,
+        )
+        bravo_resolver = _signed_startup_resolver(
+            bravo_items, bravo_snapshot, now=now, signing_key=signing_key,
+        )
+        resolver = StartupV2AttestationResolver(
+            trusted_authorities={
+                **alpha_resolver._trusted_authorities,
+                **bravo_resolver._trusted_authorities,
+            },
+            attestations=alpha_resolver._attestations + bravo_resolver._attestations,
+            offline_test_only=True,
+        )
+        alpha_revalidator, alpha_source = _signed_synthetic_current_assignment(
+            alpha_resolver, base_snapshot, alpha_org, PROJECT, GROUPS[0], now,
+        )
+        bravo_revalidator, bravo_source = _signed_synthetic_current_assignment(
+            bravo_resolver, bravo_snapshot, bravo_org, PROJECT, GROUPS[0], now,
+        )
+
+        with tempfile.TemporaryDirectory() as temp:
+            watcher, _exchanges, telegram_calls, _provider = self.make_watcher(
+                temp,
+                {alpha_org: alpha_items, bravo_org: bravo_items},
+                {},
+                targets=[FleetTarget(alpha_org, PROJECT), FleetTarget(bravo_org, PROJECT)],
+                startup_policy_snapshots_for_test={
+                    alpha_org: base_snapshot,
+                    bravo_org: bravo_snapshot,
+                },
+                startup_v2_attestation_resolver=resolver,
+                startup_provider_binding_revalidators_for_test={
+                    alpha_org: alpha_revalidator,
+                    bravo_org: bravo_revalidator,
+                },
+            )
+            try:
+                results = watcher.run_cycle(end_time_utc=now.strftime("%Y-%m-%dT%H:%M:%SZ"))
+                alpha_result = next(row for row in results if row.organization_name == alpha_org)
+                bravo_result = next(row for row in results if row.organization_name == bravo_org)
+                alpha_event = next(item for item in alpha_result.startup_events if item.get("signal_type") == "PEARL_AUTOTUNE")
+                bravo_event = next(item for item in bravo_result.startup_events if item.get("signal_type") == "PEARL_AUTOTUNE")
+                alpha_binding = alpha_event["provider_binding_revalidation"]
+                bravo_binding = bravo_event["provider_binding_revalidation"]
+                self.assertEqual((alpha_event["state"], alpha_event["floor_ths"]), ("EARLY_UNDER_FLOOR", 120.0))
+                self.assertEqual(
+                    (bravo_event["state"], bravo_event["floor_ths"]),
+                    ("EARLY_UNDER_FLOOR", 115.0),
+                    msg=bravo_event.get("reason"),
+                )
+                self.assertEqual(alpha_binding["revalidation_status"], "REVALIDATED_MATCH_TEST_ONLY")
+                self.assertEqual(bravo_binding["revalidation_status"], "REVALIDATED_MATCH_TEST_ONLY")
+                self.assertNotEqual(alpha_binding["policy_hash"], bravo_binding["policy_hash"])
+                self.assertEqual((alpha_source.read_calls, bravo_source.read_calls), (1, 1))
+                self.assertEqual(telegram_calls, [])
+                for event in (alpha_event, bravo_event):
+                    self.assertFalse(
+                        event["actions_performed"]
+                        or event["request_submitted"]
+                        or event["provider_binding_revalidation"]["action_eligible"]
+                    )
+            finally:
+                watcher.close()
 
     def test_signed_v2_binding_reaches_under_floor_through_central_watcher(self):
         result, pearl = self._run_signed_v2_startup_watch(100.0)

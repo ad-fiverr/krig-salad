@@ -673,7 +673,17 @@ class LogAlertEngineTests(unittest.TestCase):
             self.assertEqual(event["estimate_ths"], 143.41)
             self.assertFalse(event["actions_performed"])
             self.assertFalse(event["request_submitted"])
+            binding = event["provider_binding_revalidation"]
+            self.assertEqual(binding["binding_status"], "UNKNOWN")
+            self.assertEqual(binding["reason"], "EVENT_NOT_ELIGIBLE")
+            self.assertFalse(binding["action_eligible"] or binding["request_submitted"])
             self.assertNotIn(raw_line, str(event))
+            first_cursor = result.cursor_time_utc
+            replay = enricher.run_once(end_time_utc=END_TIME)
+            self.assertEqual(replay.prepared_count, 0)
+            self.assertEqual(ledger.alert_count(), 0)
+            self.assertGreaterEqual(replay.cursor_time_utc, first_cursor)
+            self.assertEqual(replay.early_admission_events, ())
         finally:
             ledger.close()
 
