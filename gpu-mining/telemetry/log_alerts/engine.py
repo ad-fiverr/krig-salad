@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable
 import hashlib
 import json
 import math
 import re
+import time
+
+from collector.fl4sh_early_autotune import EarlyEvaluationContext
 
 from .contract import (
     DATA_CLASSIFICATION,
@@ -448,6 +451,8 @@ class LogAlertEnricher:
         allowed_projects: Iterable[str] | None = None,
         identity_resolver: Callable[[NormalizedLogEntry], NormalizedLogEntry] | None = None,
         startup_early_bridge: StartupEarlyBridge | None = None,
+        startup_evaluation_context_for_test: EarlyEvaluationContext | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if type(ledger) is not SQLiteAlertLedger:
             raise TypeError("a local SQLiteAlertLedger is required")
@@ -463,9 +468,30 @@ class LogAlertEnricher:
             raise TypeError("provider identity fallback requires the live Salad adapter")
         if startup_early_bridge is not None and type(startup_early_bridge) is not StartupEarlyBridge:
             raise TypeError("startup early bridge must use the exact read-only bridge")
+        if not callable(monotonic):
+            raise TypeError("startup instrumentation clock is invalid")
+        if startup_evaluation_context_for_test is not None:
+            if type(transport) is not FixtureLogQueryTransport or type(startup_evaluation_context_for_test) is not EarlyEvaluationContext:
+                raise TypeError("synthetic startup evaluation context is fixture-only")
+            if not (
+                startup_evaluation_context_for_test.allow_synthetic_provider_log_evidence_for_test
+                and startup_evaluation_context_for_test.allow_synthetic_binding_evidence_for_test
+            ):
+                raise ValueError("fixture startup context requires explicit synthetic evidence gates")
+        selected_startup_bridge = startup_early_bridge or StartupEarlyBridge()
+        v2_resolver = selected_startup_bridge.startup_v2_attestation_resolver
+        if v2_resolver is not None:
+            if type(transport) is not LiveSaladReadTransport:
+                raise TypeError("V2 provider attestations require the exact live transport boundary")
+            if v2_resolver.offline_test_only and transport._offline_exchange is None:
+                raise TypeError("synthetic V2 attestations require the offline transport")
+            if startup_evaluation_context_for_test is not None:
+                raise TypeError("V2 attestation evidence cannot be combined with fixture context")
+        self.startup_evaluation_context_for_test = startup_evaluation_context_for_test
+        self.monotonic = monotonic
         self.allowed_projects = projects
         self.identity_resolver = identity_resolver
-        self.startup_early_bridge = startup_early_bridge or StartupEarlyBridge()
+        self.startup_early_bridge = selected_startup_bridge
         self.transport = transport
         self.ledger = ledger
         if type(transport) is FixtureLogQueryTransport:
@@ -535,6 +561,8 @@ class LogAlertEnricher:
         classification = DATA_CLASSIFICATION
         live_scope = None
         provider_response_evidence: tuple[Any, ...] = ()
+        response_received_monotonic: float | None = None
+        response_received_at_utc: str | None = None
         if type(self.transport) is FixtureLogQueryTransport:
             if query is not None or enable_provider_delivery:
                 raise UnsafeQueryCycle("fixture cycles cannot accept live query or delivery controls")
@@ -573,6 +601,8 @@ class LogAlertEnricher:
                 raise IncompleteFixtureQuery("fixture pagination exceeded the local page limit")
             if not pages or pages[-1].next_page_token is not None:
                 raise IncompleteFixtureQuery("fixture response ended before pagination completed")
+            response_received_monotonic = self.monotonic()
+            response_received_at_utc = canonical_utc(datetime.now(timezone.utc))
             query_count = len(pages)
             try:
                 for raw_entry in entries:
@@ -598,6 +628,8 @@ class LogAlertEnricher:
                 end_time_utc=end,
                 query=query,
             )
+            response_received_monotonic = self.monotonic()
+            response_received_at_utc = canonical_utc(datetime.now(timezone.utc))
             normalized.extend(live_result.entries)
             if self.allowed_projects is not None:
                 normalized = [
@@ -615,6 +647,7 @@ class LogAlertEnricher:
                         or updated.evidence_sha256 != entry.evidence_sha256
                         or updated.resource_labels != entry.resource_labels
                         or updated.alert != entry.alert
+                        or updated.provider_response_evidence is not entry.provider_response_evidence
                     ):
                         raise UnsafeQueryCycle("identity resolver changed non-identity evidence")
                     resolved.append(updated)
@@ -636,10 +669,16 @@ class LogAlertEnricher:
         # Early evidence is a read-only projection. It is deliberately kept
         # separate from alert candidates, notification delivery and ledger
         # state. Provider resource labels alone cannot verify a GPU binding.
+        watcher_ingested_at_utc = canonical_utc(datetime.now(timezone.utc))
         early_admission_events = tuple(
             event.to_dict()
-            for entry in correlated
-            if (event := self.startup_early_bridge.inspect(entry)) is not None
+            for event in self.startup_early_bridge.process_entries(
+                correlated,
+                context=self.startup_evaluation_context_for_test,
+                response_received_monotonic=response_received_monotonic,
+                response_received_at_utc=response_received_at_utc,
+                watcher_ingested_at_utc=watcher_ingested_at_utc,
+            )
         )
         candidates: list[NormalizedLogEntry] = []
         for entry in correlated:

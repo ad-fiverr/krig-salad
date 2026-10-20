@@ -12,8 +12,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from collector.fl4sh_early_autotune import (  # noqa: E402
     AssociationEvidenceRecord, BindingAttestation, EarlyCalibration, EarlyObservation,
-    EarlyPolicy, MonitorPolicyEvidence, ObservationReference, ProviderBinding,
-    association_evidence_sha256, evaluate_early_autotune, monitor_policy_evidence_sha256,
+    EarlyPolicy, LocalStartupPolicyEvidence, MonitorPolicyEvidence, ObservationReference,
+    ProviderBinding, ProviderLogObservationReference,
+    _policy_floor_catalog_hash, association_evidence_sha256, evaluate_early_autotune,
+    monitor_policy_evidence_sha256,
 )
 
 
@@ -152,6 +154,78 @@ class EarlyAutotuneTests(unittest.TestCase):
         self.assertEqual(result.state, "EARLY_UNDER_FLOOR")
         self.assertEqual(result.calibration_status, "NOT_APPLICABLE")
         self.assertIsNone(result.calibration_evidence_sha256)
+
+    def test_provider_log_v2_fast_path_uses_exact_pearl_floor_and_synthetic_gate(self):
+        event_time = NOW - timedelta(seconds=2)
+        reference = ProviderLogObservationReference(
+            evidence_sha256="d" * 64,
+            event_time_utc=event_time.isoformat().replace("+00:00", "Z"),
+            data_classification="SYNTHETIC/UNVERIFIED",
+            organization="org-synthetic",
+            project="project-synthetic",
+            container_group="group-synthetic",
+            machine_id="machine-synthetic",
+            instance_id="instance-synthetic",
+            device_namespace="fl4shminer_device",
+            device_index=1,
+            gpu_key="RTX_5090_LAPTOP",
+            gpu_identity_source_sha256="f" * 64,
+        )
+        local_policy = LocalStartupPolicyEvidence(
+            policy_hash=POLICY_HASH,
+            config_sha256="e" * 64,
+            floor_catalog_hash=_policy_floor_catalog_hash(self.policy.floors_ths),
+            organization="org-synthetic",
+            project="project-synthetic",
+            container_groups=("group-synthetic",),
+            loaded_at_utc="2026-10-18T11:59:40Z",
+        )
+        record = replace(
+            self.association_record,
+            observation_reference=reference,
+            evidence_sha256="",
+        )
+        record = replace(record, evidence_sha256=association_evidence_sha256(record))
+        binding = replace(
+            self.binding,
+            observation_reference=reference,
+            attestation=BindingAttestation(1, record.evidence_id, record.evidence_sha256),
+        )
+
+        def decision(estimate):
+            signal = EarlyObservation(
+                "PEARL_AUTOTUNE", 1, "RTX_5090_LAPTOP", estimate, event_time,
+                POLICY_HASH, source="SALAD_PROVIDER_LOG_AUTOTUNE",
+                source_reference=reference,
+                policy_evidence=local_policy,
+                policy_evidence_status="PARSED",
+            )
+            return evaluate_early_autotune(
+                signal, binding, None, self.policy,
+                now_utc=NOW,
+                association_records=(record,),
+                allow_synthetic_binding_evidence_for_test=True,
+                allow_synthetic_provider_log_evidence_for_test=True,
+            )
+
+        self.assertEqual(decision(125.0).state, "EARLY_PASS")
+        self.assertEqual(decision(120.0).state, "EARLY_PASS")
+        self.assertEqual(decision(119.0).state, "EARLY_UNDER_FLOOR")
+        blocked = evaluate_early_autotune(
+            EarlyObservation(
+                "PEARL_AUTOTUNE", 1, "RTX_5090_LAPTOP", 119.0, event_time,
+                POLICY_HASH, source="SALAD_PROVIDER_LOG_AUTOTUNE",
+                source_reference=reference,
+                policy_evidence=local_policy,
+                policy_evidence_status="PARSED",
+            ),
+            binding, None, self.policy,
+            now_utc=NOW,
+            association_records=(record,),
+            allow_synthetic_binding_evidence_for_test=True,
+        )
+        self.assertEqual(blocked.state, "EARLY_UNKNOWN")
+        self.assertEqual(blocked.reason, "POLICY_EVIDENCE_UNVERIFIED")
 
     def test_cuda_pool_equivalent_is_diagnostic_only(self):
         result = self.decide(signal=replace(

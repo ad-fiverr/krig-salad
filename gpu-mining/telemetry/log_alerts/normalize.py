@@ -8,7 +8,7 @@ transport. Resource identity is sourced only from ``resource.labels``.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 import hashlib
@@ -196,6 +196,9 @@ class NormalizedLogEntry:
     pool_recovery_signal: bool = False
     pool_recovery_signal_sha256: str | None = None
     pool_recovery_marker: "PoolRecoveryMarker | None" = None
+    # Ephemeral exact-page response provenance; excluded from repr/equality and
+    # never included in public watcher projections or SQLite records.
+    provider_response_evidence: Any = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1196,12 +1199,14 @@ def normalize_provider_log_entry(entry: Mapping[str, Any], response_evidence: An
         envelope,
         expected_classification=classification,
         identity_classification=classification,
+        provider_response_evidence=response_evidence,
     )
 
 
 def _normalize_log_entry(
     entry: Mapping[str, Any], *, expected_classification: str,
     identity_classification: str | None = None,
+    provider_response_evidence: Any = None,
 ) -> NormalizedLogEntry:
     """Shared alert parser; evidence classification is fixed by its caller."""
     if not isinstance(entry, Mapping):
@@ -1369,4 +1374,5 @@ def _normalize_log_entry(
         pool_recovery_signal=pool_recovery_signal,
         pool_recovery_signal_sha256=pool_recovery_signal_sha256,
         pool_recovery_marker=pool_recovery_marker,
+        provider_response_evidence=provider_response_evidence,
     )

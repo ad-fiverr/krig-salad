@@ -30,7 +30,9 @@
 !gpu-mining/telemetry/log_alerts/normalize.py
 !gpu-mining/telemetry/log_alerts/startup_early_bridge.py
 !gpu-mining/telemetry/log_alerts/startup_guard.py
+!gpu-mining/telemetry/log_alerts/startup_v2_attestation.py
 !gpu-mining/telemetry/collector/
+!gpu-mining/telemetry/collector/guards.py
 !gpu-mining/telemetry/collector/g4a_salad_get.py
 !gpu-mining/telemetry/collector/fl4sh_early_autotune.py
 !gpu-mining/telemetry/collector/fl4shminer.py
@@ -39,5 +41,9 @@
 !gpu-mining/telemetry/collector/startup_admission.py
 !gpu-mining/telemetry/collector/startup_recovery_policy.py
 !gpu-mining/telemetry/collector/work.py
+!gpu-mining/telemetry/g5_control_plane/
+!gpu-mining/telemetry/g5_control_plane/__init__.py
+!gpu-mining/telemetry/g5_control_plane/config.py
+!gpu-mining/telemetry/g5_control_plane/startup_policy.py
 !gpu-mining/g4c-live/
 !gpu-mining/g4c-live/live_secret_boundary.py

@@ -6,13 +6,13 @@ import hashlib
 import json
 import math
 import re
-from dataclasses import asdict, replace
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Protocol
 
 from .gpu_identity import normalize_gpu_identity
 from .guard_store import GuardStore, canonical_utc
-from .guards import HashGuardPolicy, evaluate_hash_floor
+from .guards import HashGuardPolicy, evaluate_hash_floor, hash_guard_policy
 
 
 class ReallocationActionAdapter(Protocol):
@@ -39,8 +39,7 @@ class DisabledReallocationActionAdapter:
 
 
 def _policy_hash(policy: HashGuardPolicy) -> str:
-    encoded = json.dumps(asdict(policy), sort_keys=True, separators=(",", ":"), allow_nan=False)
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return hash_guard_policy(policy)
 
 
 def _parse_utc(value: str) -> datetime:

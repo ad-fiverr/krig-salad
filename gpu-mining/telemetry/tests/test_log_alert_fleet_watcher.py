@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.util
@@ -33,7 +33,7 @@ from log_alerts.fleet_targets import (  # noqa: E402
 )
 from log_alerts.fleet_watcher import CentralFleetWatcher  # noqa: E402
 from log_alerts.live_capability import authorize_live_invocation  # noqa: E402
-from log_alerts.live_adapter import LiveAdapterError  # noqa: E402
+from log_alerts.live_adapter import LiveAdapterError, _allowlisted_envelope  # noqa: E402
 from log_alerts import live_cli as live_cli_module  # noqa: E402
 from log_alerts.live_cli import (  # noqa: E402
     WatcherAlreadyRunning,
@@ -46,6 +46,19 @@ from log_alerts.live_transport import (  # noqa: E402
     SaladTransportResponse,
     secret_boundary_types,
 )
+from log_alerts.normalize import normalize_provider_log_entry  # noqa: E402
+from log_alerts.startup_v2_attestation import (  # noqa: E402
+    StartupV2Attestation,
+    StartupV2AttestationResolver,
+    startup_v2_signature_payload,
+)
+from collector.fl4sh_early_autotune import (  # noqa: E402
+    AssociationEvidenceRecord,
+    ProviderLogObservationReference,
+    association_evidence_sha256,
+)
+from g5_control_plane.config import G5Config, load_config  # noqa: E402
+from g5_control_plane.service import G5ControlPlaneService  # noqa: E402
 
 
 _SMOKE_PATH = TELEMETRY_ROOT.parent / "runtime" / "fl4shminer" / "ci-fleet-image-smoke.py"
@@ -184,6 +197,85 @@ def _page(items: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
+def _signed_startup_resolver(items, snapshot, *, now, attested_valid_from=None):
+    """Create an event-specific synthetic attestation from an offline response."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    organization = str(items[0]["resource"]["labels"]["organization_name"])
+    policy = LiveLogQueryPolicy(organization)
+    response_body = json.dumps(_page(items), separators=(",", ":")).encode("utf-8")
+    transport = LiveSaladReadTransport.for_offline_test(
+        policy=policy,
+        exchange=OfflineSaladExchange(lambda *_args: SaladTransportResponse(200, response_body)),
+    )
+    request = policy.build_request(
+        start_time_utc=now - timedelta(minutes=1), end_time_utc=now,
+        query='severity="ERROR"', page_size=100,
+    )
+    evidence = transport.fetch_query(request).evidence
+    normalized = [
+        normalize_provider_log_entry(_allowlisted_envelope(item), evidence)
+        for item in items
+    ]
+    gpu_entry = next(item for item in normalized if "Device [1]" in (item.text_log or ""))
+    pearl_entry = next(item for item in normalized if "Pearl autotune" in (item.text_log or ""))
+    reference = ProviderLogObservationReference(
+        evidence_sha256=pearl_entry.evidence_sha256,
+        event_time_utc=pearl_entry.event_time_utc,
+        data_classification=pearl_entry.data_classification,
+        organization=pearl_entry.identity.organization_name,
+        project=pearl_entry.identity.project_name,
+        container_group=pearl_entry.identity.container_group_name,
+        machine_id=pearl_entry.identity.machine_id,
+        instance_id=pearl_entry.identity.instance_id,
+        device_namespace="fl4shminer_device",
+        device_index=1,
+        gpu_key="RTX_5080_LAPTOP",
+        gpu_identity_source_sha256=gpu_entry.evidence_sha256,
+    )
+    valid_from = attested_valid_from or datetime.fromisoformat(
+        gpu_entry.event_time_utc.replace("Z", "+00:00"),
+    )
+    valid_until = now + timedelta(minutes=2)
+    revalidated = datetime.fromisoformat(pearl_entry.event_time_utc.replace("Z", "+00:00"))
+    record = AssociationEvidenceRecord(
+        format_version=1,
+        evidence_id="offline-watcher-binding-1",
+        source="SYNTHETIC_TEST_ONLY",
+        status="VERIFIED",
+        observation_reference=reference,
+        assignment_id="offline-assignment-1",
+        assignment_generation="offline-generation-1",
+        valid_from_utc=valid_from,
+        valid_until_utc=valid_until,
+        revalidated_at_utc=revalidated,
+        policy_hash=snapshot.policy.policy_hash,
+        verifier_id="offline-watcher-test-verifier",
+        verifier_version="1",
+        evidence_sha256="0" * 64,
+    )
+    record = replace(record, evidence_sha256=association_evidence_sha256(record))
+    private = Ed25519PrivateKey.generate()
+    public = private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    attestation = StartupV2Attestation(
+        schema_version=2,
+        authority_id="offline-watcher-test-authority",
+        key_id="offline-watcher-test-key",
+        response_sha256=evidence.response_sha256,
+        record=record,
+        signature=b"\0" * 64,
+    )
+    attestation = replace(
+        attestation, signature=private.sign(startup_v2_signature_payload(attestation)),
+    )
+    return StartupV2AttestationResolver(
+        trusted_authorities={"offline-watcher-test-key": ("offline-watcher-test-authority", public)},
+        attestations=(attestation,),
+        offline_test_only=True,
+    )
+
+
 class CentralFleetWatcherTests(unittest.TestCase):
     def test_synthetic_image_layout_resolves_monitor_and_healthcheck_at_install_root(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -227,8 +319,10 @@ class CentralFleetWatcherTests(unittest.TestCase):
 
     def make_watcher(self, directory, items_by_org, instance_rows_by_scope, *, failing=None,
                      lookup_failing=None, query_responder=None, poll_seconds=30,
-                     clock=None, monotonic=None):
-        secret_provider = SyntheticSecretProvider()
+                     clock=None, monotonic=None, startup_policy_snapshot=None, targets=None,
+                     startup_v2_attestation_resolver=None, secret_provider_override=None,
+                     transport_factory_override=None):
+        secret_provider = secret_provider_override or SyntheticSecretProvider()
         telegram = SyntheticTelegramSecretProvider().acquire()
         telegram_calls = []
         sender = CentralTelegramSender.for_offline_test(
@@ -271,16 +365,18 @@ class CentralFleetWatcherTests(unittest.TestCase):
             )
 
         watcher = CentralFleetWatcher(
-            targets=[FleetTarget(org, PROJECT) for org in ORGANIZATIONS],
+            targets=targets or [FleetTarget(org, PROJECT) for org in ORGANIZATIONS],
             query='severity="ERROR"',
             state_dir=directory,
             secret_provider=secret_provider,
             sender=sender,
             capability=capability,
             poll_seconds=poll_seconds,
-            transport_factory=transport_factory,
+            transport_factory=transport_factory_override or transport_factory,
             clock_utc=clock,
             monotonic=monotonic or (lambda: 0.0),
+            startup_policy_snapshot=startup_policy_snapshot,
+            startup_v2_attestation_resolver=startup_v2_attestation_resolver,
         )
         return watcher, exchanges, telegram_calls, secret_provider
 
@@ -916,6 +1012,214 @@ class CentralFleetWatcherTests(unittest.TestCase):
             finally:
                 watcher.close()
 
+    def test_startup_fast_path_watcher_projection_is_immediate_synthetic_and_non_actionable(self):
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        event_time = (now - timedelta(seconds=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_time = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        service = G5ControlPlaneService(G5Config())
+        try:
+            snapshot = replace(
+                service.startup_policy_snapshot(),
+                loaded_at_utc=(now - timedelta(seconds=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            )
+        finally:
+            service.close()
+
+        instance = _instance_id(0, 0)
+        machine = _machine_id(0, 0, 0)
+        organization = "adrianfiverr"
+        items = [
+            _log_item(
+                organization, GROUPS[0], instance, event_time,
+                "Device [1] NVIDIA GeForce RTX 5080 Laptop GPU: Initialized",
+            ),
+            _log_item(
+                organization, GROUPS[0], instance, event_time,
+                "GPU=NVIDIA GeForce RTX 5080 Laptop GPU Pearl autotune hashrate = 119.0 TH/s",
+            ),
+        ]
+        for item in items:
+            item["resource"]["labels"]["machine_id"] = machine
+        with tempfile.TemporaryDirectory() as temp:
+            watcher, _exchanges, telegram_calls, _provider = self.make_watcher(
+                temp,
+                {organization: items},
+                {},
+                startup_policy_snapshot=snapshot,
+                targets=[FleetTarget(organization, PROJECT)],
+            )
+            try:
+                first = watcher.run_cycle(end_time_utc=end_time)
+                alpha = next(result for result in first if result.organization_name == organization)
+                self.assertEqual(alpha.early_signal_count, 2)
+                self.assertEqual(alpha.early_unknown_count, 1)
+                self.assertEqual(alpha.early_under_floor_count, 0)
+                self.assertEqual(alpha.alerts_prepared, 0)
+                self.assertEqual(len(alpha.startup_events), 2)
+                pearl = next(event for event in alpha.startup_events if event.get("signal_type") == "PEARL_AUTOTUNE")
+                self.assertEqual(pearl["mode"], "STARTUP_FAST_PATH")
+                self.assertEqual(pearl["gpu_key"], "RTX_5080_LAPTOP")
+                self.assertEqual(pearl["floor_ths"], 120.0)
+                self.assertFalse(pearl["actions_performed"] or pearl["request_submitted"])
+                encoded = json.dumps(alpha.startup_events, sort_keys=True)
+                for private_value in (machine, instance, "GPU=NVIDIA", "Pearl autotune"):
+                    self.assertNotIn(private_value, encoded)
+                self.assertEqual(telegram_calls, [])
+
+                second = watcher.run_cycle(end_time_utc=(now + timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+                alpha_second = next(result for result in second if result.organization_name == organization)
+                self.assertEqual(alpha_second.startup_events, ())
+                self.assertEqual(alpha_second.alerts_prepared, 0)
+                self.assertEqual(telegram_calls, [])
+            finally:
+                watcher.close()
+
+    def _run_signed_v2_startup_watch(
+        self, estimate_ths, *, include_attestation=True,
+        attested_valid_from=None, omit_gpu_detection=False,
+    ):
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        init_time = now - timedelta(seconds=4)
+        pearl_time = now - timedelta(seconds=3)
+        init_text = "Device [1] NVIDIA GeForce RTX 5080 Laptop GPU: Initialized"
+        pearl_text = (
+            "GPU=NVIDIA GeForce RTX 5080 Laptop GPU Pearl autotune hashrate = "
+            f"{estimate_ths:.2f} TH/s"
+        )
+        organization = "adrianfiverr"
+        instance = _instance_id(0, 0)
+        machine = _machine_id(0, 0, 0)
+        items = [
+            _log_item(organization, GROUPS[0], instance, init_time.strftime("%Y-%m-%dT%H:%M:%SZ"), init_text),
+            _log_item(organization, GROUPS[0], instance, pearl_time.strftime("%Y-%m-%dT%H:%M:%SZ"), pearl_text),
+        ]
+        for item in items:
+            item["resource"]["labels"]["machine_id"] = machine
+        service = G5ControlPlaneService(G5Config())
+        try:
+            snapshot = replace(
+                service.startup_policy_snapshot(),
+                loaded_at_utc=(now - timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            )
+        finally:
+            service.close()
+        if include_attestation:
+            resolver = _signed_startup_resolver(
+                items, snapshot, now=now, attested_valid_from=attested_valid_from,
+            )
+        else:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+            public = Ed25519PrivateKey.generate().public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+            resolver = StartupV2AttestationResolver(
+                trusted_authorities={"offline-watcher-test-key": ("offline-watcher-test-authority", public)},
+                attestations=(),
+                offline_test_only=True,
+            )
+        watch_items = items[1:] if omit_gpu_detection else items
+        with tempfile.TemporaryDirectory() as temp:
+            watcher, _exchanges, telegram_calls, _provider = self.make_watcher(
+                temp,
+                {organization: watch_items},
+                {},
+                startup_policy_snapshot=snapshot,
+                startup_v2_attestation_resolver=resolver,
+                targets=[FleetTarget(organization, PROJECT)],
+            )
+            try:
+                rows = watcher.run_cycle(end_time_utc=now.strftime("%Y-%m-%dT%H:%M:%SZ"))
+                result = next(row for row in rows if row.organization_name == organization)
+                self.assertEqual(telegram_calls, [])
+                self.assertEqual(result.alerts_prepared, 0)
+                event = next(
+                    item for item in result.startup_events
+                    if item.get("signal_type") == "PEARL_AUTOTUNE"
+                )
+                return result, event
+            finally:
+                watcher.close()
+
+    def test_signed_v2_binding_reaches_early_pass_through_central_watcher(self):
+        result, pearl = self._run_signed_v2_startup_watch(160.47)
+        self.assertEqual(pearl["state"], "EARLY_PASS")
+        self.assertEqual(pearl["reason"], "PEARL_AT_OR_ABOVE_FLOOR")
+        self.assertEqual(pearl["provenance_status"], "SYNTHETIC_TEST_ONLY")
+        self.assertEqual(pearl["floor_ths"], 120.0)
+        self.assertFalse(pearl["actions_performed"] or pearl["request_submitted"])
+        self.assertEqual(result.early_unknown_count, 0)
+        self.assertEqual(result.early_under_floor_count, 0)
+
+    def test_signed_v2_binding_reaches_under_floor_through_central_watcher(self):
+        result, pearl = self._run_signed_v2_startup_watch(100.0)
+        self.assertEqual(pearl["state"], "EARLY_UNDER_FLOOR")
+        self.assertEqual(pearl["reason"], "PEARL_BELOW_FLOOR")
+        self.assertEqual(pearl["provenance_status"], "SYNTHETIC_TEST_ONLY")
+        self.assertEqual(result.early_under_floor_count, 1)
+        self.assertEqual(result.early_unknown_count, 0)
+        self.assertFalse(pearl["actions_performed"] or pearl["request_submitted"])
+
+    def test_missing_v2_attestation_stays_early_unknown_in_watcher_path(self):
+        _result, pearl = self._run_signed_v2_startup_watch(160.47, include_attestation=False)
+        self.assertEqual(pearl["state"], "EARLY_UNKNOWN")
+        self.assertEqual(pearl["reason"], "NO_VERIFIED_ATTESTATION")
+        self.assertFalse(pearl["actions_performed"] or pearl["request_submitted"])
+
+    def test_new_generation_cannot_reuse_pre_generation_gpu_detection(self):
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        pearl_time = now - timedelta(seconds=3)
+        attested_valid_from = pearl_time
+        _result, pearl = self._run_signed_v2_startup_watch(
+            160.47, attested_valid_from=attested_valid_from,
+        )
+        self.assertEqual(pearl["state"], "EARLY_UNKNOWN")
+        self.assertEqual(pearl["reason"], "ATTESTATION_GENERATION_MISMATCH")
+
+    def test_restarted_watcher_without_gpu_init_cannot_reuse_prior_process_identity(self):
+        _result, pearl = self._run_signed_v2_startup_watch(
+            160.47, omit_gpu_detection=True,
+        )
+        self.assertEqual(pearl["state"], "EARLY_UNKNOWN")
+        self.assertEqual(pearl["reason"], "ATTESTATION_INPUT_INCOMPLETE")
+
+    def test_offline_attestation_resolver_is_rejected_before_live_secret_or_socket(self):
+        resolver = StartupV2AttestationResolver(
+            trusted_authorities={"offline-watcher-test-key": ("offline-watcher-test-authority", b"p" * 32)},
+            attestations=(),
+            offline_test_only=True,
+        )
+        provider = InteractiveSecretProvider(enabled=False)
+        transports = []
+
+        def network_transport_factory(organization, secret_provider, capability):
+            transport = LiveSaladReadTransport(
+                policy=LiveLogQueryPolicy(organization),
+                secret_provider=secret_provider,
+                capability=capability,
+            )
+            transports.append(transport)
+            return transport
+
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "log_alerts.live_transport.http.client.HTTPSConnection",
+            side_effect=AssertionError("socket must not be opened"),
+        ):
+            watcher, _exchanges, telegram_calls, _provider = self.make_watcher(
+                temp, {ORGANIZATIONS[0]: []}, {},
+                targets=[FleetTarget(ORGANIZATIONS[0], PROJECT)],
+                startup_v2_attestation_resolver=resolver,
+                secret_provider_override=provider,
+                transport_factory_override=network_transport_factory,
+            )
+            try:
+                result = watcher.run_cycle(end_time_utc="2026-10-13T12:01:00Z")[0]
+                self.assertEqual(result.records_seen, 0)
+                self.assertEqual(result.query_subqueries_seen, 0)
+                self.assertEqual(provider.read_count, 0)
+                self.assertEqual(len(transports), 1)
+                self.assertEqual(telegram_calls, [])
+            finally:
+                watcher.close()
+
     def test_one_watcher_accepts_100_organization_targets_without_spawning_or_connecting(self):
         targets = [FleetTarget(f"fleet-{index:03d}", PROJECT) for index in range(100)]
         secret_provider = SyntheticSecretProvider()
@@ -1020,6 +1324,105 @@ class CentralFleetWatcherTests(unittest.TestCase):
                 "--query", 'severity="ERROR"',
             ])
         self.assertEqual(code, 2)
+
+    def test_cli_startup_policy_config_loads_real_json_through_watcher_without_live_io(self):
+        provider_type, _, _ = secret_boundary_types()
+        secret_provider = provider_type(enabled=True)
+        captured = {}
+
+        class FakeTelegramProvider:
+            def __init__(self, *, enabled):
+                self.enabled = enabled
+
+            def acquire(self):
+                return object()
+
+        class FakeWatcher:
+            by_organization = {"fleet-alpha": object()}
+
+            def __init__(self, **kwargs):
+                captured["watcher_snapshot"] = kwargs["startup_policy_snapshot"]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def watch(self, *, on_cycle):
+                captured["watch_called"] = callable(on_cycle)
+
+        with tempfile.TemporaryDirectory(prefix="live-cli-startup-policy-") as directory:
+            config_path = Path(directory) / "startup-policy.json"
+            config_path.write_text(json.dumps({
+                "pearl_startup_floors_ths": {"RTX_5080_LAPTOP": 111},
+                "monitor": {"warmup_seconds": 45},
+            }), encoding="utf-8")
+            expected_config = load_config(config_path, environ={})
+            expected_service = G5ControlPlaneService(expected_config)
+            try:
+                expected_policy_hash = expected_service.monitor.policy_hash
+            finally:
+                expected_service.close()
+            state_dir = Path(directory) / "state"
+            output = io.StringIO()
+            with (
+                patch("sys.stdout", output),
+                patch("sys.stdin.isatty", return_value=True),
+                patch.dict("os.environ", {}, clear=True),
+                patch.object(provider_type, "acquire", return_value=object()),
+                patch.object(live_cli_module, "_load_interactive_salad_provider", return_value=secret_provider),
+                patch.object(live_cli_module, "_acquire_watcher_lock", return_value=None),
+                patch.object(live_cli_module, "InteractiveTelegramSecretProvider", FakeTelegramProvider),
+                patch.object(live_cli_module, "CentralTelegramSender", return_value=object()),
+                patch.object(live_cli_module, "CentralFleetWatcher", FakeWatcher),
+                patch("log_alerts.live_transport.http.client.HTTPSConnection", side_effect=AssertionError("network opened")),
+            ):
+                code = live_cli_main([
+                    "--watch-live-alerts", "--enable-live-read", "--enable-central-telegram",
+                    "--confirm-live", "CENTRAL_FLEET_MONITOR", "--target", "fleet-alpha:miners",
+                    "--query", 'severity="ERROR"', "--state-dir", str(state_dir),
+                    "--startup-policy-config", str(config_path),
+                ])
+
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertEqual(captured["watcher_snapshot"].policy.floors_ths["RTX_5080_LAPTOP"], 111.0)
+        self.assertEqual(captured["watcher_snapshot"].floor_sources["RTX_5080_LAPTOP"], "JSON")
+        self.assertEqual(captured["watcher_snapshot"].policy.policy_hash, expected_policy_hash)
+        self.assertRegex(captured["watcher_snapshot"].config_sha256, r"^[0-9a-f]{64}$")
+        self.assertTrue(captured["watch_called"])
+        self.assertNotIn("STATUS=FAILED", output.getvalue())
+
+    def test_cli_startup_policy_missing_or_invalid_config_fails_closed_before_secrets(self):
+        provider_type, _, _ = secret_boundary_types()
+        with tempfile.TemporaryDirectory(prefix="live-cli-startup-policy-invalid-") as directory:
+            root = Path(directory)
+            invalid_path = root / "invalid.json"
+            invalid_path.write_text('{"pearl_startup_floors_ths":[]}', encoding="utf-8")
+            for config_path in (root / "missing.json", invalid_path):
+                with self.subTest(config=config_path.name):
+                    output = io.StringIO()
+                    with (
+                        patch("sys.stdout", output),
+                        patch("sys.stdin.isatty", return_value=True),
+                        patch.dict("os.environ", {}, clear=True),
+                        patch.object(live_cli_module, "_load_interactive_salad_provider") as secret_loader,
+                        patch.object(live_cli_module, "CentralFleetWatcher") as watcher,
+                        patch("log_alerts.live_transport.http.client.HTTPSConnection", side_effect=AssertionError("network opened")),
+                    ):
+                        code = live_cli_main([
+                            "--watch-live-alerts", "--enable-live-read", "--enable-central-telegram",
+                            "--confirm-live", "CENTRAL_FLEET_MONITOR", "--target", "fleet-alpha:miners",
+                            "--query", 'severity="ERROR"', "--state-dir", str(root / "state"),
+                            "--startup-policy-config", str(config_path),
+                        ])
+
+                    self.assertEqual(code, 1)
+                    self.assertIn("STATUS=FAILED DETAILS=REDACTED", output.getvalue())
+                    self.assertNotIn(str(config_path), output.getvalue())
+                    self.assertNotIn("pearl_startup_floors_ths", output.getvalue())
+                    secret_loader.assert_not_called()
+                    watcher.assert_not_called()
 
     def test_watcher_lock_allows_only_one_process_per_local_state_directory(self):
         with tempfile.TemporaryDirectory() as directory:

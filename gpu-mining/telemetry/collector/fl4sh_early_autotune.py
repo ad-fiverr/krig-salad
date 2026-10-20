@@ -76,8 +76,8 @@ class EarlyObservation:
     policy_hash: str | None
     source: str = "FL4SHMINER_AUTOTUNE_LOG"
     startup_failure_reason: str | None = None
-    source_reference: "ObservationReference | None" = None
-    policy_evidence: "MonitorPolicyEvidence | None" = None
+    source_reference: "ObservationReference | ProviderLogObservationReference | None" = None
+    policy_evidence: "MonitorPolicyEvidence | LocalStartupPolicyEvidence | None" = None
     policy_evidence_status: str = "MISSING"
 
 
@@ -125,6 +125,81 @@ class ObservationReference:
 
 
 @dataclass(frozen=True)
+class ProviderLogObservationReference:
+    """V2 event provenance from one normalized Salad provider log record.
+
+    Unlike the historical CSV reference, this type makes no claim about a CSV
+    file or row. It is accepted only when the caller explicitly marks the
+    provider log as observed (or a test-only fixture gate is enabled).
+    """
+
+    evidence_sha256: str
+    event_time_utc: str
+    data_classification: str
+    organization: str
+    project: str
+    container_group: str
+    machine_id: str
+    instance_id: str
+    device_namespace: str
+    device_index: int
+    gpu_key: str
+    gpu_identity_source_sha256: str
+    container_group_version: str | None = None
+
+
+@dataclass(frozen=True)
+class LocalStartupPolicyEvidence:
+    """Effective operator policy loaded by the central read-only watcher."""
+
+    policy_hash: str
+    config_sha256: str
+    floor_catalog_hash: str
+    organization: str
+    project: str
+    container_groups: tuple[str, ...]
+    loaded_at_utc: str
+    source: str = "G5_LOCAL_EFFECTIVE_CONFIGURATION"
+    status: str = "PARSED"
+
+
+@dataclass(frozen=True)
+class StartupPolicySnapshot:
+    """Read-only effective floors and exact fleet scope from local G5 config."""
+
+    policy: EarlyPolicy
+    config_sha256: str
+    floor_catalog_hash: str
+    organization: str
+    project: str
+    container_groups: tuple[str, ...]
+    floor_sources: Mapping[str, str]
+    loaded_at_utc: str
+
+    def __post_init__(self) -> None:
+        if type(self.policy) is not EarlyPolicy:
+            raise ValueError("INVALID_STARTUP_POLICY")
+        if not _hash(self.config_sha256) or not _hash(self.floor_catalog_hash):
+            raise ValueError("INVALID_STARTUP_POLICY_FINGERPRINT")
+        if not _valid_id(self.organization) or not _valid_id(self.project):
+            raise ValueError("INVALID_STARTUP_POLICY_SCOPE")
+        if (
+            type(self.container_groups) is not tuple or not self.container_groups
+            or len(set(self.container_groups)) != len(self.container_groups)
+            or any(not _valid_id(item) for item in self.container_groups)
+        ):
+            raise ValueError("INVALID_STARTUP_POLICY_SCOPE")
+        if not isinstance(self.floor_sources, Mapping) or set(self.floor_sources) != set(self.policy.floors_ths):
+            raise ValueError("INVALID_STARTUP_FLOOR_SOURCES")
+        if any(not isinstance(value, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,31}", value) for value in self.floor_sources.values()):
+            raise ValueError("INVALID_STARTUP_FLOOR_SOURCES")
+        if _aware_utc_text(self.loaded_at_utc) is None:
+            raise ValueError("INVALID_STARTUP_POLICY_TIME")
+        object.__setattr__(self, "container_groups", tuple(self.container_groups))
+        object.__setattr__(self, "floor_sources", MappingProxyType(dict(self.floor_sources)))
+
+
+@dataclass(frozen=True)
 class BindingAttestation:
     """Pointer to an independently supplied, canonical association record."""
 
@@ -145,7 +220,7 @@ class AssociationEvidenceRecord:
     evidence_id: str
     source: str
     status: str
-    observation_reference: ObservationReference
+    observation_reference: ObservationReference | ProviderLogObservationReference
     assignment_id: str
     assignment_generation: str
     valid_from_utc: datetime
@@ -173,7 +248,7 @@ class ProviderBinding:
     policy_hash: str
     source: str = "INDEPENDENT_PROVIDER_AND_WORKLOAD_EVIDENCE"
     status: str = "VERIFIED"
-    observation_reference: ObservationReference | None = None
+    observation_reference: ObservationReference | ProviderLogObservationReference | None = None
     attestation: BindingAttestation | None = None
     valid_until_utc: datetime | None = None
 
@@ -252,12 +327,15 @@ class EarlyEvaluationContext:
     now_utc: datetime | None = None
     allow_synthetic_calibration_for_test: bool = False
     allow_synthetic_binding_evidence_for_test: bool = False
+    allow_synthetic_provider_log_evidence_for_test: bool = False
 
     def __post_init__(self) -> None:
         if type(self.allow_synthetic_calibration_for_test) is not bool:
             raise ValueError("INVALID_SYNTHETIC_CALIBRATION_TEST_FLAG")
         if type(self.allow_synthetic_binding_evidence_for_test) is not bool:
             raise ValueError("INVALID_SYNTHETIC_BINDING_TEST_FLAG")
+        if type(self.allow_synthetic_provider_log_evidence_for_test) is not bool:
+            raise ValueError("INVALID_SYNTHETIC_PROVIDER_LOG_TEST_FLAG")
         object.__setattr__(self, "bindings", tuple(self.bindings))
         object.__setattr__(self, "association_records", tuple(self.association_records))
         object.__setattr__(self, "calibrations", tuple(self.calibrations))
@@ -274,6 +352,7 @@ def evaluate_early_autotune(
     allow_synthetic_calibration_for_test: bool = False,
     association_records: Sequence[AssociationEvidenceRecord] = (),
     allow_synthetic_binding_evidence_for_test: bool = False,
+    allow_synthetic_provider_log_evidence_for_test: bool = False,
 ) -> EarlyDecision:
     """Compare Pearl autotune directly to its exact GPU floor; never authorize action.
 
@@ -319,13 +398,28 @@ def evaluate_early_autotune(
         observation.policy_evidence,
         observation.source_reference,
         observation.event_time_utc,
+        policy=policy,
+        allow_synthetic_provider_log_evidence_for_test=allow_synthetic_provider_log_evidence_for_test,
     ):
         return unknown("POLICY_EVIDENCE_UNVERIFIED")
     if observation.policy_hash != observation.policy_evidence.policy_hash:
         return unknown("POLICY_EVIDENCE_CONFLICT")
     if observation.policy_hash != policy.policy_hash:
         return unknown("POLICY_MISMATCH")
-    if observation.source != "FL4SHMINER_AUTOTUNE_LOG" or observation.signal_type not in SIGNAL_TYPES:
+    source_is_verified = (
+        observation.source == "FL4SHMINER_AUTOTUNE_LOG"
+        and type(observation.source_reference) is ObservationReference
+    ) or (
+        observation.source == "SALAD_PROVIDER_LOG_AUTOTUNE"
+        and type(observation.source_reference) is ProviderLogObservationReference
+        and observation.source_reference.data_classification == "PROVIDER_OBSERVED"
+    ) or (
+        allow_synthetic_provider_log_evidence_for_test
+        and observation.source == "SALAD_PROVIDER_LOG_AUTOTUNE"
+        and type(observation.source_reference) is ProviderLogObservationReference
+        and observation.source_reference.data_classification == "SYNTHETIC/UNVERIFIED"
+    )
+    if not source_is_verified or observation.signal_type not in SIGNAL_TYPES:
         return unknown("SIGNAL_UNVERIFIED")
     if observation.device_index is None or type(observation.device_index) is not int or not 0 <= observation.device_index <= 999:
         return unknown("DEVICE_UNVERIFIED")
@@ -342,8 +436,14 @@ def evaluate_early_autotune(
     if binding.source not in {"INDEPENDENT_PROVIDER_AND_WORKLOAD_EVIDENCE", "SYNTHETIC_TEST_ONLY"}:
         return unknown("BINDING_UNVERIFIED")
     if (
-        not _valid_observation_reference(observation.source_reference)
-        or not _valid_observation_reference(binding.observation_reference)
+        not _valid_observation_reference(
+            observation.source_reference,
+            allow_synthetic_provider_log_evidence_for_test=allow_synthetic_provider_log_evidence_for_test,
+        )
+        or not _valid_observation_reference(
+            binding.observation_reference,
+            allow_synthetic_provider_log_evidence_for_test=allow_synthetic_provider_log_evidence_for_test,
+        )
     ):
         return unknown("PROVENANCE_UNVERIFIED")
     if binding.observation_reference != observation.source_reference:
@@ -383,6 +483,7 @@ def evaluate_early_autotune(
         observation.source_reference,
         association_records,
         allow_synthetic=allow_synthetic_binding_evidence_for_test,
+        allow_synthetic_provider_log_evidence_for_test=allow_synthetic_provider_log_evidence_for_test,
     )
     if attestation_result != "VALID":
         return unknown(attestation_result)
@@ -409,7 +510,31 @@ def evaluate_early_autotune(
     )
 
 
-def _valid_observation_reference(value: object) -> bool:
+def _valid_observation_reference(
+    value: object,
+    *,
+    allow_synthetic_provider_log_evidence_for_test: bool = False,
+) -> bool:
+    if type(value) is ProviderLogObservationReference:
+        if value.data_classification == "SYNTHETIC/UNVERIFIED" and not allow_synthetic_provider_log_evidence_for_test:
+            return False
+        if value.data_classification not in {"PROVIDER_OBSERVED", "SYNTHETIC/UNVERIFIED"}:
+            return False
+        if (
+            not _hash(value.evidence_sha256)
+            or not _hash(value.gpu_identity_source_sha256)
+            or _aware_utc_text(value.event_time_utc) is None
+            or not all(_valid_id(item) for item in (
+                value.organization, value.project, value.container_group,
+                value.machine_id, value.instance_id,
+            ))
+            or (value.container_group_version is not None and not _valid_id(value.container_group_version))
+            or value.device_namespace != "fl4shminer_device"
+            or type(value.device_index) is not int or not 0 <= value.device_index <= 999
+            or not _gpu_key(value.gpu_key)
+        ):
+            return False
+        return True
     if type(value) is not ObservationReference:
         return False
     if not _hash(value.source_file_sha256) or not _valid_id(value.source_event_id):
@@ -489,9 +614,53 @@ def monitor_policy_evidence_sha256(value: MonitorPolicyEvidence | None) -> str |
 
 def _valid_policy_evidence(
     evidence: object,
-    reference: ObservationReference | None,
+    reference: ObservationReference | ProviderLogObservationReference | None,
     event_time_utc: datetime | None,
+    *,
+    policy: EarlyPolicy | None = None,
+    allow_synthetic_provider_log_evidence_for_test: bool = False,
 ) -> bool:
+    if type(evidence) is LocalStartupPolicyEvidence:
+        if (
+            type(reference) is not ProviderLogObservationReference
+            or not _valid_observation_reference(
+                reference,
+                allow_synthetic_provider_log_evidence_for_test=allow_synthetic_provider_log_evidence_for_test,
+            )
+            or evidence.status != "PARSED"
+            or evidence.source != "G5_LOCAL_EFFECTIVE_CONFIGURATION"
+            or not _hash(evidence.policy_hash)
+            or not _hash(evidence.config_sha256)
+            or not _hash(evidence.floor_catalog_hash)
+            or not all(_valid_id(item) for item in (evidence.organization, evidence.project))
+            or type(evidence.container_groups) is not tuple
+            or not evidence.container_groups
+            or len(set(evidence.container_groups)) != len(evidence.container_groups)
+            or any(not _valid_id(group) for group in evidence.container_groups)
+            or not _utc(event_time_utc)
+        ):
+            return False
+        loaded = _aware_utc_text(evidence.loaded_at_utc)
+        event_time = _aware_utc_text(reference.event_time_utc)
+        if loaded is None or event_time is None or event_time_utc.astimezone(timezone.utc) != event_time:
+            return False
+        if not loaded <= event_time <= event_time_utc:
+            return False
+        if (
+            reference.data_classification == "SYNTHETIC/UNVERIFIED"
+            and not allow_synthetic_provider_log_evidence_for_test
+        ):
+            return False
+        if (
+            evidence.organization != reference.organization
+            or evidence.project != reference.project
+            or reference.container_group not in evidence.container_groups
+            or policy is None
+            or evidence.policy_hash != policy.policy_hash
+            or evidence.floor_catalog_hash != _policy_floor_catalog_hash(policy.floors_ths)
+        ):
+            return False
+        return True
     if type(evidence) is not MonitorPolicyEvidence or not _valid_observation_reference(reference):
         return False
     assert isinstance(reference, ObservationReference)
@@ -565,10 +734,11 @@ def association_evidence_sha256(value: AssociationEvidenceRecord) -> str | None:
 
 def _validate_binding_attestation(
     binding: ProviderBinding,
-    observation_reference: ObservationReference,
+    observation_reference: ObservationReference | ProviderLogObservationReference,
     association_records: Sequence[AssociationEvidenceRecord],
     *,
     allow_synthetic: bool,
+    allow_synthetic_provider_log_evidence_for_test: bool = False,
 ) -> str:
     attestation = binding.attestation
     if (
@@ -608,6 +778,11 @@ def _validate_binding_attestation(
         return "PROVENANCE_UNVERIFIED"
     if record.source == "SYNTHETIC_TEST_ONLY" and not allow_synthetic:
         return "BINDING_NOT_AUTHORIZED_FOR_PRODUCTION"
+    if not _valid_observation_reference(
+        record.observation_reference,
+        allow_synthetic_provider_log_evidence_for_test=allow_synthetic_provider_log_evidence_for_test,
+    ):
+        return "PROVENANCE_UNVERIFIED"
     if (
         record.observation_reference != observation_reference
         or record.observation_reference != binding.observation_reference
@@ -627,8 +802,19 @@ def _valid_id(value: object) -> bool:
     return isinstance(value, str) and ID_RE.fullmatch(value) is not None
 
 
-def _source_reference_hash(value: ObservationReference | None) -> str | None:
-    if not _valid_observation_reference(value):
+def _source_reference_hash(value: ObservationReference | ProviderLogObservationReference | None) -> str | None:
+    # Hashing is a provenance utility; the evaluator separately enforces the
+    # explicit test-only gate for synthetic provider-log evidence.
+    if not _valid_observation_reference(value, allow_synthetic_provider_log_evidence_for_test=True):
         return None
     encoded = json.dumps(value.__dict__, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(encoded.encode("ascii")).hexdigest()
+
+
+def _policy_floor_catalog_hash(floors: Mapping[str, float]) -> str:
+    payload = json.dumps(
+        [[key, format(value, ".17g")] for key, value in sorted(floors.items())],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()

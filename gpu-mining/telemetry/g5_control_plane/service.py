@@ -22,10 +22,10 @@ from collector.fl4sh_early_autotune import (
     EarlyEvaluationContext,
     EarlyObservation,
     EarlyPolicy,
+    StartupPolicySnapshot,
 )
 from collector.fleet_hashrate_rollups import MAXIMUM_SAMPLE_RECORDS_PER_TRACK, build_hashrate_rollups
 from collector.guard_store import GuardStore
-from collector.guards import HashGuardPolicy
 from collector.reallocation_controller import ReallocationController, ReallocationPolicy
 from collector.salad_action_policy import SaladAction, SaladActionPolicy
 from collector.salad_billing_cost import operator_reaction_cost_scenarios
@@ -35,6 +35,7 @@ from collector.startup_latency import polling_comparison, reaction_exposure_comp
 from collector.v2_adapters import normalize_v2_evaluation
 
 from .config import G5Config, GROUPS
+from .startup_policy import build_guard_policy, build_startup_policy_snapshot
 from .store import ControlPlaneStore
 
 
@@ -101,19 +102,7 @@ class G5ControlPlaneService:
         self.config = config
         self.store = control_store or ControlPlaneStore(":memory:")
         self.guard_store = guard_store or GuardStore(":memory:")
-        self.guard_policy = HashGuardPolicy(
-            gpu_floors_ths=dict(config.gpu_floors_ths),
-            warmup_seconds=config.warmup_seconds,
-            hash_window_seconds=config.hash_window_seconds,
-            reevaluation_interval_seconds=config.reevaluation_interval_seconds,
-            minimum_samples_per_window=config.minimum_samples_per_window,
-            expected_sample_interval_seconds=config.expected_sample_interval_seconds,
-            maximum_sample_gap_seconds=config.maximum_sample_gap_seconds,
-            minimum_window_coverage_ratio=config.minimum_window_coverage_ratio,
-            consecutive_bad_windows=config.consecutive_bad_windows,
-            reallocation_cooldown_seconds=None,
-            max_reallocations_per_run=None,
-        )
+        self.guard_policy = build_guard_policy(config)
         self.monitor = ContinuousMonitor(self.guard_store, self.guard_policy)
         self.action_ledger = action_ledger or ActionLedger(":memory:")
         self._auto_gate_reviews: dict[str, dict[str, Any]] = {}
@@ -577,12 +566,9 @@ class G5ControlPlaneService:
             raise ValueError("startup preview time must include a timezone")
         # Startup Pearl floors use their own exact canonical registry. The
         # continuous Device hashRate guard retains gpu_floors_ths unchanged.
-        floors = dict(self.config.pearl_startup_floors_ths)
-        policy = EarlyPolicy(
-            self.monitor.policy_hash,
-            floors,
-            margin_ths=0.0,
-        )
+        snapshot = self.startup_policy_snapshot()
+        floors = dict(snapshot.policy.floors_ths)
+        policy = snapshot.policy
         active = context or EarlyEvaluationContext()
         policy_conflict = active.policy is not None and (
             type(active.policy) is not EarlyPolicy
@@ -597,6 +583,7 @@ class G5ControlPlaneService:
             now_utc=parsed_now,
             allow_synthetic_calibration_for_test=active.allow_synthetic_calibration_for_test,
             allow_synthetic_binding_evidence_for_test=active.allow_synthetic_binding_evidence_for_test,
+            allow_synthetic_provider_log_evidence_for_test=active.allow_synthetic_provider_log_evidence_for_test,
         )
         decision = self.startup_admission_engine.evaluate(
             observation,
@@ -674,6 +661,13 @@ class G5ControlPlaneService:
         with self._lock:
             self._last_startup_preview = dict(summary)
         return summary
+
+    def startup_policy_snapshot(self) -> StartupPolicySnapshot:
+        """Expose the exact local read-only Pearl policy used by the existing preview."""
+        snapshot = build_startup_policy_snapshot(self.config)
+        if snapshot.policy.policy_hash != self.monitor.policy_hash:
+            raise RuntimeError("G5_STARTUP_POLICY_HASH_MISMATCH")
+        return snapshot
 
     @staticmethod
     def _safe_startup_gate_summary(result: Mapping[str, Any] | None) -> dict[str, Any]:

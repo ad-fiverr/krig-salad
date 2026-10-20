@@ -10,11 +10,15 @@ on:
       - gpu-mining/telemetry/collector/g4a_salad_get.py
       - gpu-mining/telemetry/collector/fl4sh_early_autotune.py
       - gpu-mining/telemetry/collector/fl4shminer.py
+      - gpu-mining/telemetry/collector/guards.py
       - gpu-mining/telemetry/collector/gpu_identity.py
       - gpu-mining/telemetry/collector/models.py
       - gpu-mining/telemetry/collector/startup_admission.py
       - gpu-mining/telemetry/collector/startup_recovery_policy.py
       - gpu-mining/telemetry/collector/work.py
+      - gpu-mining/telemetry/g5_control_plane/__init__.py
+      - gpu-mining/telemetry/g5_control_plane/config.py
+      - gpu-mining/telemetry/g5_control_plane/startup_policy.py
       - gpu-mining/g4c-live/live_secret_boundary.py
       - .github/workflows/build-fl4shminer.yml
       - .github/fl4sh-publish-targets.json

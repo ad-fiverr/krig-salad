@@ -43,6 +43,7 @@ LOG_ALERT_MODULES = (
     "normalize.py",
     "startup_early_bridge.py",
     "startup_guard.py",
+    "startup_v2_attestation.py",
 )
 
 RUNTIME_INPUTS = (
@@ -62,11 +63,15 @@ WATCHER_INPUTS = tuple(
     "gpu-mining/telemetry/collector/fl4sh_early_autotune.py",
     "gpu-mining/telemetry/collector/fl4shminer.py",
     "gpu-mining/telemetry/collector/g4a_salad_get.py",
+    "gpu-mining/telemetry/collector/guards.py",
     "gpu-mining/telemetry/collector/gpu_identity.py",
     "gpu-mining/telemetry/collector/models.py",
     "gpu-mining/telemetry/collector/startup_admission.py",
     "gpu-mining/telemetry/collector/startup_recovery_policy.py",
     "gpu-mining/telemetry/collector/work.py",
+    "gpu-mining/telemetry/g5_control_plane/__init__.py",
+    "gpu-mining/telemetry/g5_control_plane/config.py",
+    "gpu-mining/telemetry/g5_control_plane/startup_policy.py",
     "gpu-mining/g4c-live/live_secret_boundary.py",
 )
 
@@ -80,6 +85,7 @@ ALLOWED_DIRECTORIES = frozenset(
         "gpu-mining/telemetry",
         "gpu-mining/telemetry/log_alerts",
         "gpu-mining/telemetry/collector",
+        "gpu-mining/telemetry/g5_control_plane",
         "gpu-mining/g4c-live",
     }
 )
@@ -91,11 +97,15 @@ WORKFLOW_TRIGGERS = frozenset(
         "gpu-mining/telemetry/collector/g4a_salad_get.py",
         "gpu-mining/telemetry/collector/fl4sh_early_autotune.py",
         "gpu-mining/telemetry/collector/fl4shminer.py",
+        "gpu-mining/telemetry/collector/guards.py",
         "gpu-mining/telemetry/collector/gpu_identity.py",
         "gpu-mining/telemetry/collector/models.py",
         "gpu-mining/telemetry/collector/startup_admission.py",
         "gpu-mining/telemetry/collector/startup_recovery_policy.py",
         "gpu-mining/telemetry/collector/work.py",
+        "gpu-mining/telemetry/g5_control_plane/__init__.py",
+        "gpu-mining/telemetry/g5_control_plane/config.py",
+        "gpu-mining/telemetry/g5_control_plane/startup_policy.py",
         "gpu-mining/g4c-live/live_secret_boundary.py",
         ".github/workflows/build-fl4shminer.yml",
         ".github/fl4sh-publish-targets.json",
@@ -248,6 +258,12 @@ def check_dockerfile_manifest(root: Path) -> None:
         fail(f"Dockerfile COPY manifest differs (missing={missing}, extra={extra})")
     if "ENV PYTHONPATH=/opt/fl4shminer/gpu-mining/telemetry" not in dockerfile:
         fail("image does not expose the repository-shaped watcher modules on PYTHONPATH")
+    stages = re.findall(r"(?ms)^FROM .*?(?=^FROM |\Z)", dockerfile)
+    if len(stages) != 2:
+        fail("Dockerfile must retain exactly the reviewed artifact and runtime stages")
+    crypto_pin = "python3-cryptography=3.4.8-1ubuntu2.4"
+    if crypto_pin in stages[0] or stages[1].count(crypto_pin) != 1:
+        fail("pinned Ed25519 runtime dependency must be installed only in the final image stage")
 
     ignore_path = root / "gpu-mining/runtime/fl4shminer/Dockerfile.dockerignore"
     lines = [
@@ -348,11 +364,15 @@ def check_workflow(root: Path) -> None:
         "gpu-mining/telemetry/collector/g4a_salad_get.py": True,
         "gpu-mining/telemetry/collector/fl4sh_early_autotune.py": True,
         "gpu-mining/telemetry/collector/fl4shminer.py": True,
+        "gpu-mining/telemetry/collector/guards.py": True,
         "gpu-mining/telemetry/collector/gpu_identity.py": True,
         "gpu-mining/telemetry/collector/models.py": True,
         "gpu-mining/telemetry/collector/startup_admission.py": True,
         "gpu-mining/telemetry/collector/startup_recovery_policy.py": True,
         "gpu-mining/telemetry/collector/work.py": True,
+        "gpu-mining/telemetry/g5_control_plane/__init__.py": True,
+        "gpu-mining/telemetry/g5_control_plane/config.py": True,
+        "gpu-mining/telemetry/g5_control_plane/startup_policy.py": True,
         "gpu-mining/telemetry/collector/startup_latency.py": False,
         "gpu-mining/g4c-live/live_secret_boundary.py": True,
         ".github/workflows/build-fl4shminer.yml": True,
@@ -420,13 +440,14 @@ def check_image_tree(root: Path) -> None:
         fail(f"installed image file inventory differs (missing={missing}, extra={extra})")
 
     telemetry = root / "gpu-mining/telemetry"
-    if {entry.name for entry in telemetry.iterdir()} != {"log_alerts", "collector"}:
+    if {entry.name for entry in telemetry.iterdir()} != {"log_alerts", "collector", "g5_control_plane"}:
         fail("image contains telemetry outside the reviewed watcher package")
     collector = telemetry / "collector"
     expected_collector = {
         "fl4sh_early_autotune.py",
         "fl4shminer.py",
         "g4a_salad_get.py",
+        "guards.py",
         "gpu_identity.py",
         "models.py",
         "startup_admission.py",
@@ -435,6 +456,9 @@ def check_image_tree(root: Path) -> None:
     }
     if {entry.name for entry in collector.iterdir()} != expected_collector:
         fail("image collector directory differs from the exact startup watcher import closure")
+    g5_control_plane = telemetry / "g5_control_plane"
+    if {entry.name for entry in g5_control_plane.iterdir()} != {"__init__.py", "config.py", "startup_policy.py"}:
+        fail("image G5 package differs from the exact read-only startup policy loader")
     g4c = root / "gpu-mining/g4c-live"
     if {entry.name for entry in g4c.iterdir()} != {"live_secret_boundary.py"}:
         fail("image G4C directory contains files beyond the approved secret boundary")
@@ -535,6 +559,17 @@ def check_imports_and_inert_startup(root: Path, *, image: bool) -> None:
     transport = importlib.import_module("log_alerts.live_transport")
     recovery_policy = importlib.import_module("collector.startup_recovery_policy")
     from collector.g4a_salad_get import normalize_instance_list_response
+
+    from g5_control_plane.startup_policy import load_startup_policy_snapshot
+
+    startup_snapshot = load_startup_policy_snapshot(None, environ={})
+    if not re.fullmatch(r"[a-f0-9]{64}", startup_snapshot.policy.policy_hash):
+        fail("read-only startup policy loader did not produce a valid policy fingerprint")
+    if not re.fullmatch(r"[a-f0-9]{64}", startup_snapshot.config_sha256):
+        fail("read-only startup policy loader did not produce a valid config fingerprint")
+    if "g5_control_plane.service" in sys.modules:
+        fail("read-only startup policy import loaded the G5 action/control service")
+    check_ed25519_runtime()
 
     if not callable(normalize_instance_list_response):
         fail("G4A instance response normalizer is unavailable")
@@ -692,11 +727,40 @@ def check_imports_and_inert_startup(root: Path, *, image: bool) -> None:
             fail("default-off watcher module CLI did not block before live access")
     print("CENTRAL_WATCHER_IMPORT_OK")
     print("STARTUP_RECOVERY_IMPORT_OK")
+    print("STARTUP_POLICY_READONLY_IMPORT_OK")
+    print("ED25519_VERIFY_AND_REJECT_OK")
     print(f"SECRET_BOUNDARY_PATH_OK path={boundary_path.as_posix()}")
     print("WATCHER_DEFAULT_OFF_OFFLINE_OK")
     if image:
         print("WATCHER_MODULE_CLI_DEFAULT_OFF_OK")
     print("PRODUCTIVE_READINESS_CONTRACT_OK")
+
+
+def check_ed25519_runtime() -> None:
+    """Exercise the packaged Ed25519 verifier against the RFC 8032 known vector."""
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        public_key = bytes.fromhex(
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+        )
+        signature = bytes.fromhex(
+            "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
+            "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+        )
+        verifier = Ed25519PublicKey.from_public_bytes(public_key)
+        verifier.verify(signature, b"")
+        altered = bytearray(signature)
+        altered[0] ^= 1
+        try:
+            verifier.verify(bytes(altered), b"")
+        except InvalidSignature:
+            return
+    except ImportError:
+        fail("pinned Ed25519 runtime dependency is unavailable to the watcher interpreter")
+    except Exception:
+        fail("Ed25519 known-vector verification failed")
+    fail("Ed25519 verifier accepted a tampered signature")
 
 
 def main() -> int:

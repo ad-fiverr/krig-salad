@@ -17,7 +17,7 @@ FROM --platform=linux/amd64 nvidia/cuda:12.8.2-runtime-ubuntu22.04@sha256:f442e4
 # The opt-in miner supervisor and central CLI need Python's standard library.
 # Keep the final stage free of pip, compilers, downloaders, and build tooling.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 \
+    && apt-get install -y --no-install-recommends python3 python3-cryptography=3.4.8-1ubuntu2.4 \
     && rm -rf /var/lib/apt/lists/*
 
 ARG IMAGE_REVISION=unknown
@@ -37,8 +37,10 @@ COPY gpu-mining/runtime/fl4shminer/fl4sh-release.lock gpu-mining/runtime/fl4shmi
 
 # Explicit Python-module allowlist. collector is intentionally a namespace
 # package here: do not copy collector/__init__.py or unrelated telemetry.
-COPY gpu-mining/telemetry/log_alerts/__init__.py gpu-mining/telemetry/log_alerts/central_telegram.py gpu-mining/telemetry/log_alerts/contract.py gpu-mining/telemetry/log_alerts/cuda_guard.py gpu-mining/telemetry/log_alerts/delivery.py gpu-mining/telemetry/log_alerts/engine.py gpu-mining/telemetry/log_alerts/fleet_targets.py gpu-mining/telemetry/log_alerts/fleet_watcher.py gpu-mining/telemetry/log_alerts/ledger.py gpu-mining/telemetry/log_alerts/list_instances_lookup.py gpu-mining/telemetry/log_alerts/live_adapter.py gpu-mining/telemetry/log_alerts/live_capability.py gpu-mining/telemetry/log_alerts/live_cli.py gpu-mining/telemetry/log_alerts/live_controller.py gpu-mining/telemetry/log_alerts/live_transport.py gpu-mining/telemetry/log_alerts/normalize.py gpu-mining/telemetry/log_alerts/startup_early_bridge.py gpu-mining/telemetry/log_alerts/startup_guard.py /opt/fl4shminer/gpu-mining/telemetry/log_alerts/
+COPY gpu-mining/telemetry/log_alerts/__init__.py gpu-mining/telemetry/log_alerts/central_telegram.py gpu-mining/telemetry/log_alerts/contract.py gpu-mining/telemetry/log_alerts/cuda_guard.py gpu-mining/telemetry/log_alerts/delivery.py gpu-mining/telemetry/log_alerts/engine.py gpu-mining/telemetry/log_alerts/fleet_targets.py gpu-mining/telemetry/log_alerts/fleet_watcher.py gpu-mining/telemetry/log_alerts/ledger.py gpu-mining/telemetry/log_alerts/list_instances_lookup.py gpu-mining/telemetry/log_alerts/live_adapter.py gpu-mining/telemetry/log_alerts/live_capability.py gpu-mining/telemetry/log_alerts/live_cli.py gpu-mining/telemetry/log_alerts/live_controller.py gpu-mining/telemetry/log_alerts/live_transport.py gpu-mining/telemetry/log_alerts/normalize.py gpu-mining/telemetry/log_alerts/startup_early_bridge.py gpu-mining/telemetry/log_alerts/startup_guard.py gpu-mining/telemetry/log_alerts/startup_v2_attestation.py /opt/fl4shminer/gpu-mining/telemetry/log_alerts/
 COPY gpu-mining/telemetry/collector/fl4sh_early_autotune.py gpu-mining/telemetry/collector/fl4shminer.py gpu-mining/telemetry/collector/g4a_salad_get.py gpu-mining/telemetry/collector/gpu_identity.py gpu-mining/telemetry/collector/models.py gpu-mining/telemetry/collector/startup_admission.py gpu-mining/telemetry/collector/startup_recovery_policy.py gpu-mining/telemetry/collector/work.py /opt/fl4shminer/gpu-mining/telemetry/collector/
+COPY gpu-mining/telemetry/collector/guards.py /opt/fl4shminer/gpu-mining/telemetry/collector/guards.py
+COPY gpu-mining/telemetry/g5_control_plane/__init__.py gpu-mining/telemetry/g5_control_plane/config.py gpu-mining/telemetry/g5_control_plane/startup_policy.py /opt/fl4shminer/gpu-mining/telemetry/g5_control_plane/
 COPY gpu-mining/g4c-live/live_secret_boundary.py /opt/fl4shminer/gpu-mining/g4c-live/live_secret_boundary.py
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 CMD ["/opt/fl4shminer/fl4sh-healthcheck.sh"]

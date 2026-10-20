@@ -93,4 +93,5 @@ class StartupAdmissionEngine:
             allow_synthetic_calibration_for_test=active.allow_synthetic_calibration_for_test,
             association_records=active.association_records,
             allow_synthetic_binding_evidence_for_test=active.allow_synthetic_binding_evidence_for_test,
+            allow_synthetic_provider_log_evidence_for_test=active.allow_synthetic_provider_log_evidence_for_test,
         )

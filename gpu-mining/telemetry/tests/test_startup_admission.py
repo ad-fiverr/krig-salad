@@ -340,6 +340,248 @@ class StartupAdmissionEngineTests(unittest.TestCase):
 
 
 class StartupEarlyBridgeTests(unittest.TestCase):
+    @staticmethod
+    def _provider_log_fixture(text: str, *, organization: str = "adrianfiverr"):
+        return normalize_log_entry({
+            "data_classification": DATA_CLASSIFICATION,
+            "log_id": "synthetic-startup-event",
+            "event_time_utc": "2026-10-18T11:59:58Z",
+            "resource": {
+                "type": "salad.container_group_instance",
+                "labels": {
+                    "organization_name": organization,
+                    "project_name": "miners",
+                    "container_group_name": "fl4shminer",
+                    "machine_id": SYNTHETIC_MACHINE,
+                    "instance_id": SYNTHETIC_INSTANCE,
+                },
+            },
+            "text_log": text,
+            "structured_message": None,
+        })
+
+    def test_future_event_time_is_clock_inconsistent_and_never_clamped_to_zero_age(self):
+        bridge = StartupEarlyBridge(monotonic=lambda: 10.0)
+        entry = self._provider_log_fixture(
+            "GPU=NVIDIA GeForce RTX 5080 Laptop GPU Pearl autotune hashrate = 119.0 TH/s",
+        )
+        events = bridge.process_entries(
+            [entry],
+            response_received_at_utc="2026-10-18T11:59:57Z",
+            watcher_ingested_at_utc="2026-10-18T11:59:57Z",
+        )
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event.state, "EARLY_UNKNOWN")
+        self.assertEqual(event.reason, "CLOCK_INCONSISTENT")
+        self.assertEqual(event.cause, StartupCause.UNKNOWN.value)
+        self.assertIsNone(event.event_age_at_ingestion_seconds)
+        self.assertEqual(event.recovery.disposition, "HOLD_FOR_VERIFIED_EVIDENCE")
+        self.assertFalse(event.actions_performed or event.request_submitted)
+
+    def test_provider_gpu_init_and_pearl_project_in_one_cycle_without_wait_or_action(self):
+        service = G5ControlPlaneService(G5Config())
+        try:
+            snapshot = service.startup_policy_snapshot()
+            snapshot = replace(snapshot, loaded_at_utc="2026-10-18T11:59:30Z")
+            bridge = StartupEarlyBridge(policy_snapshot=snapshot)
+            context = EarlyEvaluationContext(
+                now_utc=NOW,
+                allow_synthetic_provider_log_evidence_for_test=True,
+            )
+            init = self._provider_log_fixture(
+                "Device [1] NVIDIA GeForce RTX 5080 Laptop GPU: Initialized",
+            )
+            pearl = self._provider_log_fixture(
+                "GPU=NVIDIA GeForce RTX 5080 Laptop GPU Pearl autotune hashrate = 119.0 TH/s",
+            )
+            response_at = "2026-10-18T11:59:59.000000Z"
+            events = bridge.process_entries(
+                [pearl, init],
+                context=context,
+                response_received_at_utc=response_at,
+                watcher_ingested_at_utc="2026-10-18T12:00:00Z",
+            )
+            self.assertEqual([event.state for event in events], ["GPU_DETECTED", "EARLY_UNKNOWN"])
+            projection = events[1].to_dict()
+            self.assertEqual(projection["mode"], "STARTUP_FAST_PATH")
+            self.assertEqual(projection["decision_signal"], "PEARL_AUTOTUNE")
+            self.assertEqual(projection["gpu_key"], "RTX_5080_LAPTOP")
+            self.assertEqual(projection["gpu_autotune_ths"], 119.0)
+            self.assertEqual(projection["floor_ths"], 120.0)
+            self.assertEqual(projection["reason"], "BINDING_UNVERIFIED")
+            self.assertEqual(projection["provider_response_received_at_utc"], response_at)
+            self.assertIsNone(projection["polling_latency_seconds"])
+            self.assertEqual(projection["polling_latency_status"], "UNKNOWN_PROVIDER_AVAILABILITY_TIME")
+            self.assertFalse(projection["actions_performed"])
+            self.assertFalse(projection["request_submitted"])
+            serialized = json.dumps([event.to_dict() for event in events])
+            for private_value in (SYNTHETIC_MACHINE, SYNTHETIC_INSTANCE, "synthetic-startup-event", "Pearl autotune"):
+                self.assertNotIn(private_value, serialized)
+            self.assertEqual(bridge.process_entries(
+                [init, pearl],
+                context=context,
+                response_received_at_utc=response_at,
+                watcher_ingested_at_utc="2026-10-18T12:00:00Z",
+            ), ())
+        finally:
+            service.close()
+
+    def test_unconfigured_4070_ti_and_policy_scope_mismatch_do_not_receive_a_floor(self):
+        service = G5ControlPlaneService(G5Config())
+        try:
+            snapshot = replace(
+                service.startup_policy_snapshot(),
+                loaded_at_utc="2026-10-18T11:59:30Z",
+            )
+            bridge = StartupEarlyBridge(policy_snapshot=snapshot)
+            context = EarlyEvaluationContext(
+                now_utc=NOW,
+                allow_synthetic_provider_log_evidence_for_test=True,
+            )
+            events = bridge.process_entries([
+                self._provider_log_fixture(
+                    "Device [1] NVIDIA GeForce RTX 4070 Ti Laptop GPU: Initialized",
+                ),
+                self._provider_log_fixture(
+                    "GPU=NVIDIA GeForce RTX 4070 Ti Laptop GPU Pearl autotune hashrate = 143.41 TH/s",
+                ),
+            ], context=context)
+            pearl = events[-1].to_dict()
+            self.assertEqual(pearl["state"], "EARLY_UNKNOWN")
+            self.assertEqual(pearl["reason"], "FLOOR_UNCONFIGURED")
+            self.assertEqual(pearl["gpu_key"], "RTX_4070_TI_LAPTOP")
+            self.assertIsNone(pearl["floor_ths"])
+            self.assertFalse(pearl["actions_performed"] or pearl["request_submitted"])
+
+            scoped_out = StartupEarlyBridge(policy_snapshot=snapshot).process_entries([
+                self._provider_log_fixture(
+                    "Device [1] NVIDIA GeForce RTX 5080 Laptop GPU: Initialized",
+                    organization="other-org",
+                ),
+                self._provider_log_fixture(
+                    "GPU=NVIDIA GeForce RTX 5080 Laptop GPU Pearl autotune hashrate = 119.0 TH/s",
+                    organization="other-org",
+                ),
+            ], context=context)
+            self.assertEqual(scoped_out[-1].state, "EARLY_UNKNOWN")
+            self.assertIsNone(scoped_out[-1].floor_ths)
+            self.assertEqual(scoped_out[-1].reason, "POLICY_SCOPE_UNVERIFIED")
+
+            scoped_context = EarlyEvaluationContext(
+                policy=snapshot.policy,
+                now_utc=NOW,
+                allow_synthetic_provider_log_evidence_for_test=True,
+            )
+            scoped_out_with_context_policy = StartupEarlyBridge(
+                policy_snapshot=snapshot,
+            ).process_entries([
+                self._provider_log_fixture(
+                    "Device [1] NVIDIA GeForce RTX 5080 Laptop GPU: Initialized",
+                    organization="other-org",
+                ),
+                self._provider_log_fixture(
+                    "GPU=NVIDIA GeForce RTX 5080 Laptop GPU Pearl autotune hashrate = 100.0 TH/s",
+                    organization="other-org",
+                ),
+            ], context=scoped_context)
+            self.assertEqual(scoped_out_with_context_policy[-1].state, "EARLY_UNKNOWN")
+            self.assertEqual(scoped_out_with_context_policy[-1].reason, "POLICY_SCOPE_UNVERIFIED")
+            self.assertIsNone(scoped_out_with_context_policy[-1].floor_ths)
+        finally:
+            service.close()
+
+    def test_gpu_identity_conflict_blocks_startup_floor_projection(self):
+        service = G5ControlPlaneService(G5Config())
+        try:
+            snapshot = replace(service.startup_policy_snapshot(), loaded_at_utc="2026-10-18T11:59:30Z")
+            bridge = StartupEarlyBridge(policy_snapshot=snapshot)
+            context = EarlyEvaluationContext(
+                now_utc=NOW,
+                allow_synthetic_provider_log_evidence_for_test=True,
+            )
+            events = bridge.process_entries([
+                self._provider_log_fixture(
+                    "Device [1] NVIDIA GeForce RTX 5080 Laptop GPU: Initialized",
+                ),
+                self._provider_log_fixture(
+                    "GPU=NVIDIA GeForce RTX 5090 Laptop GPU Pearl autotune hashrate = 130.0 TH/s",
+                ),
+            ], context=context)
+            pearl = events[-1].to_dict()
+            self.assertEqual(pearl["state"], "EARLY_UNKNOWN")
+            self.assertEqual(pearl["reason"], "GPU_IDENTITY_CONFLICT")
+            self.assertIsNone(pearl["floor_ths"])
+            self.assertFalse(pearl["actions_performed"] or pearl["request_submitted"])
+        finally:
+            service.close()
+
+    def test_gpu_identity_conflict_cannot_be_cleared_by_a_later_matching_detection(self):
+        service = G5ControlPlaneService(G5Config())
+        try:
+            snapshot = replace(service.startup_policy_snapshot(), loaded_at_utc="2026-10-18T11:59:30Z")
+            bridge = StartupEarlyBridge(policy_snapshot=snapshot)
+            context = EarlyEvaluationContext(
+                now_utc=NOW,
+                allow_synthetic_provider_log_evidence_for_test=True,
+            )
+            first = self._provider_log_fixture(
+                "Device [1] NVIDIA GeForce RTX 5080 Laptop GPU: Initialized",
+            )
+            conflict = replace(
+                self._provider_log_fixture(
+                    "Device [1] NVIDIA GeForce RTX 5090 Laptop GPU: Initialized",
+                ),
+                event_time_utc="2026-10-18T11:59:59Z",
+            )
+            later_matching = replace(
+                self._provider_log_fixture(
+                    "Device [1] NVIDIA GeForce RTX 5080 Laptop GPU: Initialized",
+                ),
+                event_time_utc="2026-10-18T12:00:00Z",
+            )
+            pearl = replace(
+                self._provider_log_fixture(
+                    "GPU=NVIDIA GeForce RTX 5080 Laptop GPU Pearl autotune hashrate = 119.0 TH/s",
+                ),
+                event_time_utc="2026-10-18T12:00:01Z",
+            )
+            events = bridge.process_entries([first, conflict, later_matching, pearl], context=context)
+            self.assertEqual([event.state for event in events], [
+                "GPU_DETECTED", "GPU_IDENTITY_CONFLICT", "GPU_IDENTITY_CONFLICT", "EARLY_UNKNOWN",
+            ])
+            self.assertEqual(events[-1].reason, "GPU_IDENTITY_CONFLICT")
+            self.assertIsNone(events[-1].floor_ths)
+            self.assertFalse(events[-1].actions_performed or events[-1].request_submitted)
+        finally:
+            service.close()
+
+    def test_list_instances_enrichment_is_not_silently_recast_as_log_label_evidence(self):
+        service = G5ControlPlaneService(G5Config())
+        try:
+            snapshot = replace(service.startup_policy_snapshot(), loaded_at_utc="2026-10-18T11:59:30Z")
+            bridge = StartupEarlyBridge(policy_snapshot=snapshot)
+            context = EarlyEvaluationContext(
+                now_utc=NOW,
+                allow_synthetic_provider_log_evidence_for_test=True,
+            )
+            init = self._provider_log_fixture(
+                "Device [1] NVIDIA GeForce RTX 5080 Laptop GPU: Initialized",
+            )
+            pearl = self._provider_log_fixture(
+                "GPU=NVIDIA GeForce RTX 5080 Laptop GPU Pearl autotune hashrate = 119.0 TH/s",
+            )
+            init = replace(init, identity=replace(init.identity, source="list_instances"))
+            pearl = replace(pearl, identity=replace(pearl.identity, source="list_instances"))
+            events = bridge.process_entries([init, pearl], context=context)
+            self.assertEqual(events[0].state, "GPU_IDENTITY_UNKNOWN")
+            self.assertEqual(events[-1].state, "EARLY_UNKNOWN")
+            self.assertEqual(events[-1].reason, "GPU_IDENTITY_UNVERIFIED")
+            self.assertIsNone(events[-1].floor_ths)
+            self.assertFalse(events[-1].actions_performed or events[-1].request_submitted)
+        finally:
+            service.close()
+
     def test_4070_ti_pearl_estimate_is_recognized_but_unverified_and_unknown(self):
         raw = "GPU=NVIDIA GeForce RTX 4070 Ti Laptop GPU Pearl autotune hashrate = 143.41 TH/s"
         entry = synthetic_log(raw)

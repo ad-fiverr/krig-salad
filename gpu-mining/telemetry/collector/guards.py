@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import math
 import statistics
-from dataclasses import dataclass
+import hashlib
+import json
+from dataclasses import asdict, dataclass
 from typing import Any, Iterable, Mapping
 
 from .gpu_identity import normalize_gpu_identity
@@ -33,6 +35,12 @@ class GuardResult:
 
     def to_dict(self) -> dict[str, Any]:
         return {"decision": self.decision, "reason": self.reason, "details": dict(self.details)}
+
+
+def hash_guard_policy(policy: HashGuardPolicy) -> str:
+    """Return the canonical policy fingerprint shared by continuous and startup paths."""
+    encoded = json.dumps(asdict(policy), sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _finite_number(value: Any) -> float | None:

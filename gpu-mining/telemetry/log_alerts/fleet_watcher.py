@@ -11,6 +11,8 @@ import threading
 import time
 from typing import Any, Callable, Iterable, Mapping
 
+from collector.fl4sh_early_autotune import StartupPolicySnapshot
+
 from .central_telegram import CentralTelegramSender
 from .contract import LiveLogQueryPolicy, canonical_utc
 from .delivery import DeliveryCoordinator
@@ -21,6 +23,7 @@ from .live_adapter import QUERY_FAILURE_CODES, LiveAdapterError, LiveQueryLimits
 from .live_capability import LiveRuntimeCapability
 from .live_transport import LiveSaladReadTransport, LiveTransportBlocked
 from .list_instances_lookup import ListInstancesLookup
+from .startup_v2_attestation import StartupV2AttestationResolver
 
 
 MIN_POLL_SECONDS = 15
@@ -49,6 +52,7 @@ class OrganizationCycleResult:
     early_signal_count: int = 0
     early_unknown_count: int = 0
     early_under_floor_count: int = 0
+    startup_events: tuple[Mapping[str, Any], ...] = ()
 
 
 class CentralFleetWatcher:
@@ -68,6 +72,8 @@ class CentralFleetWatcher:
         ledger_factory: Callable[[str | Path], SQLiteAlertLedger] = SQLiteAlertLedger,
         clock_utc: Callable[[], str] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        startup_policy_snapshot: StartupPolicySnapshot | None = None,
+        startup_v2_attestation_resolver: StartupV2AttestationResolver | None = None,
     ) -> None:
         self.targets = validate_targets(targets)
         self.by_organization = targets_by_organization(self.targets)
@@ -85,6 +91,13 @@ class CentralFleetWatcher:
             raise TypeError("one centralized Telegram sender is required")
         if not callable(ledger_factory) or not callable(monotonic):
             raise TypeError("watcher support functions are invalid")
+        if startup_policy_snapshot is not None and type(startup_policy_snapshot) is not StartupPolicySnapshot:
+            raise TypeError("startup policy must be the exact read-only G5 snapshot")
+        if (
+            startup_v2_attestation_resolver is not None
+            and type(startup_v2_attestation_resolver) is not StartupV2AttestationResolver
+        ):
+            raise TypeError("startup binding must use the exact V2 attestation resolver")
         self.query = query.strip()
         state_path = Path(state_dir).expanduser()
         if state_path.is_symlink():
@@ -98,12 +111,15 @@ class CentralFleetWatcher:
         self.ledger_factory = ledger_factory
         self.clock_utc = clock_utc or (lambda: canonical_utc(datetime.now(timezone.utc)))
         self.monotonic = monotonic
+        self.startup_policy_snapshot = startup_policy_snapshot
+        self.startup_v2_attestation_resolver = startup_v2_attestation_resolver
         self._ledgers: dict[str, SQLiteAlertLedger] = {}
         # Keep the per-organization transport and scoped List Instances cache
         # for the lifetime of the watcher. Recreating the lookup each cycle
         # would silently disable its bounded TTL cache.
         self._transports: dict[str, LiveSaladReadTransport] = {}
         self._lookups: dict[str, ListInstancesLookup] = {}
+        self._startup_bridges: dict[str, Any] = {}
         self._closed = False
 
     def __repr__(self) -> str:
@@ -137,6 +153,12 @@ class CentralFleetWatcher:
                 raise RuntimeError("fixed organization transport unavailable")
             self._transports[organization] = transport
             offline = transport._offline_exchange is not None
+            if (
+                self.startup_v2_attestation_resolver is not None
+                and self.startup_v2_attestation_resolver.offline_test_only
+                and not offline
+            ):
+                raise RuntimeError("synthetic startup attestation requires the offline transport")
             lookup = self._lookups.get(organization)
             if lookup is None:
                 lookup = ListInstancesLookup(
@@ -151,6 +173,15 @@ class CentralFleetWatcher:
             # Saturated pages are subdivided by the existing bounded adapter.
             # The default cap (64) permits safe time slicing without retries.
             limits = LiveQueryLimits()
+            startup_bridge = self._startup_bridges.get(organization)
+            if startup_bridge is None:
+                from .startup_early_bridge import StartupEarlyBridge
+                startup_bridge = StartupEarlyBridge(
+                    policy_snapshot=self.startup_policy_snapshot,
+                    startup_v2_attestation_resolver=self.startup_v2_attestation_resolver,
+                    monotonic=self.monotonic,
+                )
+                self._startup_bridges[organization] = startup_bridge
             enricher = LogAlertEnricher(
                 approved_organization=organization,
                 transport=transport,
@@ -159,6 +190,8 @@ class CentralFleetWatcher:
                 secret_provider=self.secret_provider,
                 allowed_projects=projects,
                 identity_resolver=lookup.resolve_entry,
+                startup_early_bridge=startup_bridge,
+                monotonic=self.monotonic,
             )
             cycle = enricher.run_once(
                 end_time_utc=end_time_utc,
@@ -203,6 +236,7 @@ class CentralFleetWatcher:
                 early_signal_count=len(cycle.early_admission_events),
                 early_unknown_count=sum(item.get("state") == "EARLY_UNKNOWN" for item in cycle.early_admission_events),
                 early_under_floor_count=sum(item.get("state") == "EARLY_UNDER_FLOOR" for item in cycle.early_admission_events),
+                startup_events=cycle.early_admission_events,
             )
         except Exception as exc:
             status = _safe_failure_state(exc)
@@ -281,6 +315,7 @@ class CentralFleetWatcher:
             ledger.close()
         self._ledgers.clear()
         self._lookups.clear()
+        self._startup_bridges.clear()
         self._transports.clear()
 
     def __enter__(self) -> "CentralFleetWatcher":

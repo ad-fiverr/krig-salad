@@ -106,6 +106,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ledger-path", default="salad-log-alerts.sqlite3")
     parser.add_argument("--state-dir", default="salad-alert-state")
     parser.add_argument("--poll-seconds", type=int, default=DEFAULT_POLL_SECONDS)
+    parser.add_argument(
+        "--startup-policy-config",
+        help="optional local G5 JSON config for read-only Pearl startup floor projections",
+    )
     return parser
 
 
@@ -163,6 +167,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         ):
             raise ValueError("query is invalid")
         targets = _watch_targets(args) if args.watch_live_alerts else None
+        if args.startup_policy_config and not args.watch_live_alerts:
+            raise ValueError("startup policy config is available only in watcher mode")
         if args.watch_live_alerts and not MIN_POLL_SECONDS <= args.poll_seconds <= MAX_POLL_SECONDS:
             raise ValueError("poll interval is outside the allowed range")
         if not args.watch_live_alerts:
@@ -193,6 +199,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.watch_live_alerts:
             watcher_lock_fd = _acquire_watcher_lock(args.state_dir)
+        startup_policy_snapshot = None
+        if args.watch_live_alerts and args.startup_policy_config:
+            from g5_control_plane.startup_policy import load_startup_policy_snapshot
+            startup_policy_snapshot = load_startup_policy_snapshot(args.startup_policy_config)
         secret_provider = _load_interactive_salad_provider()
         InteractiveSecretProvider, _, _ = secret_boundary_types()
         if type(secret_provider) is not InteractiveSecretProvider:
@@ -212,6 +222,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sender=sender,
                 capability=capability,
                 poll_seconds=args.poll_seconds,
+                startup_policy_snapshot=startup_policy_snapshot,
             ) as watcher:
                 _emit({"status": "WATCHING", "organizations": len(watcher.by_organization), "poll_seconds": args.poll_seconds})
                 def emit_cycle(results):
