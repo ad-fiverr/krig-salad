@@ -148,6 +148,18 @@ class ActionLedger:
                 FOREIGN KEY(action_key) REFERENCES action_ledger(action_key)
             )"""
         )
+        # EARLY startup reallocation has a stricter idempotency boundary than
+        # the historical steady-state action key: one provider assignment
+        # generation can consume at most one dispatch reservation, including
+        # after restart or terminal reconciliation.
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS early_generation_dispatch_locks (
+                generation_scope_sha256 TEXT PRIMARY KEY,
+                action_key TEXT NOT NULL UNIQUE,
+                created_at_utc TEXT NOT NULL,
+                FOREIGN KEY(action_key) REFERENCES action_ledger(action_key)
+            )"""
+        )
         # SCRUM-101 simulation admissions are deliberately isolated from the
         # provider-action state machine above. No simulation row can be
         # transitioned into RESERVED, SEND_STARTED, or a provider receipt.
@@ -417,6 +429,139 @@ class ActionLedger:
                 (action_key, timestamp, timestamp, encoded, _json(receipt)),
             )
             self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        return self.get(action_key) | {"inserted": True}  # type: ignore[operator]
+
+    @_serialized
+    def reserve_live_early(
+        self,
+        action_key: str,
+        action: str,
+        target: Mapping[str, Any],
+        assignment_generation: str,
+        at_utc: str,
+    ) -> dict[str, Any]:
+        """Atomically reserve the only EARLY dispatch for one assignment generation.
+
+        The lock survives all state transitions. A corrected/restarted caller
+        cannot issue another POST for a generation that already reserved an
+        EARLY action. A different, verified generation has its own lock key.
+        """
+        if action != "REALLOCATE_INSTANCE":
+            raise ValueError("EARLY live action must be REALLOCATE_INSTANCE")
+        if not isinstance(target, Mapping) or not isinstance(assignment_generation, str) or not assignment_generation.strip():
+            raise ValueError("EARLY target and assignment generation are required")
+        target_copy = dict(target)
+        if target_copy.get("assignment_generation") != assignment_generation:
+            raise ValueError("EARLY target generation does not match the reservation")
+        expected_key = self.early_live_key_for(action=action, target=target_copy)
+        if action_key != expected_key:
+            raise ValueError("EARLY action key does not match the exact target generation")
+        timestamp = canonical_utc(at_utc)
+        generation_scope = self._early_generation_scope_sha256(target_copy, assignment_generation)
+        payload = {
+            "action": action,
+            "target": target_copy,
+            "dispatch_kind": "EARLY",
+            "assignment_generation": assignment_generation,
+            "actions_performed": False,
+        }
+        _reject_secrets(payload)
+        encoded = _json(payload)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT * FROM action_ledger WHERE action_key=?", (action_key,),
+            ).fetchone()
+            if row is not None:
+                if row["recommendation_json"] != encoded:
+                    self.connection.execute("COMMIT")
+                    return {
+                        "action_key": action_key,
+                        "state": "BLOCKED_EARLY_GENERATION_ALREADY_DISPATCHED",
+                        "inserted": False,
+                        "blocker": "EARLY_GENERATION_ALREADY_DISPATCHED",
+                    }
+                self.connection.execute("COMMIT")
+                return self.get(action_key) | {"inserted": False, "blocker": "EARLY_GENERATION_ALREADY_DISPATCHED"}  # type: ignore[operator]
+            lock = self.connection.execute(
+                "SELECT action_key FROM early_generation_dispatch_locks WHERE generation_scope_sha256=?",
+                (generation_scope,),
+            ).fetchone()
+            if lock is not None:
+                self.connection.execute("COMMIT")
+                return {
+                    "action_key": action_key,
+                    "state": "BLOCKED_EARLY_GENERATION_ALREADY_DISPATCHED",
+                    "inserted": False,
+                    "blocker": "EARLY_GENERATION_ALREADY_DISPATCHED",
+                }
+            # Earlier SCRUM-175 iterations included machine_id in the lock
+            # hash. Recover their durable lock meaning from the sealed ledger
+            # recommendation so changing physical hosts cannot reopen the same
+            # assignment generation after upgrade.
+            legacy_locks = self.connection.execute(
+                "SELECT a.recommendation_json FROM early_generation_dispatch_locks AS l "
+                "JOIN action_ledger AS a ON a.action_key=l.action_key"
+            ).fetchall()
+            for legacy_lock in legacy_locks:
+                try:
+                    previous = json.loads(legacy_lock["recommendation_json"])
+                    previous_target = previous.get("target") if isinstance(previous, dict) else None
+                    previous_generation = previous.get("assignment_generation") if isinstance(previous, dict) else None
+                    if not isinstance(previous_target, Mapping) or not isinstance(previous_generation, str):
+                        raise ValueError("legacy EARLY lock recommendation is invalid")
+                    previous_scope = self._early_generation_scope_sha256(previous_target, previous_generation)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    self.connection.execute("COMMIT")
+                    return {
+                        "action_key": action_key,
+                        "state": "BLOCKED_EARLY_GENERATION_LOCK_INTEGRITY",
+                        "inserted": False,
+                        "blocker": "EARLY_GENERATION_LOCK_INTEGRITY_INVALID",
+                    }
+                if previous_scope == generation_scope:
+                    self.connection.execute("COMMIT")
+                    return {
+                        "action_key": action_key,
+                        "state": "BLOCKED_EARLY_GENERATION_ALREADY_DISPATCHED",
+                        "inserted": False,
+                        "blocker": "EARLY_GENERATION_ALREADY_DISPATCHED",
+                    }
+            active_rows = self.connection.execute(
+                "SELECT recommendation_json FROM action_ledger WHERE state IN "
+                "('RESERVED', 'SEND_STARTED', 'ACCEPTED_PENDING', 'RECONCILIATION_REQUIRED')"
+            ).fetchall()
+            for active_row in active_rows:
+                active = json.loads(active_row["recommendation_json"])
+                if active.get("action") in {"START_GROUP", "STOP_GROUP", "REALLOCATE_INSTANCE"}:
+                    self.connection.execute("COMMIT")
+                    return {
+                        "action_key": action_key,
+                        "state": "BLOCKED_ACTIVE_ACTION",
+                        "inserted": False,
+                        "blocker": "ANOTHER_PROVIDER_ACTION_REQUIRES_RECONCILIATION",
+                    }
+            receipt = {"actions_performed": False, "mode": "live_early_action_reserved_not_sent"}
+            self.connection.execute(
+                "INSERT INTO action_ledger VALUES (?, 'RESERVED', ?, ?, ?, ?)",
+                (action_key, timestamp, timestamp, encoded, _json(receipt)),
+            )
+            self.connection.execute(
+                "INSERT INTO early_generation_dispatch_locks VALUES (?, ?, ?)",
+                (generation_scope, action_key, timestamp),
+            )
+            self.connection.execute("COMMIT")
+        except sqlite3.IntegrityError:
+            self.connection.execute("ROLLBACK")
+            return {
+                "action_key": action_key,
+                "state": "BLOCKED_EARLY_GENERATION_ALREADY_DISPATCHED",
+                "inserted": False,
+                "blocker": "EARLY_GENERATION_ALREADY_DISPATCHED",
+            }
         except Exception:
             self.connection.execute("ROLLBACK")
             raise
@@ -1057,3 +1202,38 @@ class ActionLedger:
             raise ValueError("container group is required for a live action key")
         digest = hashlib.sha256("\0".join(values).encode("utf-8")).hexdigest()
         return f"salad_{action.casefold()}_{digest}"
+
+    @staticmethod
+    def _early_generation_scope_sha256(target: Mapping[str, Any], assignment_generation: str) -> str:
+        # The one-dispatch lock belongs to the provider assignment generation,
+        # not to the physical machine currently hosting it. Machine, instance,
+        # or deterioration changes must not create another dispatch slot for
+        # the same assignment generation.
+        fields = ("organization", "project", "container_group", "assignment_id")
+        values: list[str] = []
+        for name in fields:
+            value = target.get(name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"EARLY generation scope field {name} is invalid")
+            values.append(value.strip())
+        if not isinstance(assignment_generation, str) or not assignment_generation.strip():
+            raise ValueError("EARLY assignment generation is invalid")
+        values.append(assignment_generation.strip())
+        return hashlib.sha256("\0".join(values).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def early_live_key_for(*, action: str, target: Mapping[str, Any]) -> str:
+        if action != "REALLOCATE_INSTANCE" or not isinstance(target, Mapping):
+            raise ValueError("EARLY live key is restricted to exact instance reallocation")
+        fields = (
+            "organization", "project", "container_group", "machine_id", "instance_id",
+            "assignment_id", "assignment_generation", "deterioration_id",
+        )
+        values = [action]
+        for name in fields:
+            value = target.get(name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"EARLY live key component {name} is invalid")
+            values.append(value.strip())
+        digest = hashlib.sha256("\0".join(values).encode("utf-8")).hexdigest()
+        return f"early_reallocation_{digest}"

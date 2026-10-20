@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import math
+import re
 import secrets
 from typing import Any
 import uuid
@@ -104,10 +105,14 @@ class ActionCapabilityVerifier:
             "container_group", "action", "path", "issued_at_epoch",
             "expires_at_epoch", "nonce", "max_requests",
         }
+        target_generation = target.get("assignment_generation")
+        generation_bound = target_generation is not None
+        if generation_bound:
+            expected.add("assignment_generation")
         valid = (
             isinstance(claims, dict)
             and set(claims) == expected
-            and claims.get("schema_version") == 1
+            and claims.get("schema_version") == (2 if generation_bound else 1)
             and claims.get("audience") == "salad-g5-control-plane"
             and claims.get("host") == "api.salad.com"
             and claims.get("organization") == APPROVED_ORGANIZATION
@@ -115,6 +120,14 @@ class ActionCapabilityVerifier:
             and claims.get("container_group") == target.get("container_group")
             and claims.get("action") == action.value
             and claims.get("path") == route
+            and (
+                not generation_bound
+                or (
+                    isinstance(target_generation, str)
+                    and bool(target_generation.strip())
+                    and claims.get("assignment_generation") == target_generation
+                )
+            )
             and claims.get("max_requests") == 1
             and nonce == claims.get("nonce")
             and issued <= float(now_epoch) < expires
@@ -438,6 +451,210 @@ class DecisionDossierAuthority:
         signature = hmac.digest(self.__key, payload, "sha256")
         return VerifiedActionDossier(payload, signature)
 
+    def issue_early_reallocation(
+        self,
+        *,
+        action: SaladAction,
+        target: Mapping[str, Any],
+        decision: Mapping[str, Any],
+        live_admission: Mapping[str, Any],
+        source_evidence: Mapping[str, Any],
+        policy_evidence: Mapping[str, Any],
+        generation_evidence: Mapping[str, Any],
+        binding_evidence: Mapping[str, Any],
+        provider_revalidation: Mapping[str, Any],
+        budget_evidence: Mapping[str, Any],
+        allocation_history: Mapping[str, Any],
+        proof_binding: Mapping[str, Any],
+        reservation_snapshot: list[Mapping[str, Any]],
+        hard_budget_usd: Any,
+        now_epoch: float,
+    ) -> VerifiedActionDossier:
+        """Seal one short-lived EARLY admission without inventing two hash windows."""
+        if action is not SaladAction.REALLOCATE_INSTANCE:
+            raise DossierRejected("EARLY dossier is restricted to instance reallocation")
+        verifier = self.__evidence_verifier
+        early_methods = (
+            "verify_early_decision", "verify_early_calibration", "verify_early_generation",
+            "verify_early_revalidation",
+        )
+        if verifier is None or any(not callable(getattr(verifier, name, None)) for name in early_methods):
+            raise DossierRejected("INDEPENDENT_EARLY_ACTION_EVIDENCE_VERIFIER_NOT_CONFIGURED")
+        mappings = (
+            target, decision, live_admission, source_evidence, policy_evidence,
+            generation_evidence, binding_evidence, provider_revalidation,
+            budget_evidence, allocation_history, proof_binding,
+        )
+        if any(not isinstance(value, Mapping) for value in mappings) or not isinstance(reservation_snapshot, list):
+            raise DossierRejected("EARLY action evidence is incomplete")
+        try:
+            from .action_ledger import _reject_secrets
+            for value in (*mappings, reservation_snapshot):
+                _reject_secrets(value)
+        except ValueError:
+            raise DossierRejected("SECRET_LIKE_FIELDS_REJECTED") from None
+
+        try:
+            verified = (
+                verifier.verify_early_decision(decision) is True
+                and verifier.verify_early_calibration(decision) is True
+                and verifier.verify_early_generation(generation_evidence) is True
+                and verifier.verify_early_revalidation(proof_binding) is True
+                and verifier.verify_binding(binding_evidence) is True
+                and verifier.verify_provider(provider_revalidation) is True
+                and verifier.verify_telemetry(source_evidence) is True
+                and verifier.verify_budget(budget_evidence) is True
+                and verifier.verify_allocation_history(allocation_history) is True
+            )
+        except Exception:
+            verified = False
+        if not verified:
+            raise DossierRejected("independent EARLY action evidence verification failed")
+
+        now = _epoch(now_epoch)
+        hard_cap = _money(hard_budget_usd)
+        if now is None or hard_cap is None or hard_cap <= 0 or hard_cap > HARD_BUDGET_CAP_USD:
+            raise DossierRejected("BUDGET_UNVERIFIABLE")
+        required_target = (
+            "organization", "project", "container_group", "machine_id", "instance_id",
+            "assignment_id", "assignment_generation", "deterioration_id",
+        )
+        if (
+            target.get("organization") != APPROVED_ORGANIZATION
+            or target.get("project") != APPROVED_PROJECT
+            or target.get("container_group") not in APPROVED_GROUPS
+            or any(not isinstance(target.get(name), str) or not target[name].strip() for name in required_target)
+            or action is not SaladAction.REALLOCATE_INSTANCE
+        ):
+            raise DossierRejected("EARLY target is outside the fixed verified scope")
+        if (
+            decision.get("state") != "EARLY_UNDER_FLOOR"
+            or decision.get("reason") != "UPPER_BOUND_BELOW_THRESHOLD"
+            or decision.get("actions_performed") is not False
+            or decision.get("action_eligible") is not False
+            or decision.get("calibration_status") != "APPLIED_APPROVED_MEASURED_PAIRS"
+            or decision.get("assignment_id") != target.get("assignment_id")
+            or decision.get("assignment_generation") != target.get("assignment_generation")
+            or decision.get("policy_hash") != policy_evidence.get("policy_hash")
+            or source_evidence.get("source") != "FL4SHMINER_AUTOTUNE_LOG"
+            or source_evidence.get("source_reference_sha256") != decision.get("source_reference_sha256")
+            or policy_evidence.get("policy_hash") != decision.get("policy_hash")
+            or policy_evidence.get("gpu_floors_ths", {}).get(decision.get("gpu_key")) != decision.get("floor_ths")
+            or generation_evidence.get("status") != "CURRENT"
+            or generation_evidence.get("assignment_id") != target.get("assignment_id")
+            or generation_evidence.get("assignment_generation") != target.get("assignment_generation")
+        ):
+            raise DossierRejected("EARLY decision, calibration, policy, or generation mismatch")
+
+        provider = binding_evidence.get("provider") if isinstance(binding_evidence.get("provider"), Mapping) else {}
+        assignment = binding_evidence.get("assignment") if isinstance(binding_evidence.get("assignment"), Mapping) else {}
+        expected_identity = {
+            "organization_id": APPROVED_ORGANIZATION,
+            "project_id": APPROVED_PROJECT,
+            "container_group_id": target.get("container_group"),
+            "instance_id": target.get("instance_id"),
+            "machine_id": target.get("machine_id"),
+            "assignment_id": target.get("assignment_id"),
+            "assignment_generation": target.get("assignment_generation"),
+        }
+        if any(provider.get(key) != value or assignment.get(key) != value for key, value in expected_identity.items()):
+            raise DossierRejected("EARLY binding identity does not match the exact target generation")
+        if (
+            provider_revalidation.get("organization_id") != APPROVED_ORGANIZATION
+            or provider_revalidation.get("project_id") != APPROVED_PROJECT
+            or provider_revalidation.get("container_group_id") != target.get("container_group")
+            or provider_revalidation.get("instance_id") != target.get("instance_id")
+            or provider_revalidation.get("assignment_id") != target.get("assignment_id")
+            or provider_revalidation.get("assignment_generation") != target.get("assignment_generation")
+            or provider_revalidation.get("machine_id") != provider.get("machine_id")
+        ):
+            raise DossierRejected("EARLY provider revalidation identity mismatch")
+        if (
+            live_admission.get("status") != "LIVE_ADMISSION_ELIGIBLE"
+            or live_admission.get("admission_only") is not True
+            or live_admission.get("live_action_eligible") is not True
+            or live_admission.get("actions_performed") is not False
+            or live_admission.get("request_submitted") is not False
+            or live_admission.get("dossier_created") is not False
+            or live_admission.get("policy_hash") != decision.get("policy_hash")
+        ):
+            raise DossierRejected("fresh LIVE admission is not eligible")
+        if (
+            proof_binding.get("assignment_id") != target.get("assignment_id")
+            or proof_binding.get("assignment_generation") != target.get("assignment_generation")
+            or proof_binding.get("instance_id") != target.get("instance_id")
+            or proof_binding.get("machine_id") != provider.get("machine_id")
+            or proof_binding.get("policy_hash") != decision.get("policy_hash")
+            or not isinstance(proof_binding.get("evidence_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", proof_binding["evidence_sha256"]) is None
+        ):
+            raise DossierRejected("EARLY signed generation proof does not match the target")
+        synthetic_test_authority = getattr(verifier, "synthetic_test_only", False) is True
+        if synthetic_test_authority:
+            if proof_binding.get("data_classification") != "SYNTHETIC/UNVERIFIED":
+                raise DossierRejected("synthetic EARLY authority requires explicit synthetic proof provenance")
+        elif proof_binding.get("data_classification") != "PROVIDER_OBSERVED":
+            raise DossierRejected("provider-observed generation proof is required")
+
+        spend = _money(budget_evidence.get("verified_spend_usd"))
+        action_cost = _money(budget_evidence.get("verified_next_action_cost_usd"))
+        pending = _money(budget_evidence.get("pending_exposure_usd"))
+        maximum = _money(budget_evidence.get("maximum_exposure_usd"))
+        if (
+            budget_evidence.get("status") != "VERIFIED"
+            or budget_evidence.get("currency") != "USD"
+            or any(value is None or value < 0 for value in (spend, action_cost, pending, maximum))
+            or maximum is None or maximum > hard_cap
+            or maximum < spend + action_cost + pending  # type: ignore[operator]
+            or not all(isinstance(budget_evidence.get(name), str) and budget_evidence[name].strip() for name in (
+                "spend_evidence_id", "next_action_cost_evidence_id", "pending_exposure_evidence_id",
+                "maximum_exposure_evidence_id", "action_cost_source_reference",
+            ))
+        ):
+            raise DossierRejected("BUDGET_UNVERIFIABLE")
+        if allocation_history.get("history_known") is not True:
+            raise DossierRejected("REALLOCATION_HISTORY_UNKNOWN")
+        if any(
+            type(allocation_history.get(name)) is not int or allocation_history[name] < 0
+            for name in ("allocation_reallocation_count", "fleet_reallocation_count")
+        ):
+            raise DossierRejected("REALLOCATION_HISTORY_UNKNOWN")
+        if any(isinstance(row, Mapping) and row.get("state") in {
+            "RESERVED", "SEND_STARTED", "ACCEPTED_PENDING", "RECONCILIATION_REQUIRED",
+        } for row in reservation_snapshot):
+            raise DossierRejected("ACTION_RESERVATION_OR_RECONCILIATION_UNCLEAR")
+
+        claims = {
+            "schema_version": 2,
+            "dispatch_kind": "EARLY",
+            "action": action.value,
+            "target_sha256": _sha256(dict(target)),
+            "assignment_generation": target["assignment_generation"],
+            "decision_sha256": _sha256(dict(decision)),
+            "live_admission_sha256": _sha256(dict(live_admission)),
+            "source_evidence_sha256": _sha256(dict(source_evidence)),
+            "policy_evidence_sha256": _sha256(dict(policy_evidence)),
+            "generation_evidence_sha256": _sha256(dict(generation_evidence)),
+            "binding_evidence_sha256": _sha256(dict(binding_evidence)),
+            "provider_revalidation_sha256": _sha256(dict(provider_revalidation)),
+            "proof_evidence_sha256": proof_binding["evidence_sha256"],
+            "proof_binding_sha256": _sha256(dict(proof_binding)),
+            "allocation_history_sha256": _sha256(dict(allocation_history)),
+            "reservation_snapshot_sha256": _sha256(reservation_snapshot),
+            "verified_total_exposure_usd": format(maximum, "f"),
+            "hard_budget_usd": format(hard_cap, "f"),
+            "action_cost_evidence_id": budget_evidence.get("next_action_cost_evidence_id"),
+            "action_cost_source_reference": budget_evidence.get("action_cost_source_reference"),
+            "action_cost_usd": format(action_cost, "f"),
+            "data_classification": "SYNTHETIC/UNVERIFIED" if synthetic_test_authority else "PROVIDER_OBSERVED",
+            "synthetic_fixture_id": "G5-SYNTHETIC-ACTION-PATH" if synthetic_test_authority else None,
+            "issued_at_epoch": now,
+            "expires_at_epoch": now + 30,
+        }
+        payload = _canonical_bytes(claims)
+        signature = hmac.digest(self.__key, payload, "sha256")
+        return VerifiedActionDossier(payload, signature)
+
     def verify_for(
         self,
         dossier: VerifiedActionDossier | None,
@@ -454,16 +671,20 @@ class DecisionDossierAuthority:
                 return False
             claims = json.loads(dossier.payload.decode("utf-8"))
             now = _epoch(now_epoch)
-            canonical_target = {
-                "organization": target.get("organization"), "project": target.get("project"),
-                "container_group": target.get("container_group"), "instance_id": target.get("instance_id"),
-                "assignment_id": target.get("assignment_id"), "deterioration_id": target.get("deterioration_id"),
-            }
+            schema_version = claims.get("schema_version")
+            canonical_target = (
+                dict(target) if schema_version == 2 else {
+                    "organization": target.get("organization"), "project": target.get("project"),
+                    "container_group": target.get("container_group"), "instance_id": target.get("instance_id"),
+                    "assignment_id": target.get("assignment_id"), "deterioration_id": target.get("deterioration_id"),
+                }
+            )
             maximum = _money(claims.get("verified_total_exposure_usd"))
             hard_cap = _money(claims.get("hard_budget_usd"))
             return bool(
                 type(action) is SaladAction
-                and claims.get("schema_version") == 1
+                and schema_version in {1, 2}
+                and (schema_version != 2 or claims.get("dispatch_kind") == "EARLY")
                 and claims.get("action") == action.value
                 and claims.get("target_sha256") == _sha256(canonical_target)
                 and now is not None
@@ -472,7 +693,10 @@ class DecisionDossierAuthority:
                 and float(claims["issued_at_epoch"]) <= now < float(claims["expires_at_epoch"])
                 and maximum is not None and hard_cap is not None
                 and maximum <= hard_cap <= HARD_BUDGET_CAP_USD
-                and claims.get("assignment_generation") == canonical_target.get("assignment_id")
+                and claims.get("assignment_generation") == (
+                    canonical_target.get("assignment_generation")
+                    if schema_version == 2 else canonical_target.get("assignment_id")
+                )
             )
         except Exception:
             return False
