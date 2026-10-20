@@ -14,8 +14,9 @@ import socket
 import ssl
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import quote
 import uuid
 
@@ -38,6 +39,7 @@ ORGANIZATION = "adrianfiverr"
 PROJECT = "miners"
 APPROVED_GROUPS = ("fl4shminer", "fl4shminer-2", "fl4shminer-3", "fl4shminer-4")
 _SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SAFE_PROVIDER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 
 
 class ActionTransportBlocked(RuntimeError):
@@ -94,6 +96,18 @@ def fixed_action_path(action: SaladAction, target: Mapping[str, Any]) -> str:
             raise ValueError("reallocation requires a verified UUID instance ID") from None
         return group_path + f"/instances/{canonical_instance}/reallocate"
     raise ValueError("action is not supported")
+
+
+def _parse_utc(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
 
 
 class RestrictedSaladActionHTTPTransport:
@@ -288,15 +302,44 @@ class SaladActionExecutor:
         *,
         decision_dossier: VerifiedActionDossier | None = None,
         auto_armed: bool = False,
+        before_send_validation: Callable[[], bool] | None = None,
     ) -> ActionReceipt:
         now = float(self.clock())
+        early_claims = self.dossier_authority.verified_claims(decision_dossier, now_epoch=now)
+        early_dispatch = isinstance(early_claims, Mapping) and early_claims.get("schema_version") == 2
+        if early_dispatch:
+            assignment_generation = early_claims.get("assignment_generation")
+            if (
+                action is not SaladAction.REALLOCATE_INSTANCE
+                or not isinstance(assignment_generation, str)
+                or target.get("assignment_generation") != assignment_generation
+                or not callable(before_send_validation)
+            ):
+                return ActionReceipt("BLOCKED", None, "early-invalid", False, "EARLY_TARGET_GENERATION_OR_REVALIDATION_REQUIRED")
+            synthetic_dossier = (
+                early_claims.get("data_classification") == "SYNTHETIC/UNVERIFIED"
+                and early_claims.get("synthetic_fixture_id") == "G5-SYNTHETIC-ACTION-PATH"
+            )
+            synthetic_transport = getattr(self.transport, "synthetic_test_only", False) is True
+            if synthetic_dossier != synthetic_transport:
+                return ActionReceipt("BLOCKED", None, "early-invalid", False, "EARLY_EVIDENCE_TRANSPORT_PROVENANCE_MISMATCH")
+            try:
+                action_key = ActionLedger.early_live_key_for(action=action.value, target=target)
+            except (TypeError, ValueError):
+                return ActionReceipt("BLOCKED", None, "early-invalid", False, "EARLY_TARGET_GENERATION_INVALID")
+        else:
+            if before_send_validation is not None or target.get("assignment_generation") is not None:
+                return ActionReceipt("BLOCKED", None, "early-invalid", False, "EARLY_DOSSIER_REQUIRED_FOR_GENERATION_BOUND_DISPATCH")
+            try:
+                action_key = ActionLedger.live_key_for(action=action.value, target=dict(target))
+            except (TypeError, ValueError):
+                return ActionReceipt("BLOCKED", None, "invalid-target", False, "INVALID_ACTION_TARGET")
         decision = self.policy.evaluate(
             action, target=dict(target), decision_dossier=decision_dossier,
             dossier_authority=self.dossier_authority,
             kill_switch_clear=bool(getattr(self.kill_switch, "enabled", False)),
             auto_armed=auto_armed, now_epoch=now,
         )
-        action_key = ActionLedger.live_key_for(action=action.value, target=dict(target))
         if not decision.allowed:
             return ActionReceipt("BLOCKED", None, action_key, False, ",".join(decision.blockers))
         try:
@@ -329,12 +372,28 @@ class SaladActionExecutor:
         except Exception:
             return ActionReceipt("BLOCKED", None, action_key, False, "ACTION_LEDGER_UNAVAILABLE")
         at_utc = canonical_utc(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)))
-        reservation = self.ledger.reserve_live(action_key, action.value, dict(target), at_utc)
+        if early_dispatch:
+            reservation = self.ledger.reserve_live_early(
+                action_key, action.value, dict(target), assignment_generation, at_utc,
+            )
+        else:
+            reservation = self.ledger.reserve_live(action_key, action.value, dict(target), at_utc)
         if not reservation["inserted"]:
             return ActionReceipt(
                 "BLOCKED", None, action_key, False,
                 reservation.get("blocker", "DUPLICATE_OR_RECONCILIATION_REQUIRED"),
             )
+        if early_dispatch:
+            try:
+                revalidation_ok = before_send_validation() is True  # type: ignore[misc]
+            except Exception:
+                revalidation_ok = False
+            if not revalidation_ok:
+                self.ledger.transition(
+                    action_key, "ABORTED_PRE_SEND", at_utc,
+                    {"reason": "exact EARLY assignment generation revalidation failed", "request_submitted": False},
+                )
+                return ActionReceipt("ABORTED_PRE_SEND", None, action_key, False, "EARLY_TARGET_REVALIDATION_FAILED")
         try:
             nonce_consumed = self.ledger.consume_signed_action_nonce(capability_nonce, action_key, at_utc)
         except Exception:
@@ -508,6 +567,13 @@ class SaladActionExecutor:
         observation_digest = provider_observation.get("sanitized_observation_sha256") if isinstance(provider_observation, Mapping) else None
         verifier = self.reconciliation_verifier
         prior_receipt = entry.get("receipt") if isinstance(entry.get("receipt"), Mapping) else {}
+        recommendation = entry.get("recommendation") if isinstance(entry.get("recommendation"), Mapping) else {}
+        early_target = (
+            recommendation.get("target")
+            if recommendation.get("dispatch_kind") == "EARLY"
+            and isinstance(recommendation.get("target"), Mapping)
+            else None
+        )
         prior_dispatch_is_synthetic = (
             prior_receipt.get("data_classification") == "SYNTHETIC/UNVERIFIED"
             and prior_receipt.get("synthetic_fixture_id") == "G5-SYNTHETIC-ACTION-PATH"
@@ -537,6 +603,13 @@ class SaladActionExecutor:
             or re.fullmatch(r"[0-9a-f]{64}", observation_digest) is None
         ):
             return ActionReceipt("RECONCILIATION_REQUIRED", None, action_key, False, "INDEPENDENT_PROVIDER_OBSERVATION_REQUIRED")
+        early_replacement = None
+        if early_target is not None:
+            early_replacement, early_reason = self._validated_early_replacement(
+                early_target, provider_observation, entry=entry, at_utc=at_utc,
+            )
+            if early_replacement is None:
+                return ActionReceipt("RECONCILIATION_REQUIRED", None, action_key, False, early_reason)
         if verifier is None or not callable(getattr(verifier, "verify_action_outcome", None)):
             return ActionReceipt("RECONCILIATION_REQUIRED", None, action_key, False, "NO_INDEPENDENT_ACTION_OUTCOME_VERIFIER_CONFIGURED")
         try:
@@ -560,6 +633,8 @@ class SaladActionExecutor:
                 "simulation_only": True,
                 "request_submitted": False,
             }
+            if early_replacement is not None:
+                synthetic_receipt.update(early_replacement)
             self.ledger.transition(
                 action_key, "RECONCILED_SYNTHETIC_SIMULATION", timestamp, synthetic_receipt,
             )
@@ -568,7 +643,8 @@ class SaladActionExecutor:
                 {"action_key": action_key, "evidence_id": observation_digest,
                  "data_classification": "SYNTHETIC/UNVERIFIED",
                  "synthetic_fixture_id": "G5-SYNTHETIC-ACTION-PATH",
-                 "simulation_only": True, "actions_performed": False},
+                 "simulation_only": True, "actions_performed": False,
+                 **(early_replacement or {})},
                 timestamp,
             )
             return ActionReceipt(
@@ -587,7 +663,8 @@ class SaladActionExecutor:
             action_key,
             "RECONCILED_OBSERVED_CHANGE",
             timestamp,
-            {"evidence_id": observation_digest, "result": "independently_verified_provider_change"},
+            {"evidence_id": observation_digest, "result": "independently_verified_provider_change",
+             **(early_replacement or {})},
         )
         self._append_action_audit(
             "ACTION_RECONCILED_OBSERVED_CHANGE",
@@ -595,3 +672,57 @@ class SaladActionExecutor:
             timestamp,
         )
         return ActionReceipt("RECONCILED_OBSERVED_CHANGE", None, action_key, True, request_submitted=True)
+
+    @staticmethod
+    def _validated_early_replacement(
+        old_target: Mapping[str, Any],
+        observation: Mapping[str, Any],
+        *,
+        entry: Mapping[str, Any],
+        at_utc: str,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Require a complete, later, same-scope replacement assignment."""
+        replacement = observation.get("replacement_binding")
+        required = (
+            "organization", "project", "container_group", "machine_id", "instance_id",
+            "assignment_id", "assignment_generation", "observed_at_utc",
+        )
+        if not isinstance(replacement, Mapping) or any(name not in replacement for name in required):
+            return None, "EARLY_REPLACEMENT_IDENTITY_INCOMPLETE"
+        for name in ("organization", "project", "container_group"):
+            if replacement.get(name) != old_target.get(name):
+                return None, "EARLY_REPLACEMENT_SCOPE_MISMATCH"
+        for name in ("machine_id", "assignment_id", "assignment_generation"):
+            value = replacement.get(name)
+            if not isinstance(value, str) or not _SAFE_PROVIDER_ID.fullmatch(value):
+                return None, "EARLY_REPLACEMENT_IDENTITY_INVALID"
+        try:
+            new_instance = str(uuid.UUID(replacement.get("instance_id")))
+            old_instance = str(uuid.UUID(old_target.get("instance_id")))
+        except (TypeError, ValueError, AttributeError):
+            return None, "EARLY_REPLACEMENT_IDENTITY_INVALID"
+        if new_instance != replacement.get("instance_id") or new_instance == old_instance:
+            return None, "EARLY_REPLACEMENT_INSTANCE_NOT_NEW"
+        if (
+            replacement.get("assignment_id") == old_target.get("assignment_id")
+            or replacement.get("assignment_generation") == old_target.get("assignment_generation")
+        ):
+            return None, "EARLY_REPLACEMENT_GENERATION_NOT_NEW"
+        observed_at = _parse_utc(replacement.get("observed_at_utc"))
+        accepted_at = _parse_utc(entry.get("updated_at_utc"))
+        reconciliation_at = _parse_utc(at_utc)
+        if observed_at is None or accepted_at is None or reconciliation_at is None:
+            return None, "EARLY_REPLACEMENT_TIME_INVALID"
+        if not accepted_at < observed_at <= reconciliation_at:
+            return None, "EARLY_REPLACEMENT_TIME_ORDER_INVALID"
+        return {
+            "reconciled_from": {
+                key: old_target[key]
+                for key in ("organization", "project", "container_group", "machine_id", "instance_id", "assignment_id", "assignment_generation")
+            },
+            "reconciled_to": {
+                key: replacement[key]
+                for key in ("organization", "project", "container_group", "machine_id", "instance_id", "assignment_id", "assignment_generation")
+            },
+            "replacement_observed_at_utc": observed_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }, ""
