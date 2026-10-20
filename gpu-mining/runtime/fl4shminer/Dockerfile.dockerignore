@@ -60,6 +60,7 @@
 !gpu-mining/telemetry/collector/startup_latency.py
 !gpu-mining/telemetry/collector/v2_adapters.py
 !gpu-mining/telemetry/g5_control_plane/
+!gpu-mining/telemetry/g5_control_plane/static/
 !gpu-mining/telemetry/g5_control_plane/__init__.py
 !gpu-mining/telemetry/g5_control_plane/app.py
 !gpu-mining/telemetry/g5_control_plane/config.py
@@ -67,5 +68,8 @@
 !gpu-mining/telemetry/g5_control_plane/service.py
 !gpu-mining/telemetry/g5_control_plane/startup_policy.py
 !gpu-mining/telemetry/g5_control_plane/store.py
+!gpu-mining/telemetry/g5_control_plane/static/index.html
+!gpu-mining/telemetry/g5_control_plane/static/app.js
+!gpu-mining/telemetry/g5_control_plane/static/styles.css
 !gpu-mining/g4c-live/
 !gpu-mining/g4c-live/live_secret_boundary.py

@@ -21,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import urllib.request
 
 
@@ -98,6 +99,9 @@ CONTROL_PLANE_INPUTS = (
     "gpu-mining/telemetry/g5_control_plane/server.py",
     "gpu-mining/telemetry/g5_control_plane/service.py",
     "gpu-mining/telemetry/g5_control_plane/store.py",
+    "gpu-mining/telemetry/g5_control_plane/static/index.html",
+    "gpu-mining/telemetry/g5_control_plane/static/app.js",
+    "gpu-mining/telemetry/g5_control_plane/static/styles.css",
 )
 
 PACKAGED_TELEMETRY_INPUTS = WATCHER_INPUTS + CONTROL_PLANE_INPUTS
@@ -112,6 +116,7 @@ ALLOWED_DIRECTORIES = frozenset(
         "gpu-mining/telemetry/log_alerts",
         "gpu-mining/telemetry/collector",
         "gpu-mining/telemetry/g5_control_plane",
+        "gpu-mining/telemetry/g5_control_plane/static",
         "gpu-mining/g4c-live",
     }
 )
@@ -153,6 +158,9 @@ WORKFLOW_TRIGGERS = frozenset(
         "gpu-mining/telemetry/g5_control_plane/service.py",
         "gpu-mining/telemetry/g5_control_plane/startup_policy.py",
         "gpu-mining/telemetry/g5_control_plane/store.py",
+        "gpu-mining/telemetry/g5_control_plane/static/index.html",
+        "gpu-mining/telemetry/g5_control_plane/static/app.js",
+        "gpu-mining/telemetry/g5_control_plane/static/styles.css",
         "gpu-mining/g4c-live/live_secret_boundary.py",
         ".github/workflows/build-fl4shminer.yml",
         ".github/fl4sh-publish-targets.json",
@@ -413,6 +421,11 @@ def check_sources_exist(root: Path) -> None:
             "watcher Python source inventory changed; update the explicit "
             f"image manifest (missing={missing_modules}, unreviewed={unreviewed_modules})"
         )
+    static_root = root / "gpu-mining/telemetry/g5_control_plane/static"
+    expected_static = {Path(item).name for item in G5_STATIC_INPUTS}
+    actual_static = {item.name for item in static_root.iterdir() if item.is_file()}
+    if actual_static != expected_static:
+        fail("G5 dashboard static source inventory differs from the explicit image manifest")
 
 
 def check_dockerfile_manifest(root: Path) -> None:
@@ -654,12 +667,18 @@ def check_image_tree(root: Path, *, include_control_plane: bool = False) -> None
         fail("image collector directory differs from the exact startup watcher import closure")
     g5_control_plane = telemetry / "g5_control_plane"
     expected_g5_control_plane = {
-        Path(item).name
+        Path(item).relative_to("gpu-mining/telemetry/g5_control_plane").parts[0]
         for item in telemetry_inputs
         if item.startswith("gpu-mining/telemetry/g5_control_plane/")
     }
     if {entry.name for entry in g5_control_plane.iterdir()} != expected_g5_control_plane:
         fail("image G5 package differs from the exact offline control-plane inventory")
+    if include_control_plane:
+        static_root = g5_control_plane / "static"
+        expected_static = {Path(item).name for item in G5_STATIC_INPUTS}
+        actual_static = {item.name for item in static_root.iterdir() if item.is_file()}
+        if actual_static != expected_static:
+            fail("installed G5 dashboard static inventory differs from the exact package manifest")
     g4c = root / "gpu-mining/g4c-live"
     if {entry.name for entry in g4c.iterdir()} != {"live_secret_boundary.py"}:
         fail("image G4C directory contains files beyond the approved secret boundary")
@@ -684,6 +703,7 @@ def check_simulated_image_tree(source_root: Path) -> None:
         # The source smoke does not build or run Fl4shMiner. This inert marker
         # occupies the pinned artifact path required by the installed inventory.
         (image_root / "fl4shminer").write_bytes(b"synthetic inert artifact marker")
+        check_negative_dashboard_asset_omissions(image_root)
         child_environment = {
             key: os.environ[key]
             for key in ("PATH", "SYSTEMROOT", "WINDIR", "PATHEXT", "TEMP", "TMP")
@@ -727,8 +747,85 @@ def check_simulated_image_tree(source_root: Path) -> None:
             or "STARTUP_RECOVERY_IMPORT_OK" not in result.stdout
             or "REALLOCATION_PACKAGE_IMPORT_OK" not in result.stdout
             or "G5_ACTION_DEFAULT_CLOSED_OK" not in result.stdout
+            or "G5_STATIC_DASHBOARD_ROUTES_OK" not in result.stdout
         ):
             fail("simulated packaged-image import closure failed")
+
+
+G5_STATIC_INPUTS = (
+    "gpu-mining/telemetry/g5_control_plane/static/index.html",
+    "gpu-mining/telemetry/g5_control_plane/static/app.js",
+    "gpu-mining/telemetry/g5_control_plane/static/styles.css",
+)
+
+
+def check_negative_dashboard_asset_omissions(image_root: Path) -> None:
+    """Prove image inventory validation rejects omission of every dashboard asset."""
+    check_image_tree(image_root, include_control_plane=True)
+    static_root = image_root / "gpu-mining/telemetry/g5_control_plane/static"
+    for relative in G5_STATIC_INPUTS:
+        asset_path = static_root / Path(relative).name
+        content = asset_path.read_bytes()
+        asset_path.unlink()
+        rejected = False
+        try:
+            check_image_tree(image_root, include_control_plane=True)
+        except SystemExit:
+            rejected = True
+        finally:
+            asset_path.write_bytes(content)
+        if not rejected:
+            fail("installed image inventory accepted a missing G5 dashboard asset")
+    print("G5_STATIC_ASSET_OMISSION_REJECTIONS_OK")
+
+
+def check_dashboard_routes(root: Path, server_module: Any) -> None:
+    """Exercise G5 GET routes against installed files without opening a socket."""
+    expected_static_root = (
+        root / "gpu-mining/telemetry/g5_control_plane/static"
+    ).resolve()
+    if server_module.STATIC_ROOT.resolve() != expected_static_root:
+        fail("G5 dashboard routes did not resolve assets from the checked package tree")
+
+    token = "SYNTHETIC_CSRF_TOKEN"
+    route_expectations = (
+        ("/", "text/html; charset=utf-8"),
+        ("/static/app.js", "text/javascript; charset=utf-8"),
+        ("/static/styles.css", "text/css; charset=utf-8"),
+    )
+    for route, expected_content_type in route_expectations:
+        handler_type = server_module._make_handler()
+        handler = handler_type.__new__(handler_type)
+        handler.path = route
+        handler.headers = {"Host": "127.0.0.1:8765"}
+        handler.server = SimpleNamespace(
+            server_port=8765,
+            csrf_token=token,
+            service=SimpleNamespace(state=lambda: {}, audit=lambda: {}),
+        )
+        handler.wfile = io.BytesIO()
+        handler.close_connection = False
+        statuses: list[int] = []
+        response_headers: list[tuple[str, str]] = []
+        handler.send_response = lambda status, *args: statuses.append(status)
+        handler.send_header = lambda name, value: response_headers.append((name, value))
+        handler.end_headers = lambda: None
+        handler.do_GET()
+        if statuses != [200]:
+            fail("G5 dashboard route did not return HTTP 200")
+        content_types = [
+            value for name, value in response_headers if name.casefold() == "content-type"
+        ]
+        if content_types != [expected_content_type]:
+            fail("G5 dashboard route returned an unexpected content type")
+        body = handler.wfile.getvalue()
+        if route == "/":
+            if token.encode("ascii") not in body or b"__CSRF_TOKEN__" in body:
+                fail("G5 dashboard HTML did not replace its synthetic CSRF marker")
+        else:
+            expected_path = server_module.STATIC_ROOT / Path(route).name
+            if body != expected_path.read_bytes():
+                fail("G5 dashboard route did not return its packaged static asset")
 
 
 def block_external_boundaries() -> None:
@@ -764,8 +861,11 @@ def check_imports_and_inert_startup(root: Path, *, image: bool) -> None:
     from collector.g4a_salad_get import normalize_instance_list_response
 
     from g5_control_plane.startup_policy import load_startup_policy_snapshot
+    from g5_control_plane import server as g5_server
 
     startup_snapshot = load_startup_policy_snapshot(None, environ={})
+    check_dashboard_routes(root, g5_server)
+    print("G5_STATIC_DASHBOARD_ROUTES_OK")
     if not re.fullmatch(r"[a-f0-9]{64}", startup_snapshot.policy.policy_hash):
         fail("read-only startup policy loader did not produce a valid policy fingerprint")
     if not re.fullmatch(r"[a-f0-9]{64}", startup_snapshot.config_sha256):
